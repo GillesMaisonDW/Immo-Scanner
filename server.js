@@ -18,57 +18,65 @@ if (!API_KEY) {
 }
 
 // ── Middleware ────────────────────────────────────────────────────
-app.use(express.json({ limit: '25mb' }));          // grote foto's toestaan
+app.use(express.json({ limit: '25mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
-// ── System prompt voor de Immo Scanner skill ──────────────────────
-const SYSTEM_PROMPT = `Je bent de Immo Scanner skill. Je analyseert foto's van Belgische makelaarsborden en zoekt de bijhorende vastgoedlisting op.
+// ── System prompt ─────────────────────────────────────────────────
+const SYSTEM_PROMPT = `Je bent de Immo Scanner skill. Je analyseert foto's van Belgische makelaarsborden en zoekt de bijhorende vastgoedlisting op via de web_search tool.
 
-## MAKELAARS DATABASE (gebruik kleur → logo → naam):
-- ERA: rood (#E30613) + wit, "ERA" in vetgedrukt blokschrift → site:era.be
-- Trevi: rood + wit, "Trevi" cursief → site:trevi.be
-- DeWaele: rood + wit, "Dewaele" schreefloos → site:dewaele.com
-- Axel Lenaerts: rood + wit, klassiek serif lettertype → site:axellenaerts.be
-- Heylen: donkerblauw + wit, H-logo of "Heylen" → site:heylenvastgoed.be (BLAUW = Heylen)
-- Hillewaere: ORANJE (#E87722) + wit, H-logo → site:hillewaere-vastgoed.be (ORANJE = Hillewaere)
-- Century 21: geel + zwart → site:century21.be
-- Crevits: donkergroen + wit/goud → site:crevits.be
-- Engel & Völkers: groen + wit/goud, premium → site:engelvoelkers.com/be
-- Huysewinkel: wit bord + bruin/terracotta geometrische H → site:huysewinkel.be
-- Carlo Eggermont: marineblauw + wit, volledige naam → site:carloeggermont.be
-- de Fooz: donker + goud, klassiek serif → site:defooz.com
-- Quares: zwart + wit, minimalistisch → site:quares.be
-- Sotheby's: zwart/navy + goud, "S" embleem → site:sothebysrealty.be
-- Onbekende makelaar: zoek eerst via Google op naam, daarna fallback Immoweb
+## KRITIEKE REGEL: JE MOET ALTIJD ZOEKEN
+Je hebt toegang tot de web_search tool. Je MOET deze gebruiken om de listing te vinden. Geef NOOIT op zonder minstens 2 zoekopdrachten uitgevoerd te hebben. "Niet gevonden" is enkel toegestaan als je effectief hebt gezocht en niets passends terugkwam.
 
-## GEDRAGSREGELS:
-1. Werk MAXIMAAL zelfstandig — stel NOOIT vragen
-2. GPS = locatie GEBRUIKER, niet pand. Zoek in straal van 100m eromheen
-3. Kanaal of brede straat ertussen → vergroot straal naar 200m
-4. Toon NOOIT een URL zonder te vermelden dat je ze gevonden hebt via websearch
-5. Meld altijd via welke zoekmethode je iets gevonden hebt
+## MAKELAARS DATABASE (kleur → logo → naam → website):
+- ERA: rood (#E30613) + wit, "ERA" vetgedrukt → era.be
+- Trevi: rood + wit, "Trevi" cursief → trevi.be
+- DeWaele: rood + wit, "Dewaele" schreefloos → dewaele.com
+- Heylen: donkerblauw + wit, H-logo → heylenvastgoed.be
+- Hillewaere: ORANJE (#E87722) + wit, H-logo → hillewaere-vastgoed.be
+- Century 21: geel + zwart → century21.be
+- Crevits: donkergroen + wit/goud → crevits.be
+- Engel & Völkers: groen + goud, premium → engelvoelkers.com/be
+- de Fooz: donkerblauw + oranje/goud accenten → defooz.com (GEEN koppelteken)
+- Quares: zwart + wit, minimalistisch → quares.be
+- Sotheby's: navy + goud → sothebysrealty.be
+- Onbekend: zoek eerst via Google op naam
 
 ## STAP 1 — Analyseer het bord:
-- Primaire kleur van het bord
-- Logo-vorm en lettertype
-- Naam van de makelaar als leesbaar
-- Type listing: TE KOOP of TE HUUR
-- Referentienummer als zichtbaar
-- Telefoonnummer als zichtbaar
+- Primaire kleur + logo-vorm + leesbare naam
+- Type: TE KOOP of TE HUUR
+- Telefoonnummer of referentienummer als zichtbaar
+- Gebruik de MAKELAARS DATABASE om de website te bepalen — vertrouw NIET op wat je op het bord leest voor de URL (borden bevatten soms www. met koppeltekens of typfouten)
 
 ## STAP 2 — Locatie bepalen:
-- Gebruik GPS als middelpunt van zoekstraal (100–200m)
-- Kijk naar zichtbare straatnamen in de foto
-- Adres op het bord zelf
+- GPS = locatie GEBRUIKER, niet pand. Het pand staat tot 200m verderop.
+- Gebruik GPS-coördinaten DIRECT in je zoekopdracht, verzin GEEN buurt- of straatnamen.
+- Kijk ook naar zichtbare straatnamen, huisnummers of omgeving in de foto zelf.
 
-## STAP 3 — Zoek de listing:
-Gebruik Google site:-zoekopdrachten. Formuleer de logica en geef het beste resultaat op basis van je kennis.
+## STAP 3 — ZOEK ACTIEF via web_search (VERPLICHT):
+Voer de zoekopdrachten in deze volgorde uit:
+
+1. Zoek op de makelaarwebsite + gemeente:
+   → "[makelaar] te huur Gent" of "site:[website] te huur Gent"
+
+2. Als GPS beschikbaar: zoek op coördinaten of nabijgelegen straten:
+   → "[makelaar] te huur [straat zichtbaar in foto] Gent"
+
+3. Als nog niet gevonden: zoek breder via Google:
+   → "[makelaar] [type] [gemeente] te huur listing"
+
+4. Fallback: zoek op Immoweb, Zimmo of Immoscoop:
+   → "immoweb.be [makelaar] [gemeente] te huur"
+
+Analyseer de zoekresultaten en identificeer de listing die overeenkomt met de locatie en het type pand op de foto.
+
+## STAP 4 — Visuele verificatie (als foto beschikbaar in resultaten):
+Als de makelaarwebsite een foto van de gevel toont in de zoekresultaten, vergelijk dit visueel met de foto van het bord. Een overeenkomende gevel = sterke bevestiging.
 
 ## OUTPUT — gebruik EXACT dit JSON-formaat:
 {
   "status": "gevonden" | "niet_gevonden" | "gedeeltelijk",
   "makelaar": "naam",
-  "makelaar_herkenning": "hoe herkend (kleur/logo/naam)",
+  "makelaar_herkenning": "hoe herkend",
   "makelaar_betrouwbaarheid": "hoog" | "middel" | "laag",
   "pand_type": "🏠 Woning" | "🏢 Appartement" | "🏗️ Nieuwbouw" | "🏭 Commercieel" | "🌳 Grond",
   "listing_type": "Te koop" | "Te huur",
@@ -81,39 +89,43 @@ Gebruik Google site:-zoekopdrachten. Formuleer de logica en geef het beste resul
   "extras": ["garage", "tuin", "terras"],
   "url": "directe URL naar listing of null",
   "telefoon": "telefoonnummer of null",
-  "gevonden_via": "makelaar website / Immoweb / etc.",
+  "gevonden_via": "beschrijf welke zoekopdracht het resultaat opleverde",
   "faal_categorie": null | "MAKELAAR_NIET_HERKEND" | "MAKELAAR_WEBSITE_GEEN_ZOEK" | "LISTING_NIET_ONLINE" | "ADRES_NIET_BEPAALBAAR" | "GPS_TE_VER" | "FALLBACK_OOK_LEEG" | "FOTO_ONLEESBAAR",
   "notitie": "korte uitleg voor de gebruiker"
 }
 Geef ENKEL de JSON terug, geen extra tekst.`;
 
-// ── /api/scan — hoofdendpoint ─────────────────────────────────────
+// ── /api/scan ─────────────────────────────────────────────────────
 app.post('/api/scan', async (req, res) => {
   const { image, mime, gps } = req.body;
 
-  if (!image) {
-    return res.status(400).json({ error: 'Geen foto meegestuurd.' });
-  }
-  if (!API_KEY) {
-    return res.status(500).json({ error: 'API key niet geconfigureerd op de server. Contacteer de beheerder.' });
-  }
+  if (!image) return res.status(400).json({ error: 'Geen foto meegestuurd.' });
+  if (!API_KEY) return res.status(500).json({ error: 'API key niet geconfigureerd. Contacteer de beheerder.' });
 
   const gpsInfo = gps
-    ? `GPS locatie gebruiker: ${gps.lat}°N, ${gps.lon}°O (nauwkeurigheid ±${gps.accuracy}m). Gebruik dit als MIDDELPUNT van een zoekstraal van 100m — niet als exact adres van het pand.`
-    : 'Geen GPS beschikbaar. Werk met visuele analyse en eventuele straatnamen in de foto.';
+    ? `GPS locatie gebruiker: ${gps.lat}°N, ${gps.lon}°O (nauwkeurigheid ±${gps.accuracy}m). Dit is de locatie van de GEBRUIKER. Het gescande pand staat ergens in een straal van 100–200m hieromheen. Gebruik deze coördinaten letterlijk in je zoekopdrachten, verzin geen buurt- of straatnamen.`
+    : 'Geen GPS beschikbaar. Werk met visuele analyse: zoek naar zichtbare straatnamen, huisnummers of herkenbare gebouwen in de foto.';
 
   try {
+    const startTime = Date.now();
+
     const anthropicResp = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {
         'Content-Type':      'application/json',
         'x-api-key':         API_KEY,
-        'anthropic-version': '2023-06-01'
+        'anthropic-version': '2023-06-01',
+        'anthropic-beta':    'web-search-2025-03-05'   // ← web search ingeschakeld
       },
       body: JSON.stringify({
         model:      'claude-sonnet-4-6',
-        max_tokens: 1200,
-        system:     SYSTEM_PROMPT,
+        max_tokens: 3000,                              // meer ruimte voor tool calls
+        tools: [{
+          type:     'web_search_20250305',
+          name:     'web_search',
+          max_uses: 5                                  // max 5 zoekopdrachten per scan
+        }],
+        system:   SYSTEM_PROMPT,
         messages: [{
           role: 'user',
           content: [
@@ -127,12 +139,14 @@ app.post('/api/scan', async (req, res) => {
             },
             {
               type: 'text',
-              text: `${gpsInfo}\n\nAnalyseer dit makelaarsbord en zoek de listing op.`
+              text: `${gpsInfo}\n\nAnalyseer dit makelaarsbord. Gebruik daarna VERPLICHT de web_search tool om de listing te zoeken op de website van de makelaar. Geef het resultaat als JSON.`
             }
           ]
         }]
       })
     });
+
+    const zoekduur = ((Date.now() - startTime) / 1000).toFixed(2);
 
     if (!anthropicResp.ok) {
       const errText = await anthropicResp.text();
@@ -140,31 +154,42 @@ app.post('/api/scan', async (req, res) => {
       return res.status(502).json({ error: `Claude API fout (${anthropicResp.status}). Probeer opnieuw.` });
     }
 
-    const data    = await anthropicResp.json();
-    const rawText = data.content[0].text;
+    const data = await anthropicResp.json();
 
-    // Parse JSON uit de respons
+    // Zoek het laatste text-block met JSON (na alle tool calls)
+    let rawText = '';
+    for (const block of data.content) {
+      if (block.type === 'text' && block.text.includes('{')) {
+        rawText = block.text;
+      }
+    }
+
+    if (!rawText) {
+      console.error('Geen JSON gevonden in Claude response:', JSON.stringify(data.content));
+      return res.status(500).json({ error: 'Onverwachte respons van Claude. Probeer opnieuw.' });
+    }
+
     const jsonMatch = rawText.match(/\{[\s\S]*\}/);
     if (!jsonMatch) {
-      console.error('Geen JSON in Claude response:', rawText);
+      console.error('Geen JSON-object in tekst:', rawText);
       return res.status(500).json({ error: 'Onverwachte respons van Claude. Probeer opnieuw.' });
     }
 
     const result = JSON.parse(jsonMatch[0]);
 
-    // Log naar console
     console.log('📊 SCAN:', {
       ts:       new Date().toISOString(),
       makelaar: result.makelaar,
       status:   result.status,
-      gemeente: result.gemeente,
-      faal:     result.faal_categorie
+      adres:    result.adres,
+      faal:     result.faal_categorie,
+      duur:     `${zoekduur}s`
     });
 
-    // ── Opslaan in Supabase ──────────────────────────────────────
+    // ── Supabase opslaan ──────────────────────────────────────────
     let scanId = null;
     if (supabase) {
-      const { data, error } = await supabase.from('scans').insert({
+      const { data: dbData, error } = await supabase.from('scans').insert({
         makelaar:                result.makelaar,
         makelaar_herkenning:     result.makelaar_herkenning,
         makelaar_betrouwbaarheid:result.makelaar_betrouwbaarheid,
@@ -184,11 +209,12 @@ app.post('/api/scan', async (req, res) => {
         faal_categorie:          result.faal_categorie,
         notitie:                 result.notitie,
         gps_beschikbaar:         !!gps,
-        gps_nauwkeurigheid_m:    gps?.accuracy || null
+        gps_nauwkeurigheid_m:    gps?.accuracy || null,
+        zoekduur_seconden:       parseFloat(zoekduur)
       }).select('id').single();
 
       if (error) console.error('Supabase schrijffout:', error.message);
-      else scanId = data?.id;
+      else scanId = dbData?.id;
     }
 
     return res.json({ ...result, scan_id: scanId });
@@ -199,7 +225,7 @@ app.post('/api/scan', async (req, res) => {
   }
 });
 
-// ── /api/feedback — feedback opslaan ─────────────────────────────
+// ── /api/feedback ─────────────────────────────────────────────────
 app.post('/api/feedback', async (req, res) => {
   const { scan_id, feedback_type, makelaar_correct, faal_categorie_override } = req.body;
 
