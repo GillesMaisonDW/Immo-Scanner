@@ -7,6 +7,7 @@
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-title" content="Immo Scanner">
   <title>Immo Scanner</title>
+  <script src="https://cdn.jsdelivr.net/npm/exifr/dist/lite.umd.js"></script>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     :root {
@@ -253,14 +254,22 @@
 
       <img id="preview-img" class="preview-img" src="" alt="Preview">
 
-      <input type="file" id="camera-input" accept="image/*" capture="environment" onchange="photoSelected(this)">
-      <button class="btn btn-orange" onclick="document.getElementById('camera-input').click()">
+      <input type="file" id="camera-input"  accept="image/*" capture="environment" onchange="photoSelected(this)">
+      <input type="file" id="upload-input" accept="image/*" onchange="photoSelected(this)">
+      <button class="btn btn-orange" onclick="startGPS(); document.getElementById('camera-input').click()">
         📷 Foto nemen
+      </button>
+      <button class="btn btn-outline" style="margin-top:10px;" onclick="startGPS(); document.getElementById('upload-input').click()">
+        🖼️ Foto uploaden uit galerij
       </button>
 
       <div id="gps-pill" class="gps-pill waiting">
         <div class="gps-dot"></div>
-        <span id="gps-text">GPS ophalen...</span>
+        <span id="gps-text">Tik op foto nemen voor GPS</span>
+      </div>
+
+      <div id="gps-warning" style="display:none; margin-top:12px; background:#FFF3CD; border:1px solid #F0C040; border-radius:10px; padding:10px 14px; font-size:12px; color:#856404; text-align:left; line-height:1.5;">
+        ⚠️ <strong>Geen GPS beschikbaar.</strong> De app werkt verder zonder locatie, maar resultaten kunnen minder nauwkeurig zijn. Laat locatietoegang toe in je browserinstellingen voor de beste resultaten.
       </div>
     </div>
   </div>
@@ -343,30 +352,58 @@ let lastResult    = null;
 function startGPS() {
   const pill = document.getElementById('gps-pill');
   const text = document.getElementById('gps-text');
+  const warn = document.getElementById('gps-warning');
   if (!navigator.geolocation) {
     pill.className = 'gps-pill error';
     text.textContent = 'GPS niet beschikbaar';
+    warn.style.display = 'block';
     return;
   }
+  pill.className = 'gps-pill waiting';
+  text.textContent = 'GPS ophalen...';
   navigator.geolocation.getCurrentPosition(
     (pos) => {
       currentGPS = { lat: pos.coords.latitude.toFixed(5), lon: pos.coords.longitude.toFixed(5), accuracy: Math.round(pos.coords.accuracy) };
       pill.className = 'gps-pill ok';
       text.textContent = `GPS actief · ±${currentGPS.accuracy}m`;
+      warn.style.display = 'none';
     },
     () => {
       pill.className = 'gps-pill error';
-      text.textContent = 'GPS geweigerd — werkt zonder locatie';
+      text.textContent = 'GPS geweigerd';
+      warn.style.display = 'block';
     },
     { enableHighAccuracy: true, timeout: 10000 }
   );
 }
 
 // ── FOTO ─────────────────────────────────
-function photoSelected(input) {
+async function photoSelected(input) {
   if (!input.files || !input.files[0]) return;
   const file = input.files[0];
   currentMime = file.type || 'image/jpeg';
+
+  // EXIF GPS uitlezen uit de foto zelf (werkt alleen als foto's locatie had ingeschakeld)
+  try {
+    if (typeof exifr !== 'undefined' && !currentGPS) {
+      const gpsData = await exifr.gps(file);
+      if (gpsData && gpsData.latitude && gpsData.longitude) {
+        currentGPS = {
+          lat: gpsData.latitude.toFixed(5),
+          lon: gpsData.longitude.toFixed(5),
+          accuracy: 10 // EXIF is doorgaans nauwkeurig
+        };
+        const pill = document.getElementById('gps-pill');
+        const text = document.getElementById('gps-text');
+        pill.className = 'gps-pill ok';
+        text.textContent = `GPS uit foto · ±10m`;
+        document.getElementById('gps-warning').style.display = 'none';
+      }
+    }
+  } catch (e) {
+    // EXIF fout: geen probleem, gewoon verdergaan zonder GPS
+  }
+
   const reader = new FileReader();
   reader.onload = (e) => {
     const dataUrl = e.target.result;
@@ -509,8 +546,12 @@ function newScan() {
   document.getElementById('followup').style.display = 'none';
   document.getElementById('result-content').innerHTML = '';
   document.getElementById('debug-box').style.display = 'none';
+  const pill = document.getElementById('gps-pill');
+  const text = document.getElementById('gps-text');
+  pill.className = 'gps-pill waiting';
+  text.textContent = 'Tik op foto nemen voor GPS';
+  currentGPS = null;
   showScreen('screen-scan');
-  startGPS();
 }
 function toggleDebug() {
   const b = document.getElementById('debug-box');
@@ -527,7 +568,8 @@ function animateSteps() {
 }
 
 // ── START ─────────────────────────────────
-startGPS();
+// GPS wordt pas gevraagd bij eerste gebruikersactie (knopklik),
+// anders blokkeren browsers de popup stilletjes.
 </script>
 </body>
 </html>
