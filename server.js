@@ -21,6 +21,28 @@ if (!API_KEY) {
 app.use(express.json({ limit: '25mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
+// ── URL verificatie ───────────────────────────────────────────────
+// Controleer of een listing-URL nog actief is vóór we die tonen.
+// Geeft true (actief), false (404/dood), of null (onzeker/timeout).
+async function checkUrlActief(url) {
+  if (!url) return null;
+  try {
+    const resp = await fetch(url, {
+      method: 'HEAD',
+      redirect: 'follow',
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; ImmoScanner/1.0)' },
+      signal: AbortSignal.timeout(6000)
+    });
+    // 404, 410 = zeker dood | 200-399 = actief
+    if (resp.status === 404 || resp.status === 410) return false;
+    if (resp.status >= 200 && resp.status < 400) return true;
+    return null; // andere statuscodes: onzeker
+  } catch (e) {
+    console.warn('URL check mislukt voor', url, '—', e.message);
+    return null; // timeout of geblokkeerd: onzeker, niet uitsluiten
+  }
+}
+
 // ── Nominatim reverse geocoding ───────────────────────────────────
 // Zet GPS-coördinaten om naar een echte straatnaam via OpenStreetMap.
 // Gratis, geen API key nodig, nauwkeurig tot straatniveau.
@@ -49,8 +71,9 @@ const SYSTEM_PROMPT = `Je bent de Immo Scanner skill. Je analyseert foto's van B
 
 ## ABSOLUTE REGELS — NOOIT OVERTREDEN
 
-1. **GEEN hallucinations of gissingen.** Als je een listing toont, moet die effectief bestaan op het opgegeven adres. Twijfel je? Toon het dan NIET.
-2. **Locatie moet kloppen binnen 200m.** Als de GPS-locatie "Coupure Links, Gent" aangeeft, toon dan listings op Coupure Links zelf én aangrenzende straten binnen ~200m. Een listing op 2km afstand is fout. Twijfel over de afstand? Vermeld dit in de notitie maar toon de listing wel — en geef duidelijk aan dat de gebruiker zelf moet verifiëren.
+1. **GEEN hallucinations of gissingen.** Als je een listing toont, moet die effectief bestaan. Twijfel je? Toon het dan NIET.
+2. **Controleer of de listing nog actief is.** Kijk in het Google-zoekresultaat naar woorden als "verkocht", "verhuurd", "niet meer beschikbaar", "sold", "loué", "this property is no longer available". Staat dat er? → URL niet meegeven, status = niet_gevonden, faal_categorie = LISTING_NIET_ONLINE.
+3. **Locatie moet kloppen binnen 200m.** Als de GPS-locatie "Coupure Links, Gent" aangeeft, toon dan listings op Coupure Links zelf én aangrenzende straten binnen ~200m. Een listing op 2km afstand is fout. Twijfel over de afstand? Vermeld dit in de notitie maar toon de listing wel — en geef duidelijk aan dat de gebruiker zelf moet verifiëren.
 3. **"Niet gevonden" is een eerlijk en correct antwoord.** Liever niets tonen dan iets fout tonen.
 4. **JE MOET altijd zoeken.** Geef NOOIT op zonder minstens 3 zoekopdrachten uitgevoerd te hebben.
 
@@ -130,10 +153,12 @@ Voorbeeld: \`immoweb "de fooz" gent duplex huur\`
 - Brede Google: \`[makelaar] [gemeente] [type] [pand_type] vastgoed\`
 - Met straatnaam als EXTRA filter op al gevonden kandidaten
 
-**Na elke zoekopdracht: selecteer kandidaten op basis van GPS-afstand.**
-Je weet dat de gebruiker op ~[straat] stond. Welke gevonden listing is het dichtst bij die locatie?
+**Na elke zoekopdracht: selecteer kandidaten op basis van GPS-afstand, NIET op straatnaam.**
+In historische stadscentra (zoals Gent) liggen Veldstraat, Lange Veldstraat en Okkernootsteeg letterlijk naast elkaar maar hebben totaal verschillende namen. Straatnaam-overeenkomst zegt niets over nabijheid.
+Gebruik uitsluitend de GPS-coördinaten of de gemeente als filter:
+→ Zelfde gemeente + plausibel type + zelfde makelaar = geldige kandidaat
 → Meerdere kandidaten? Toon ze allemaal, gesorteerd op waarschijnlijkheid.
-→ Geen enkele kandidaat in de buurt? Ga verder met de volgende zoekopdracht.
+→ Geen enkele kandidaat in de gemeente? Ga verder met de volgende zoekopdracht.
 
 ---
 
@@ -280,6 +305,25 @@ app.post('/api/scan', async (req, res) => {
     }
 
     const result = JSON.parse(jsonMatch[0]);
+
+    // ── URL verificatie ──────────────────────────────────────────
+    // Controleer of de gevonden listing-URL nog bestaat vóór we die tonen.
+    if (result.url) {
+      const urlActief = await checkUrlActief(result.url);
+      if (urlActief === false) {
+        console.log('🚫 URL dood (404):', result.url);
+        result.url = null;
+        result.status = 'niet_gevonden';
+        result.faal_categorie = result.faal_categorie || 'LISTING_NIET_ONLINE';
+        result.notitie = 'De listing werd gevonden in Google maar bestaat niet meer op de website (404). ' +
+          'Het pand is waarschijnlijk al verhuurd of verkocht. ' + (result.notitie || '');
+      } else if (urlActief === null) {
+        // Onzeker (timeout of geblokkeerd) — toon wel maar met waarschuwing
+        result.notitie = (result.notitie ? result.notitie + ' ' : '') +
+          'Let op: de link kon niet automatisch gecontroleerd worden — verifieer zelf of de listing nog actief is.';
+      }
+      // urlActief === true → alles ok, niets aanpassen
+    }
 
     // ── Adres fallback ────────────────────────────────────────────
     // Als Claude geen adres kon bepalen maar Nominatim wél een straatnaam geeft,
