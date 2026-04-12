@@ -12,40 +12,36 @@ const SUPABASE_KEY   = process.env.SUPABASE_ANON_KEY;
 // ── Supabase client ───────────────────────────────────────────────
 const supabase = SUPABASE_KEY ? createClient(SUPABASE_URL, SUPABASE_KEY) : null;
 if (!supabase) console.warn('⚠️  SUPABASE_ANON_KEY niet ingesteld — scans worden niet opgeslagen.');
-
-if (!API_KEY) {
-  console.warn('⚠️  ANTHROPIC_API_KEY niet ingesteld als environment variable!');
-}
+if (!API_KEY)   console.warn('⚠️  ANTHROPIC_API_KEY niet ingesteld als environment variable!');
 
 // ── Middleware ────────────────────────────────────────────────────
 app.use(express.json({ limit: '25mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
+
+// ═══════════════════════════════════════════════════════════════════
+//  HULPFUNCTIES
+// ═══════════════════════════════════════════════════════════════════
+
 // ── URL verificatie ───────────────────────────────────────────────
-// Controleer of een listing-URL nog actief is vóór we die tonen.
-// Geeft true (actief), false (404/dood), of null (onzeker/timeout).
 async function checkUrlActief(url) {
   if (!url) return null;
   try {
     const resp = await fetch(url, {
-      method: 'HEAD',
-      redirect: 'follow',
+      method: 'HEAD', redirect: 'follow',
       headers: { 'User-Agent': 'Mozilla/5.0 (compatible; ImmoScanner/1.0)' },
       signal: AbortSignal.timeout(6000)
     });
-    // 404, 410 = zeker dood | 200-399 = actief
     if (resp.status === 404 || resp.status === 410) return false;
     if (resp.status >= 200 && resp.status < 400) return true;
-    return null; // andere statuscodes: onzeker
+    return null;
   } catch (e) {
     console.warn('URL check mislukt voor', url, '—', e.message);
-    return null; // timeout of geblokkeerd: onzeker, niet uitsluiten
+    return null;
   }
 }
 
 // ── Nominatim reverse geocoding ───────────────────────────────────
-// Zet GPS-coördinaten om naar een echte straatnaam via OpenStreetMap.
-// Gratis, geen API key nodig, nauwkeurig tot straatniveau.
 async function reverseGeocode(lat, lon) {
   try {
     const url = `https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lon}&format=json&addressdetails=1`;
@@ -55,190 +51,582 @@ async function reverseGeocode(lat, lon) {
     if (!resp.ok) return null;
     const data = await resp.json();
     const addr = data.address || {};
-    // Bouw straatnaam + gemeente samen
-    const straat    = addr.road || addr.pedestrian || addr.path || null;
-    const gemeente  = addr.city || addr.town || addr.village || addr.municipality || null;
-    const postcode  = addr.postcode || null;
-    return { straat, gemeente, postcode, volledig: data.display_name };
+    return {
+      straat:    addr.road || addr.pedestrian || addr.path || null,
+      gemeente:  addr.city || addr.town || addr.village || addr.municipality || null,
+      postcode:  addr.postcode || null,
+      volledig:  data.display_name
+    };
   } catch (e) {
     console.warn('Nominatim fout:', e.message);
     return null;
   }
 }
 
-// ── System prompt ─────────────────────────────────────────────────
-const SYSTEM_PROMPT = `Je bent de Immo Scanner skill. Je analyseert foto's van Belgische makelaarsborden en zoekt de bijhorende vastgoedlisting op via de web_search tool.
+// ── Makelaarsite rechtstreeks doorzoeken ─────────────────────────
+// Bezoekt de listingpagina van de makelaar direct — geen Google nodig.
+// Elke makelaar heeft een andere URL-structuur, dus we werken met een database.
+const MAKELAAR_LISTINGS_DB = {
+  'defooz.com': {
+    huur:  'https://www.defooz.com/te-huur',
+    koop:  'https://www.defooz.com/te-koop',
+    // Filter op gemeente via URL-parameter indien ondersteund
+    huurGemeente: (g) => `https://www.defooz.com/te-huur?locality=${g}`,
+    koopGemeente: (g) => `https://www.defooz.com/te-koop?locality=${g}`,
+  },
+  'era.be': {
+    huur:  (g, pc) => `https://www.era.be/nl/te-huur/${pc}-${g}`,
+    koop:  (g, pc) => `https://www.era.be/nl/te-koop/${pc}-${g}`,
+  },
+  'dewaele.com': {
+    huur:  (g, pc) => `https://www.dewaele.com/nl/te-huur/${pc}-${g}`,
+    koop:  (g, pc) => `https://www.dewaele.com/nl/te-koop/${pc}-${g}`,
+  },
+  'trevi.be': {
+    huur:  (g) => `https://www.trevi.be/nl/properties?transaction=rental&locality=${g}`,
+    koop:  (g) => `https://www.trevi.be/nl/properties?transaction=sale&locality=${g}`,
+  },
+  'huysewinkel.be': {
+    huur:  'https://www.huysewinkel.be/te-huur',
+    koop:  'https://www.huysewinkel.be/te-koop',
+  },
+  'crevits.be': {
+    huur:  'https://crevits.be/nl/te-huur',
+    koop:  'https://crevits.be/nl/te-koop',
+  },
+  'quares.be': {
+    huur:  (g) => `https://immo.quares.be/nl/te-huur?city=${g}`,
+    koop:  (g) => `https://immo.quares.be/nl/te-koop?city=${g}`,
+  },
+  'hillewaere-vastgoed.be': {
+    huur:  (g) => `https://www.hillewaere-vastgoed.be/nl/te-huur?city=${g}`,
+    koop:  (g) => `https://www.hillewaere-vastgoed.be/nl/te-koop?city=${g}`,
+  },
+  'heylenvastgoed.be': {
+    huur:  (g) => `https://www.heylenvastgoed.be/nl/te-huur?city=${g}`,
+    koop:  (g) => `https://www.heylenvastgoed.be/nl/te-koop?city=${g}`,
+  },
+  'carloeggermont.be': {
+    huur:  'https://carloeggermont.be/te-huur',
+    koop:  'https://carloeggermont.be/te-koop',
+  },
+};
 
-## ABSOLUTE REGELS — NOOIT OVERTREDEN
+async function searchMakelaar(makelaarNaam, listingType, gemeente, postcode) {
+  // Zoek de makelaar in de database op basis van naam-match
+  const naamLower = makelaarNaam?.toLowerCase() || '';
+  let config = null;
+  let domein = null;
 
-1. **GEEN hallucinations of gissingen.** Als je een listing toont, moet die effectief bestaan. Twijfel je? Toon het dan NIET.
-2. **Controleer of de listing nog actief is.** Kijk in het Google-zoekresultaat naar woorden als "verkocht", "verhuurd", "niet meer beschikbaar", "sold", "loué", "this property is no longer available". Staat dat er? → URL niet meegeven, status = niet_gevonden, faal_categorie = LISTING_NIET_ONLINE.
-3. **Locatie moet kloppen binnen 200m.** Als de GPS-locatie "Coupure Links, Gent" aangeeft, toon dan listings op Coupure Links zelf én aangrenzende straten binnen ~200m. Een listing op 2km afstand is fout. Twijfel over de afstand? Vermeld dit in de notitie maar toon de listing wel — en geef duidelijk aan dat de gebruiker zelf moet verifiëren.
-3. **"Niet gevonden" is een eerlijk en correct antwoord.** Liever niets tonen dan iets fout tonen.
-4. **JE MOET altijd zoeken.** Geef NOOIT op zonder minstens 3 zoekopdrachten uitgevoerd te hebben.
+  for (const [site, cfg] of Object.entries(MAKELAAR_LISTINGS_DB)) {
+    // Match op domeinnaam in de maakelaarsnaam of omgekeerd
+    const siteBase = site.replace('.be', '').replace('.com', '');
+    if (naamLower.includes(siteBase) || siteBase.includes(naamLower.split(' ')[0])) {
+      config = cfg;
+      domein = site;
+      break;
+    }
+  }
 
----
+  if (!config) {
+    console.log(`⚠️  Makelaar "${makelaarNaam}" niet in database, sla directe zoek over`);
+    return [];
+  }
 
-## MAKELAARS DATABASE (kleur → logo → naam → website):
-- ERA: rood (#E30613) + wit, "ERA" vetgedrukt blokschrift → era.be
-- Trevi: rood + wit, "Trevi" cursief schreefloos → trevi.be
+  const isHuur = listingType === 'Te huur';
+  const urlFn  = isHuur ? config.huur : config.koop;
+  const gem    = gemeente?.toLowerCase() || 'gent';
+  const pc     = postcode || '9000';
+
+  const url = typeof urlFn === 'function' ? urlFn(gem, pc) : urlFn;
+  console.log(`🏢 Makelaar ${domein} rechtstreeks ophalen:`, url);
+
+  try {
+    const resp = await fetch(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'nl-BE,nl;q=0.9,en;q=0.8'
+      },
+      signal: AbortSignal.timeout(10000)
+    });
+
+    if (!resp.ok) {
+      console.warn(`Makelaarsite HTTP ${resp.status} voor ${url}`);
+      return [];
+    }
+
+    const html = await resp.text();
+    console.log(`📄 ${domein} HTML: ${html.length} bytes`);
+
+    const listings = [];
+
+    // ── Methode 1: __NEXT_DATA__ (Next.js) ──────────────────────
+    const nextMatch = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
+    if (nextMatch) {
+      try {
+        const nd = JSON.parse(nextMatch[1]);
+        const pp = nd?.props?.pageProps || {};
+        const results = pp.properties || pp.listings || pp.results || pp.classifieds || [];
+        if (Array.isArray(results) && results.length > 0) {
+          console.log(`✅ ${domein} __NEXT_DATA__: ${results.length} resultaten`);
+          for (const item of results.slice(0, 25)) {
+            const loc = item.location || item.address || {};
+            listings.push({
+              id:      item.id || item.reference,
+              title:   item.title || item.name || `${item.type || ''} ${item.subtype || ''}`.trim(),
+              url:     item.url || item.link || null,
+              price:   item.price?.value ? `€ ${item.price.value}` : (item.price ? `€ ${item.price}` : null),
+              address: [loc.street, loc.number, loc.locality || loc.city].filter(Boolean).join(' ') || null,
+              bedrooms: item.bedroomCount || item.bedrooms || null,
+              area:     item.surface || item.area || null,
+              bron:     `${domein}_nextdata`
+            });
+          }
+        }
+      } catch (e) { console.warn(`${domein} __NEXT_DATA__ parse fout:`, e.message); }
+    }
+
+    // ── Methode 2: JSON-LD structured data ──────────────────────
+    const jsonldRegex = /<script type="application\/ld\+json">([\s\S]*?)<\/script>/g;
+    let jm;
+    while ((jm = jsonldRegex.exec(html)) !== null) {
+      try {
+        const ld = JSON.parse(jm[1]);
+        const items = ld['@type'] === 'ItemList' ? (ld.itemListElement || []) : [ld];
+        for (const item of items) {
+          const thing = item.item || item;
+          if (thing.url && (thing['@type'] === 'RealEstateListing' || thing.offers)) {
+            listings.push({
+              title:   thing.name || 'Listing',
+              url:     thing.url,
+              price:   thing.offers?.price ? `€ ${thing.offers.price}` : null,
+              address: thing.address?.streetAddress || null,
+              bron:    `${domein}_jsonld`
+            });
+          }
+        }
+      } catch (e) { /* niet elk JSON-LD blok is relevant */ }
+    }
+
+    // ── Methode 3: Regex voor listing-links ─────────────────────
+    // Vang links op die eruitzien als detail-pagina's van listings
+    const linkRegex = /href="((?:https?:\/\/[^"]*)?\/(?:te-huur|te-koop|huur|koop|detail|listing|property)[\/\-][^"]{5,120})"/gi;
+    let lm;
+    const seenUrls = new Set(listings.map(l => l.url));
+    while ((lm = linkRegex.exec(html)) !== null) {
+      let href = lm[1];
+      if (!href.startsWith('http')) href = `https://${domein}${href}`;
+      if (!seenUrls.has(href) && !href.includes('?') && href.split('/').length > 4) {
+        seenUrls.add(href);
+        listings.push({ url: href, title: href.split('/').pop()?.replace(/-/g, ' ') || 'Listing', bron: `${domein}_regex` });
+      }
+    }
+
+    console.log(`🏠 ${domein}: ${listings.length} listings gevonden`);
+    return listings;
+
+  } catch (e) {
+    console.warn(`Makelaarsite fetch fout voor ${domein}:`, e.message);
+    return [];
+  }
+}
+
+// ── Immoweb zoeken ───────────────────────────────────────────────
+// Haalt listings rechtstreeks op van Immoweb (geen Google nodig).
+// Probeert meerdere extractiemethodes (Next.js data, regex, etc.)
+async function searchImmoweb(pandType, listingType, gemeente, postcode) {
+  // Map naar Immoweb URL-slugs
+  const typeMap = {
+    'appartement': 'appartement', 'duplex': 'duplex', 'studio': 'studio',
+    'penthouse': 'penthouse', 'loft': 'loft', 'kot': 'kot',
+    'woning': 'huis', 'huis': 'huis', 'rijwoning': 'huis',
+    'villa': 'huis', 'fermette': 'huis', 'herenwoning': 'huis',
+    'bel-étage': 'huis', 'bungalow': 'huis', 'chalet': 'huis',
+    'grond': 'grond', 'bouwgrond': 'grond',
+    'handelspand': 'handelspand', 'kantoor': 'kantoor',
+    'garage': 'garage', 'parkeerplaats': 'garage'
+  };
+  const transactieMap = { 'Te koop': 'te-koop', 'Te huur': 'te-huur' };
+
+  const type       = typeMap[pandType?.toLowerCase()] || 'appartement';
+  const transactie = transactieMap[listingType]       || 'te-huur';
+  const gem        = (gemeente || 'gent').toLowerCase().replace(/\s+/g, '-');
+  const pc         = postcode || '9000';
+
+  // Probeer ook breder zoeken: als type = duplex, zoek ook appartement
+  const typesToTry = [type];
+  if (type === 'duplex') typesToTry.push('appartement');
+  if (type === 'huis')   typesToTry.push('woning');
+
+  const allListings = [];
+
+  for (const t of typesToTry) {
+    const url = `https://www.immoweb.be/nl/zoeken/${t}/${transactie}/${gem}/${pc}?orderBy=relevance`;
+    console.log('🔍 Immoweb ophalen:', url);
+
+    try {
+      const resp = await fetch(url, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          'Accept-Language': 'nl-BE,nl;q=0.9,en;q=0.8'
+        },
+        signal: AbortSignal.timeout(10000)
+      });
+
+      if (!resp.ok) {
+        console.warn('Immoweb HTTP', resp.status, 'voor', url);
+        continue;
+      }
+
+      const html = await resp.text();
+      console.log(`📄 Immoweb HTML ontvangen: ${html.length} bytes voor ${t}`);
+
+      // ── Methode 1: __NEXT_DATA__ (Next.js SSR) ──────────────────
+      const nextMatch = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
+      if (nextMatch) {
+        try {
+          const nextData = JSON.parse(nextMatch[1]);
+          // Navigeer door de Next.js data op zoek naar resultaten
+          const pageProps = nextData?.props?.pageProps || {};
+          const searchData =
+            pageProps.searchResults?.results ||
+            pageProps.results ||
+            pageProps.classifieds ||
+            pageProps.searchState?.results ||
+            [];
+
+          if (Array.isArray(searchData) && searchData.length > 0) {
+            console.log(`✅ __NEXT_DATA__ bevat ${searchData.length} resultaten`);
+            for (const item of searchData.slice(0, 20)) {
+              const prop = item.property || item;
+              const loc  = prop.location || {};
+              const price = item.price || item.transaction?.sale?.price || item.transaction?.rental?.monthlyRentalPrice || {};
+              allListings.push({
+                id:        item.id || item.classified?.id || null,
+                title:     item.title || item.cluster?.title || `${prop.type} ${prop.subtype || ''}`.trim(),
+                url:       item.id ? `https://www.immoweb.be/nl/zoekertje/${t}/${transactie}/${gem}/${pc}/${item.id}` : null,
+                price:     price.mainValue ? `€ ${price.mainValue.toLocaleString('nl-BE')}` : (price.value ? `€ ${price.value}` : null),
+                type:      `${prop.type || ''} ${prop.subtype || ''}`.trim(),
+                address:   [loc.street, loc.number, loc.locality].filter(Boolean).join(' ') || null,
+                postcode:  loc.postalCode || null,
+                bedrooms:  prop.bedroomCount || null,
+                area:      prop.netHabitableSurface || prop.surface || null,
+                agency:    item.customerName || null,
+                bron:      'immoweb_nextdata'
+              });
+            }
+          } else {
+            console.log('⚠️ __NEXT_DATA__ gevonden maar geen resultaten-array');
+            // Log de keys zodat we de structuur kunnen achterhalen
+            console.log('   pageProps keys:', Object.keys(pageProps).join(', '));
+          }
+        } catch (e) {
+          console.warn('__NEXT_DATA__ parse fout:', e.message);
+        }
+      }
+
+      // ── Methode 2: iw-search JSON data ──────────────────────────
+      const iwMatch = html.match(/window\.__INITIAL_SEARCH_RESULTS__\s*=\s*(\{[\s\S]*?\});/);
+      if (iwMatch) {
+        try {
+          const iwData = JSON.parse(iwMatch[1]);
+          const results = iwData.results || iwData.classifieds || [];
+          console.log(`✅ __INITIAL_SEARCH_RESULTS__ bevat ${results.length} resultaten`);
+          for (const item of results.slice(0, 20)) {
+            allListings.push({
+              id:      item.id,
+              title:   item.title || `Listing ${item.id}`,
+              url:     `https://www.immoweb.be/nl/zoekertje/${t}/${transactie}/${gem}/${pc}/${item.id}`,
+              price:   item.price ? `€ ${item.price}` : null,
+              address: item.address || item.street || null,
+              bron:    'immoweb_initial_search'
+            });
+          }
+        } catch (e) {
+          console.warn('__INITIAL_SEARCH_RESULTS__ parse fout:', e.message);
+        }
+      }
+
+      // ── Methode 3: Regex voor listing-URLs in de HTML ───────────
+      // Vang URLs op als: /nl/zoekertje/duplex/te-huur/gent/9000/21480312
+      const urlRegex = /href="(\/nl\/zoekertje\/[^"]+\/(\d{5,}))/g;
+      let urlMatch;
+      const seenIds = new Set(allListings.map(l => String(l.id)));
+      while ((urlMatch = urlRegex.exec(html)) !== null) {
+        const listingId = urlMatch[2];
+        if (!seenIds.has(listingId)) {
+          seenIds.add(listingId);
+          // Probeer de titel te vinden nabij deze URL
+          const titleRegex = new RegExp(`${listingId}[\\s\\S]{0,500}?<h2[^>]*>([^<]+)</h2>`, 'i');
+          const titleMatch = html.match(titleRegex);
+          allListings.push({
+            id:    listingId,
+            title: titleMatch?.[1]?.trim() || `Listing ${listingId}`,
+            url:   `https://www.immoweb.be${urlMatch[1]}`,
+            bron:  'immoweb_regex'
+          });
+        }
+      }
+
+      // ── Methode 4: JSON-LD structured data ──────────────────────
+      const jsonldRegex = /<script type="application\/ld\+json">([\s\S]*?)<\/script>/g;
+      let jsonldMatch;
+      while ((jsonldMatch = jsonldRegex.exec(html)) !== null) {
+        try {
+          const ld = JSON.parse(jsonldMatch[1]);
+          if (ld['@type'] === 'ItemList' && ld.itemListElement) {
+            console.log(`✅ JSON-LD ItemList met ${ld.itemListElement.length} items`);
+            for (const item of ld.itemListElement) {
+              const thing = item.item || item;
+              if (thing.url && !seenIds.has(thing.url)) {
+                allListings.push({
+                  title:   thing.name || thing.description || 'Listing',
+                  url:     thing.url,
+                  price:   thing.offers?.price ? `€ ${thing.offers.price}` : null,
+                  address: thing.address?.streetAddress || null,
+                  bron:    'immoweb_jsonld'
+                });
+              }
+            }
+          }
+        } catch (e) { /* niet elk LD+JSON blok is relevant */ }
+      }
+
+    } catch (e) {
+      console.warn('Immoweb fetch fout voor', t, ':', e.message);
+    }
+  }
+
+  // Dedupliceer op ID
+  const unique = [];
+  const seen = new Set();
+  for (const l of allListings) {
+    const key = l.id || l.url;
+    if (key && !seen.has(key)) { seen.add(key); unique.push(l); }
+  }
+
+  console.log(`🏠 Immoweb totaal: ${unique.length} unieke listings gevonden`);
+  return unique;
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  SYSTEM PROMPTS
+// ═══════════════════════════════════════════════════════════════════
+
+// Stap 1: Snelle foto-analyse (geen tools, geen web_search)
+const PROMPT_STAP1 = `Analyseer dit makelaarsbord. Geef ENKEL deze JSON terug, niets anders:
+{
+  "makelaar": "naam van de makelaar",
+  "makelaar_herkenning": "hoe herkend (kleur + logo + tekst)",
+  "makelaar_betrouwbaarheid": "hoog" | "middel" | "laag",
+  "listing_type": "Te koop" | "Te huur",
+  "pand_type_slug": "duplex" | "appartement" | "huis" | "studio" | "penthouse" | "grond" | "handelspand" | "kantoor" | "garage",
+  "pand_type_display": "🏠 Woning" | "🏢 Appartement" | "🏗️ Nieuwbouw" | "🏭 Commercieel" | "🌳 Grond",
+  "referentienummer": "als zichtbaar op het bord, anders null",
+  "telefoon": "als zichtbaar op het bord, anders null"
+}
+
+MAKELAARS DATABASE (kleur → naam → website):
+- ERA: rood + wit, "ERA" vetgedrukt blokschrift → era.be
+- Trevi: rood + wit, "Trevi" cursief → trevi.be
 - DeWaele: rood + wit, "Dewaele" schreefloos → dewaele.com
-- Heylen: donkerblauw + wit, H-logo (blauw) → heylenvastgoed.be
-- Hillewaere: ORANJE (#E87722) + wit, H-logo (oranje) → hillewaere-vastgoed.be
+- Heylen: donkerblauw + wit, H-logo → heylenvastgoed.be
+- Hillewaere: ORANJE + wit, H-logo → hillewaere-vastgoed.be
 - Century 21: geel + zwart → century21.be
 - Crevits: donkergroen + wit/goud → crevits.be
 - Huysewinkel: wit + bruin H-logo → huysewinkel.be
-- de Fooz: donkerblauw + goud/oranje → defooz.com (geen koppelteken)
-- Quares: zwart + wit, minimalistisch → quares.be
-- Engel & Völkers: groen + goud → engelvoelkers.com/be/nl
+- de Fooz: donkerblauw + goud/oranje → defooz.com
+- Quares: zwart + wit → quares.be
+- Engel & Völkers: groen + goud → engelvoelkers.com/be
 - Sotheby's: navy + goud → sothebysrealty.be
-- Carlo Eggermont: marineblauw + wit, volledige naam op bord → carloeggermont.be
-- Onbekend: zoek eerst via Google op naam van de makelaar
+- Carlo Eggermont: marineblauw + wit → carloeggermont.be
 
----
+Onderscheid bij rood: ERA = vetgedrukt blokschrift. Trevi = cursief. DeWaele = schreefloos.
+Onderscheid bij H-logo: Heylen = BLAUW. Hillewaere = ORANJE.
 
-## STAP 1 — Analyseer het bord
+Geef ENKEL de JSON terug.`;
 
-- Primaire kleur + logo-vorm + leesbare naam → match met database hierboven
-- Type: TE KOOP of TE HUUR
-- Referentienummer als zichtbaar (belangrijk voor directe zoek)
-- Telefoonnummer als zichtbaar (bewaar als fallback)
-- Vertrouw NIET blindweg op de URL die op het bord staat — gebruik de database voor de correcte website
+// Stap 2: Match listing uit Immoweb-resultaten + web_search fallback
+const PROMPT_STAP2 = `Je bent de Immo Scanner. Je hebt zojuist een makelaarsbord geanalyseerd en je krijgt nu een lijst met vastgoedlistings van Immoweb. Kies de listing die het best overeenkomt.
 
----
+## ABSOLUTE REGELS
+1. **GEEN hallucinations.** Toon alleen listings die echt in de lijst staan.
+2. **"Niet gevonden" is een geldig antwoord** als geen enkele listing overeenkomt.
+3. **Locatie**: het pand moet in dezelfde gemeente en idealiter binnen 200m van de GPS-locatie liggen. Hoekpanden staan op zijstraten — dat is normaal.
+4. **Type**: te koop vs te huur moet kloppen.
+5. **Makelaar**: als de makelaar/agency in de listing overeenkomt met het bord, is dat een sterke bevestiging.
+6. **Visuele match**: als de foto het gebouw toont, vergelijk de gevel/architectuur met de beschrijving.
 
-## STAP 2 — Locatie bepalen (STRIKT — geen gissingen)
+## KIES UIT DE KANDIDATEN
+- Meerdere mogelijke matches? Toon de beste 1-3 met een korte uitleg waarom.
+- Geen match? Gebruik dan je web_search tool als fallback (zoek breed op makelaar + gemeente + type).
+- Nog steeds niets? Status = "niet_gevonden", geef eerlijk aan wat je geprobeerd hebt.
 
-Je krijgt één van deze situaties:
-
-**Situatie A — Straatnaam opgegeven (GPS omgezet):**
-Deze straatnaam is waar de GEBRUIKER staat, niet noodzakelijk het adres van het pand. Gebruik de straatnaam NIET als zoekfilter — een hoekpand staat geregistreerd op de zijstraat. Gebruik de straatnaam alleen achteraf om uit gevonden kandidaten de meest nabije te kiezen. Zoek eerst breed op makelaar + type + gemeente (zie Stap 3).
-
-**Situatie B — Geen straatnaam beschikbaar:**
-Kijk in de foto naar: zichtbare straatnaamborden, huisnummers op gevels, winkelnamen of andere identificeerbare tekst.
-Als er NIETS te lezen is: zoek breed op gemeente + type pand + makelaar. Vermeld in het resultaat dat het adres onbekend is.
-
----
-
-## STAP 3 — ZOEK ACTIEF via web_search (VERPLICHT, in deze volgorde)
-
-**KRITIEKE REGEL: Zoek NOOIT op straatnaam in de eerste zoekopdrachten.**
-Een pand op een hoek staat geregistreerd op de ZIJSTRAAT, niet op de straat waar jij staat. De straatnaam gebruik je alleen achteraf om kandidaten te vergelijken, nooit als zoekfilter.
-
-Voer zoekopdrachten uit in deze volgorde:
-
-### Zoekopdracht 1 — Makelaar eigen site, breed (GEEN straatnaam):
-\`site:[makelaar website] [gemeente] [type: "te huur" of "te koop"]\`
-Voorbeeld: \`site:defooz.com gent "te huur"\`
-→ Dit geeft alle actuele listings van die makelaar in die stad.
-
-### Zoekopdracht 2 — Immoweb met makelaar en type (GEEN straatnaam):
-\`site:immoweb.be [makelaar] [gemeente] [type]\`
-Voorbeeld: \`site:immoweb.be "de fooz" gent "te huur"\`
-of: \`immoweb [makelaar] [gemeente] [type] [pand_type]\`
-Voorbeeld: \`immoweb "de fooz" gent duplex huur\`
-
-### Zoekopdracht 3 — Zimmo breed:
-\`site:zimmo.be [gemeente] [type] [pand_type]\`
-
-### Zoekopdracht 4 — Realo breed:
-\`site:realo.be [gemeente] [makelaar] [type]\`
-
-### Zoekopdracht 5 — Referentienummer (als zichtbaar op het bord):
-\`"[referentienummer]" [makelaar]\`
-→ Een referentienummer is uniek en vindt direct de juiste listing.
-
-### Zoekopdrachten 6-8 — Variaties:
-- Immoscoop.be, Spotto.be
-- Brede Google: \`[makelaar] [gemeente] [type] [pand_type] vastgoed\`
-- Met straatnaam als EXTRA filter op al gevonden kandidaten
-
-**Na elke zoekopdracht: selecteer kandidaten op basis van GPS-afstand, NIET op straatnaam.**
-In historische stadscentra (zoals Gent) liggen Veldstraat, Lange Veldstraat en Okkernootsteeg letterlijk naast elkaar maar hebben totaal verschillende namen. Straatnaam-overeenkomst zegt niets over nabijheid.
-Gebruik uitsluitend de GPS-coördinaten of de gemeente als filter:
-→ Zelfde gemeente + plausibel type + zelfde makelaar = geldige kandidaat
-→ Meerdere kandidaten? Toon ze allemaal, gesorteerd op waarschijnlijkheid.
-→ Geen enkele kandidaat in de gemeente? Ga verder met de volgende zoekopdracht.
-
----
-
-## STAP 4 — Kies de beste match uit de kandidaten
-
-Na het zoeken heb je mogelijk meerdere listings. Kies op basis van:
-1. **Afstand tot GPS-locatie**: welke listing ligt het dichtst bij de opgegeven straat/locatie? (ook zijstraten tellen mee — hoekpanden staan op de zijstraat)
-2. **Type overeenkomst**: te koop vs te huur correct?
-3. **Visuele architectuur**: als de foto het gebouw toont, klopt de gevel/bouwstijl met de listing-foto's?
-
-Toon de beste match. Als meerdere even waarschijnlijk zijn, toon ze allebei met een korte omschrijving zodat de gebruiker zelf kan kiezen.
-
----
-
-## STAP 5 — OUTPUT — gebruik EXACT dit JSON-formaat:
-
+## OUTPUT — gebruik EXACT dit JSON-formaat:
 {
   "status": "gevonden" | "niet_gevonden" | "gedeeltelijk",
   "makelaar": "naam",
-  "makelaar_herkenning": "hoe herkend (kleur + logo + tekst)",
+  "makelaar_herkenning": "hoe herkend",
   "makelaar_betrouwbaarheid": "hoog" | "middel" | "laag",
   "pand_type": "🏠 Woning" | "🏢 Appartement" | "🏗️ Nieuwbouw" | "🏭 Commercieel" | "🌳 Grond",
   "listing_type": "Te koop" | "Te huur",
-  "adres": "volledig adres of 'Niet bepaald'",
+  "adres": "volledig adres uit de listing, of null",
   "gemeente": "gemeente",
   "prijs": "€ bedrag of 'Op aanvraag' of 'Niet gevonden'",
   "slaapkamers": "aantal of null",
   "oppervlakte": "m² of null",
   "staat": "Instapklaar" | "Op te frissen" | "Te renoveren" | "Nieuwbouw" | "Onbekend",
   "extras": ["garage", "tuin", "terras"],
-  "url": "directe URL naar listing of null",
-  "telefoon": "telefoonnummer van bord of makelaar",
-  "gevonden_via": "welke zoekopdracht leverde het resultaat op",
-  "faal_categorie": null | "MAKELAAR_NIET_HERKEND" | "MAKELAAR_WEBSITE_GEEN_ZOEK" | "LISTING_NIET_ONLINE" | "ADRES_NIET_BEPAALBAAR" | "GPS_TE_VER" | "FALLBACK_OOK_LEEG" | "FOTO_ONLEESBAAR",
-  "notitie": "eerlijke uitleg voor de gebruiker — inclusief wat je geprobeerd hebt"
+  "url": "directe Immoweb/makelaar URL of null",
+  "telefoon": "telefoonnummer of null",
+  "gevonden_via": "immoweb_direct" | "web_search" | "niet gevonden",
+  "faal_categorie": null | "MAKELAAR_NIET_HERKEND" | "LISTING_NIET_ONLINE" | "ADRES_NIET_BEPAALBAAR" | "FALLBACK_OOK_LEEG" | "FOTO_ONLEESBAAR",
+  "notitie": "korte uitleg voor de gebruiker"
 }
 
 Geef ENKEL de JSON terug, geen extra tekst.`;
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  API ENDPOINTS
+// ═══════════════════════════════════════════════════════════════════
 
 // ── /api/scan ─────────────────────────────────────────────────────
 app.post('/api/scan', async (req, res) => {
   const { image, mime, gps } = req.body;
 
   if (!image) return res.status(400).json({ error: 'Geen foto meegestuurd.' });
-  if (!API_KEY) return res.status(500).json({ error: 'API key niet geconfigureerd. Contacteer de beheerder.' });
+  if (!API_KEY) return res.status(500).json({ error: 'API key niet geconfigureerd.' });
+
+  const startTime = Date.now();
 
   // ── GPS → straatnaam via Nominatim ───────────────────────────
-  let locatieInfo = '';
   let geocodeResultaat = null;
-
   if (gps) {
-    // Gebruik pand-GPS als de frontend die berekend heeft (GPS + kompasrichting),
-    // anders val terug op de gebruiker-GPS
     const geocodeLat = gps.property_lat || gps.lat;
     const geocodeLon = gps.property_lon || gps.lon;
     geocodeResultaat = await reverseGeocode(geocodeLat, geocodeLon);
-
-    if (geocodeResultaat && geocodeResultaat.straat) {
-      locatieInfo =
-        `GPS locatie omgezet naar straatnaam: "${geocodeResultaat.straat}, ${geocodeResultaat.gemeente}" ` +
-        `(postcode ${geocodeResultaat.postcode || '?'}, nauwkeurigheid GPS ±${gps.accuracy}m).\n` +
-        `BELANGRIJK: Het pand staat op of nabij "${geocodeResultaat.straat}". ` +
-        `Zoek uitsluitend listings op DEZE straat. Listings op andere straten worden genegeerd.`;
-    } else {
-      // Nominatim faalde — gebruik coördinaten als hint
-      locatieInfo =
-        `GPS beschikbaar maar straatnaam kon niet worden bepaald. ` +
-        `Coördinaten: ${gps.lat}°N, ${gps.lon}°O (nauwkeurigheid ±${gps.accuracy}m). ` +
-        `Kijk in de foto naar zichtbare straatnamen of huisnummers.`;
-    }
-  } else {
-    locatieInfo =
-      'Geen GPS beschikbaar. Kijk in de foto naar zichtbare straatnamen, huisnummers of herkenbare gebouwen. ' +
-      'Als niets leesbaar is, zoek breed op gemeente + type pand.';
   }
 
-  try {
-    const startTime = Date.now();
+  const adresFoto = geocodeResultaat?.straat
+    ? `${geocodeResultaat.straat}, ${geocodeResultaat.gemeente || ''}`.trim().replace(/,$/, '')
+    : null;
 
-    const anthropicResp = await fetch('https://api.anthropic.com/v1/messages', {
+  try {
+    // ══════════════════════════════════════════════════════════════
+    // STAP 1 — Snelle foto-analyse: wie is de makelaar + type?
+    // ══════════════════════════════════════════════════════════════
+    console.log('📸 STAP 1: Foto-analyse starten...');
+
+    const stap1Resp = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type':      'application/json',
+        'x-api-key':         API_KEY,
+        'anthropic-version': '2023-06-01'
+      },
+      body: JSON.stringify({
+        model:      'claude-sonnet-4-6',
+        max_tokens: 500,
+        system:     PROMPT_STAP1,
+        messages: [{
+          role: 'user',
+          content: [
+            { type: 'image', source: { type: 'base64', media_type: mime || 'image/jpeg', data: image } },
+            { type: 'text', text: 'Analyseer dit makelaarsbord. Geef de JSON.' }
+          ]
+        }]
+      })
+    });
+
+    if (!stap1Resp.ok) {
+      const err = await stap1Resp.text();
+      console.error('Stap 1 API fout:', stap1Resp.status, err);
+      return res.status(502).json({ error: `Claude API fout stap 1 (${stap1Resp.status}).` });
+    }
+
+    const stap1Data = await stap1Resp.json();
+    const stap1Text = stap1Data.content?.find(b => b.type === 'text')?.text || '';
+    const stap1Match = stap1Text.match(/\{[\s\S]*\}/);
+    if (!stap1Match) {
+      console.error('Stap 1: geen JSON in response:', stap1Text);
+      return res.status(500).json({ error: 'Foto-analyse mislukt. Probeer opnieuw.' });
+    }
+
+    const bordInfo = JSON.parse(stap1Match[0]);
+    console.log('✅ STAP 1 klaar:', {
+      makelaar: bordInfo.makelaar,
+      type: bordInfo.listing_type,
+      pand: bordInfo.pand_type_slug
+    });
+
+    // ══════════════════════════════════════════════════════════════
+    // STAP 2 — Zoeken: makelaarsite eerst, dan Immoweb als fallback
+    // ══════════════════════════════════════════════════════════════
+    const gemeente = geocodeResultaat?.gemeente || 'Gent';
+    const postcode = geocodeResultaat?.postcode || '9000';
+
+    // 2a. Probeer eerst de makelaarsite rechtstreeks
+    console.log('🏢 STAP 2a: Makelaarsite rechtstreeks doorzoeken...');
+    let listings = await searchMakelaar(
+      bordInfo.makelaar,
+      bordInfo.listing_type,
+      gemeente,
+      postcode
+    );
+    let listingsBron = 'makelaar_direct';
+
+    // 2b. Fallback: Immoweb als makelaarsite niets opleverde
+    if (listings.length === 0) {
+      console.log('⚠️  Makelaarsite leeg — Immoweb als fallback...');
+      listings = await searchImmoweb(
+        bordInfo.pand_type_slug,
+        bordInfo.listing_type,
+        gemeente,
+        postcode
+      );
+      listingsBron = 'immoweb_fallback';
+    }
+
+    console.log(`✅ STAP 2 klaar: ${listings.length} listings via ${listingsBron}`);
+
+    // Bouw context voor Claude
+    let listingsContext = '';
+    if (listings.length > 0) {
+      listingsContext = `\n\n## LISTINGS GEVONDEN VIA ${listingsBron.toUpperCase()} (${listings.length} resultaten)\n\n`;
+      for (const l of listings.slice(0, 25)) {
+        listingsContext += `- **${l.title || 'Geen titel'}**\n`;
+        if (l.address)  listingsContext += `  Adres: ${l.address}\n`;
+        if (l.price)    listingsContext += `  Prijs: ${l.price}\n`;
+        if (l.bedrooms) listingsContext += `  Slaapkamers: ${l.bedrooms}\n`;
+        if (l.area)     listingsContext += `  Oppervlakte: ${l.area} m²\n`;
+        if (l.agency)   listingsContext += `  Makelaar/agency: ${l.agency}\n`;
+        if (l.url)      listingsContext += `  URL: ${l.url}\n`;
+        listingsContext += '\n';
+      }
+    } else {
+      listingsContext = '\n\n## GEEN LISTINGS gevonden via makelaarsite of Immoweb. Gebruik je web_search tool als laatste redmiddel.\n';
+    }
+
+    // Locatie info
+    let locatieInfo = '';
+    if (adresFoto) {
+      locatieInfo = `Gebruiker stond bij: ${adresFoto} (GPS). Let op: het pand kan op een zijstraat of hoek staan.`;
+    } else if (gps) {
+      locatieInfo = `GPS: ${gps.lat}°N, ${gps.lon}°O (±${gps.accuracy}m). Straatnaam onbekend.`;
+    } else {
+      locatieInfo = 'Geen GPS beschikbaar.';
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // STAP 3 — Claude matcht de juiste listing
+    // ══════════════════════════════════════════════════════════════
+    console.log('🎯 STAP 3: Claude matcht listing uit', listings.length, 'kandidaten...');
+
+    const stap3Resp = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {
         'Content-Type':      'application/json',
@@ -252,23 +640,27 @@ app.post('/api/scan', async (req, res) => {
         tools: [{
           type:     'web_search_20250305',
           name:     'web_search',
-          max_uses: 8                    // verhoogd van 5 naar 8
+          max_uses: 5    // fallback als Immoweb niets opleverde
         }],
-        system:   SYSTEM_PROMPT,
+        system: PROMPT_STAP2,
         messages: [{
           role: 'user',
           content: [
-            {
-              type: 'image',
-              source: {
-                type:       'base64',
-                media_type: mime || 'image/jpeg',
-                data:       image
-              }
-            },
+            { type: 'image', source: { type: 'base64', media_type: mime || 'image/jpeg', data: image } },
             {
               type: 'text',
-              text: `${locatieInfo}\n\nAnalyseer dit makelaarsbord. Gebruik daarna VERPLICHT de web_search tool om de listing te zoeken, in de volgorde beschreven in de instructies. Toon ALLEEN listings die overeenkomen met de correcte straat en het juiste type. Geef het resultaat als JSON.`
+              text: `## BORDANALYSE (stap 1)
+Makelaar: ${bordInfo.makelaar} (${bordInfo.makelaar_herkenning})
+Betrouwbaarheid: ${bordInfo.makelaar_betrouwbaarheid}
+Type: ${bordInfo.listing_type}
+Pand: ${bordInfo.pand_type_slug}
+Referentienummer: ${bordInfo.referentienummer || 'niet zichtbaar'}
+Telefoon: ${bordInfo.telefoon || 'niet zichtbaar'}
+
+## LOCATIE
+${locatieInfo}
+${listingsContext}
+Kies de beste match uit de Immoweb-lijst. Als geen enkele listing past, gebruik dan web_search als fallback. Geef het resultaat als JSON.`
             }
           ]
         }]
@@ -277,37 +669,40 @@ app.post('/api/scan', async (req, res) => {
 
     const zoekduur = ((Date.now() - startTime) / 1000).toFixed(2);
 
-    if (!anthropicResp.ok) {
-      const errText = await anthropicResp.text();
-      console.error('Anthropic API fout:', anthropicResp.status, errText);
-      return res.status(502).json({ error: `Claude API fout (${anthropicResp.status}). Probeer opnieuw.` });
+    if (!stap3Resp.ok) {
+      const err = await stap3Resp.text();
+      console.error('Stap 3 API fout:', stap3Resp.status, err);
+      return res.status(502).json({ error: `Claude API fout stap 3 (${stap3Resp.status}).` });
     }
 
-    const data = await anthropicResp.json();
+    const stap3Data = await stap3Resp.json();
 
-    // Zoek het laatste text-block met JSON (na alle tool calls)
+    // Zoek het laatste text-block met JSON
     let rawText = '';
-    for (const block of data.content) {
-      if (block.type === 'text' && block.text.includes('{')) {
-        rawText = block.text;
-      }
+    for (const block of stap3Data.content) {
+      if (block.type === 'text' && block.text.includes('{')) rawText = block.text;
     }
 
     if (!rawText) {
-      console.error('Geen JSON gevonden in Claude response:', JSON.stringify(data.content));
-      return res.status(500).json({ error: 'Onverwachte respons van Claude. Probeer opnieuw.' });
+      console.error('Stap 3: geen JSON in response:', JSON.stringify(stap3Data.content));
+      return res.status(500).json({ error: 'Matching mislukt. Probeer opnieuw.' });
     }
 
     const jsonMatch = rawText.match(/\{[\s\S]*\}/);
     if (!jsonMatch) {
-      console.error('Geen JSON-object in tekst:', rawText);
-      return res.status(500).json({ error: 'Onverwachte respons van Claude. Probeer opnieuw.' });
+      console.error('Stap 3: geen JSON-object:', rawText);
+      return res.status(500).json({ error: 'Matching mislukt. Probeer opnieuw.' });
     }
 
     const result = JSON.parse(jsonMatch[0]);
 
+    // Vul ontbrekende velden aan vanuit stap 1
+    result.makelaar              = result.makelaar || bordInfo.makelaar;
+    result.makelaar_herkenning   = result.makelaar_herkenning || bordInfo.makelaar_herkenning;
+    result.makelaar_betrouwbaarheid = result.makelaar_betrouwbaarheid || bordInfo.makelaar_betrouwbaarheid;
+    result.telefoon              = result.telefoon || bordInfo.telefoon;
+
     // ── URL verificatie ──────────────────────────────────────────
-    // Controleer of de gevonden listing-URL nog bestaat vóór we die tonen.
     if (result.url) {
       const urlActief = await checkUrlActief(result.url);
       if (urlActief === false) {
@@ -315,40 +710,24 @@ app.post('/api/scan', async (req, res) => {
         result.url = null;
         result.status = 'niet_gevonden';
         result.faal_categorie = result.faal_categorie || 'LISTING_NIET_ONLINE';
-        result.notitie = 'De listing werd gevonden in Google maar bestaat niet meer op de website (404). ' +
-          'Het pand is waarschijnlijk al verhuurd of verkocht. ' + (result.notitie || '');
+        result.notitie = 'De listing bestaat niet meer (404). Waarschijnlijk al verhuurd/verkocht. ' + (result.notitie || '');
       } else if (urlActief === null) {
-        // Onzeker (timeout of geblokkeerd) — toon wel maar met waarschuwing
         result.notitie = (result.notitie ? result.notitie + ' ' : '') +
-          'Let op: de link kon niet automatisch gecontroleerd worden — verifieer zelf of de listing nog actief is.';
+          'Let op: de link kon niet automatisch gecontroleerd worden.';
       }
-      // urlActief === true → alles ok, niets aanpassen
     }
 
-    // ── Adres foto (locatie gebruiker) ───────────────────────────
-    // Dit is NIET het adres van het pand, maar waar de gebruiker stond.
-    // Komt altijd uit Nominatim (GPS-locatie van de gebruiker/camera).
-    const adresFoto = geocodeResultaat?.straat
-      ? `${geocodeResultaat.straat}, ${geocodeResultaat.gemeente || ''}`.trim().replace(/,$/, '')
-      : null;
-
-    // Gemeente fallback: als Claude geen gemeente teruggeeft, gebruik Nominatim
-    if (!result.gemeente && geocodeResultaat?.gemeente) {
-      result.gemeente = geocodeResultaat.gemeente;
-    }
-
-    // adres in result = het effectieve pandadres uit de listing (gevonden via zoekfunctie)
-    // Dat laten we leeg als Claude het niet gevonden heeft — adres_foto is de fallback voor de gebruiker
+    // Gemeente fallback
+    if (!result.gemeente && geocodeResultaat?.gemeente) result.gemeente = geocodeResultaat.gemeente;
     if (result.adres === 'Niet bepaald') result.adres = null;
 
-    console.log('📊 SCAN:', {
+    console.log('📊 SCAN KLAAR:', {
       ts:        new Date().toISOString(),
       makelaar:  result.makelaar,
       status:    result.status,
       adres:     result.adres,
-      straat:    geocodeResultaat?.straat || 'n/a',
-      bearing:   gps?.bearing != null ? `${Math.round(gps.bearing)}°` : 'n/a',
-      pand_gps:  gps?.property_lat ? `${gps.property_lat},${gps.property_lon}` : 'n/a',
+      adresFoto: adresFoto,
+      listings:  `${listings.length} via ${listingsBron}`,
       faal:      result.faal_categorie,
       duur:      `${zoekduur}s`
     });
@@ -393,22 +772,38 @@ app.post('/api/scan', async (req, res) => {
   }
 });
 
+// ── /api/test-zoeken ──────────────────────────────────────────────
+// Test endpoint: bekijk wat de zoekfuncties teruggeven zonder volledige scan
+// Gebruik: /api/test-zoeken?makelaar=de+fooz&type=duplex&transactie=Te+huur&gemeente=gent&postcode=9000
+app.get('/api/test-zoeken', async (req, res) => {
+  const { makelaar, type, transactie, gemeente, postcode } = req.query;
+  const gem = gemeente || 'gent';
+  const pc  = postcode || '9000';
+  const tr  = transactie || 'Te huur';
+
+  const [makelaarListings, immowebListings] = await Promise.all([
+    searchMakelaar(makelaar || 'de fooz', tr, gem, pc),
+    searchImmoweb(type || 'duplex', tr, gem, pc)
+  ]);
+
+  res.json({
+    makelaar_direct: { count: makelaarListings.length, listings: makelaarListings },
+    immoweb_fallback: { count: immowebListings.length, listings: immowebListings }
+  });
+});
+
 // ── /api/feedback ─────────────────────────────────────────────────
 app.post('/api/feedback', async (req, res) => {
   const { scan_id, feedback_type, makelaar_correct, faal_categorie_override } = req.body;
-
   console.log('💬 FEEDBACK:', { scan_id, feedback_type, makelaar_correct });
-
   if (supabase && scan_id) {
     const { error } = await supabase.from('feedback').insert({
-      scan_id,
-      feedback_type,
+      scan_id, feedback_type,
       makelaar_correct:        makelaar_correct ?? null,
       faal_categorie_override: faal_categorie_override || null
     });
     if (error) console.error('Supabase feedback fout:', error.message);
   }
-
   return res.json({ ok: true });
 });
 
