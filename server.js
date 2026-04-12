@@ -325,15 +325,21 @@ app.post('/api/scan', async (req, res) => {
       // urlActief === true → alles ok, niets aanpassen
     }
 
-    // ── Adres fallback ────────────────────────────────────────────
-    // Als Claude geen adres kon bepalen maar Nominatim wél een straatnaam geeft,
-    // gebruik dan die straatnaam als minimaal adres. Beter dan "Niet bepaald".
-    if ((!result.adres || result.adres === 'Niet bepaald' || result.adres === '') && geocodeResultaat?.straat) {
-      result.adres = `${geocodeResultaat.straat}, ${geocodeResultaat.gemeente || ''}`.trim().replace(/,$/, '');
-    }
+    // ── Adres foto (locatie gebruiker) ───────────────────────────
+    // Dit is NIET het adres van het pand, maar waar de gebruiker stond.
+    // Komt altijd uit Nominatim (GPS-locatie van de gebruiker/camera).
+    const adresFoto = geocodeResultaat?.straat
+      ? `${geocodeResultaat.straat}, ${geocodeResultaat.gemeente || ''}`.trim().replace(/,$/, '')
+      : null;
+
+    // Gemeente fallback: als Claude geen gemeente teruggeeft, gebruik Nominatim
     if (!result.gemeente && geocodeResultaat?.gemeente) {
       result.gemeente = geocodeResultaat.gemeente;
     }
+
+    // adres in result = het effectieve pandadres uit de listing (gevonden via zoekfunctie)
+    // Dat laten we leeg als Claude het niet gevonden heeft — adres_foto is de fallback voor de gebruiker
+    if (result.adres === 'Niet bepaald') result.adres = null;
 
     console.log('📊 SCAN:', {
       ts:        new Date().toISOString(),
@@ -356,7 +362,8 @@ app.post('/api/scan', async (req, res) => {
         makelaar_betrouwbaarheid:result.makelaar_betrouwbaarheid,
         listing_type:            result.listing_type,
         pand_type:               result.pand_type,
-        adres:                   result.adres,
+        adres_foto:              adresFoto,
+        adres:                   result.adres || null,
         gemeente:                result.gemeente,
         prijs:                   result.prijs,
         slaapkamers:             result.slaapkamers,
