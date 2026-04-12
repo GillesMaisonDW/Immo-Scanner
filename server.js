@@ -252,4 +252,104 @@ app.post('/api/scan', async (req, res) => {
     // Zoek het laatste text-block met JSON (na alle tool calls)
     let rawText = '';
     for (const block of data.content) {
-      if (block.type === 
+      if (block.type === 'text' && block.text.includes('{')) {
+        rawText = block.text;
+      }
+    }
+
+    if (!rawText) {
+      console.error('Geen JSON gevonden in Claude response:', JSON.stringify(data.content));
+      return res.status(500).json({ error: 'Onverwachte respons van Claude. Probeer opnieuw.' });
+    }
+
+    const jsonMatch = rawText.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) {
+      console.error('Geen JSON-object in tekst:', rawText);
+      return res.status(500).json({ error: 'Onverwachte respons van Claude. Probeer opnieuw.' });
+    }
+
+    const result = JSON.parse(jsonMatch[0]);
+
+    console.log('📊 SCAN:', {
+      ts:        new Date().toISOString(),
+      makelaar:  result.makelaar,
+      status:    result.status,
+      adres:     result.adres,
+      straat:    geocodeResultaat?.straat || 'n/a',
+      faal:      result.faal_categorie,
+      duur:      `${zoekduur}s`
+    });
+
+    // ── Supabase opslaan ──────────────────────────────────────────
+    let scanId = null;
+    if (supabase) {
+      const { data: dbData, error } = await supabase.from('scans').insert({
+        makelaar:                result.makelaar,
+        makelaar_herkenning:     result.makelaar_herkenning,
+        makelaar_betrouwbaarheid:result.makelaar_betrouwbaarheid,
+        listing_type:            result.listing_type,
+        pand_type:               result.pand_type,
+        adres:                   result.adres,
+        gemeente:                result.gemeente,
+        prijs:                   result.prijs,
+        slaapkamers:             result.slaapkamers,
+        oppervlakte:             result.oppervlakte,
+        staat:                   result.staat,
+        extras:                  result.extras || [],
+        status:                  result.status,
+        url:                     result.url,
+        telefoon:                result.telefoon,
+        gevonden_via:            result.gevonden_via,
+        faal_categorie:          result.faal_categorie,
+        notitie:                 result.notitie,
+        gps_beschikbaar:         !!gps,
+        gps_nauwkeurigheid_m:    gps?.accuracy || null,
+        zoekduur_seconden:       parseFloat(zoekduur)
+      }).select('id').single();
+
+      if (error) console.error('Supabase schrijffout:', error.message);
+      else scanId = dbData?.id;
+    }
+
+    return res.json({ ...result, scan_id: scanId });
+
+  } catch (err) {
+    console.error('Server fout:', err);
+    return res.status(500).json({ error: 'Server fout: ' + err.message });
+  }
+});
+
+// ── /api/feedback ─────────────────────────────────────────────────
+app.post('/api/feedback', async (req, res) => {
+  const { scan_id, feedback_type, makelaar_correct, faal_categorie_override } = req.body;
+
+  console.log('💬 FEEDBACK:', { scan_id, feedback_type, makelaar_correct });
+
+  if (supabase && scan_id) {
+    const { error } = await supabase.from('feedback').insert({
+      scan_id,
+      feedback_type,
+      makelaar_correct:        makelaar_correct ?? null,
+      faal_categorie_override: faal_categorie_override || null
+    });
+    if (error) console.error('Supabase feedback fout:', error.message);
+  }
+
+  return res.json({ ok: true });
+});
+
+// ── Health check ──────────────────────────────────────────────────
+app.get('/health', (req, res) => {
+  res.json({
+    status:    'ok',
+    api_key:   API_KEY  ? 'geladen ✅' : 'ONTBREEKT ❌',
+    supabase:  supabase ? 'verbonden ✅' : 'ONTBREEKT ❌',
+    timestamp: new Date().toISOString()
+  });
+});
+
+// ── Start ──────────────────────────────────────────────────────────
+app.listen(PORT, () => {
+  console.log(`🏠 Immo Scanner draait op http://localhost:${PORT}`);
+  console.log(`🔑 API key: ${API_KEY ? 'geladen ✅' : 'ONTBREEKT ❌'}`);
+});
