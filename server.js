@@ -178,7 +178,11 @@ app.post('/api/scan', async (req, res) => {
   let geocodeResultaat = null;
 
   if (gps) {
-    geocodeResultaat = await reverseGeocode(gps.lat, gps.lon);
+    // Gebruik pand-GPS als de frontend die berekend heeft (GPS + kompasrichting),
+    // anders val terug op de gebruiker-GPS
+    const geocodeLat = gps.property_lat || gps.lat;
+    const geocodeLon = gps.property_lon || gps.lon;
+    geocodeResultaat = await reverseGeocode(geocodeLat, geocodeLon);
 
     if (geocodeResultaat && geocodeResultaat.straat) {
       locatieInfo =
@@ -270,12 +274,24 @@ app.post('/api/scan', async (req, res) => {
 
     const result = JSON.parse(jsonMatch[0]);
 
+    // ── Adres fallback ────────────────────────────────────────────
+    // Als Claude geen adres kon bepalen maar Nominatim wél een straatnaam geeft,
+    // gebruik dan die straatnaam als minimaal adres. Beter dan "Niet bepaald".
+    if ((!result.adres || result.adres === 'Niet bepaald' || result.adres === '') && geocodeResultaat?.straat) {
+      result.adres = `${geocodeResultaat.straat}, ${geocodeResultaat.gemeente || ''}`.trim().replace(/,$/, '');
+    }
+    if (!result.gemeente && geocodeResultaat?.gemeente) {
+      result.gemeente = geocodeResultaat.gemeente;
+    }
+
     console.log('📊 SCAN:', {
       ts:        new Date().toISOString(),
       makelaar:  result.makelaar,
       status:    result.status,
       adres:     result.adres,
       straat:    geocodeResultaat?.straat || 'n/a',
+      bearing:   gps?.bearing != null ? `${Math.round(gps.bearing)}°` : 'n/a',
+      pand_gps:  gps?.property_lat ? `${gps.property_lat},${gps.property_lon}` : 'n/a',
       faal:      result.faal_categorie,
       duur:      `${zoekduur}s`
     });
