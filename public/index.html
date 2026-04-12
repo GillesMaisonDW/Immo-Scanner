@@ -256,7 +256,7 @@
 
       <input type="file" id="camera-input"  accept="image/*" capture="environment" onchange="photoSelected(this)">
       <input type="file" id="upload-input" accept="image/*" onchange="photoSelected(this)">
-      <button class="btn btn-orange" onclick="startGPS(); document.getElementById('camera-input').click()">
+      <button class="btn btn-orange" onclick="startKompas(); startGPS(); document.getElementById('camera-input').click()">
         📷 Foto nemen
       </button>
       <button class="btn btn-outline" style="margin-top:10px;" onclick="startGPS(); document.getElementById('upload-input').click()">
@@ -343,10 +343,48 @@
 <!-- JAVASCRIPT                            -->
 <!-- ══════════════════════════════════════ -->
 <script>
-let currentPhoto  = null;
-let currentMime   = 'image/jpeg';
-let currentGPS    = null;
-let lastResult    = null;
+let currentPhoto    = null;
+let currentMime     = 'image/jpeg';
+let currentGPS      = null;
+let lastResult      = null;
+let compassHeading  = null;  // graden vanaf noord (0 = noord, 90 = oost, ...)
+
+// ── KOMPAS ───────────────────────────────
+// Berekent de geschatte locatie van het pand op basis van
+// de GPS-positie van de gebruiker + de richting van de camera.
+// Aanname: het pand staat ~40 meter voor de gebruiker.
+function estimatePandLocatie(lat, lon, bearingDeg) {
+  const AFSTAND_M = 40;
+  const R = 6371000;
+  const b = bearingDeg * Math.PI / 180;
+  const φ = lat * Math.PI / 180;
+  const dLat = (AFSTAND_M / R) * Math.cos(b) * 180 / Math.PI;
+  const dLon = (AFSTAND_M / R) * Math.sin(b) / Math.cos(φ) * 180 / Math.PI;
+  return { lat: parseFloat((lat + dLat).toFixed(5)), lon: parseFloat((lon + dLon).toFixed(5)) };
+}
+
+function handleOrientatie(e) {
+  // iOS geeft webkitCompassHeading, Android geeft alpha (maar gespiegeld)
+  if (e.webkitCompassHeading != null) {
+    compassHeading = e.webkitCompassHeading;
+  } else if (e.alpha != null) {
+    compassHeading = (360 - e.alpha) % 360;
+  }
+}
+
+function startKompas() {
+  // iOS 13+ vereist expliciete toestemming
+  if (typeof DeviceOrientationEvent !== 'undefined' &&
+      typeof DeviceOrientationEvent.requestPermission === 'function') {
+    DeviceOrientationEvent.requestPermission()
+      .then(state => { if (state === 'granted') window.addEventListener('deviceorientation', handleOrientatie, true); })
+      .catch(() => {});
+  } else {
+    // Android en oudere iOS
+    window.addEventListener('deviceorientationabsolute', handleOrientatie, true);
+    window.addEventListener('deviceorientation', handleOrientatie, true);
+  }
+}
 
 // ── GPS ──────────────────────────────────
 function startGPS() {
@@ -363,9 +401,23 @@ function startGPS() {
   text.textContent = 'GPS ophalen...';
   navigator.geolocation.getCurrentPosition(
     (pos) => {
-      currentGPS = { lat: pos.coords.latitude.toFixed(5), lon: pos.coords.longitude.toFixed(5), accuracy: Math.round(pos.coords.accuracy) };
+      const lat = pos.coords.latitude;
+      const lon = pos.coords.longitude;
+      currentGPS = {
+        lat: parseFloat(lat.toFixed(5)),
+        lon: parseFloat(lon.toFixed(5)),
+        accuracy: Math.round(pos.coords.accuracy)
+      };
+      // Voeg pand-locatie toe als kompasrichting bekend is
+      if (compassHeading !== null) {
+        const pand = estimatePandLocatie(lat, lon, compassHeading);
+        currentGPS.property_lat = pand.lat;
+        currentGPS.property_lon = pand.lon;
+        currentGPS.bearing = Math.round(compassHeading);
+      }
       pill.className = 'gps-pill ok';
-      text.textContent = `GPS actief · ±${currentGPS.accuracy}m`;
+      const kompasInfo = compassHeading !== null ? ` · 🧭 ${Math.round(compassHeading)}°` : '';
+      text.textContent = `GPS actief · ±${currentGPS.accuracy}m${kompasInfo}`;
       warn.style.display = 'none';
     },
     () => {
