@@ -41,6 +41,84 @@ async function checkUrlActief(url) {
   }
 }
 
+// ── Adres ophalen van detail-pagina van een listing ───────────────
+// Na matching bezoeken we de detailpagina om het exacte adres te extraheren.
+async function fetchAdresVanListing(url) {
+  if (!url) return null;
+  try {
+    const resp = await fetch(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'nl-BE,nl;q=0.9,en;q=0.8'
+      },
+      signal: AbortSignal.timeout(8000)
+    });
+    if (!resp.ok) return null;
+    const html = await resp.text();
+
+    // Methode 1: JSON-LD structured data (meest betrouwbaar)
+    const jsonldRegex = /<script[^>]*type="application\/ld\+json"[^>]*>([\s\S]*?)<\/script>/gi;
+    let jm;
+    while ((jm = jsonldRegex.exec(html)) !== null) {
+      try {
+        const ld = JSON.parse(jm[1]);
+        const addr = ld.address || ld.location?.address;
+        if (addr && addr.streetAddress) {
+          const straat = addr.streetAddress.trim();
+          const gemeente = addr.addressLocality ? addr.addressLocality.trim() : '';
+          console.log(`📍 Adres via JSON-LD: ${straat}, ${gemeente}`);
+          return gemeente ? `${straat}, ${gemeente}` : straat;
+        }
+      } catch {}
+    }
+
+    // Methode 2: __NEXT_DATA__ (Next.js SSR)
+    const nextMatch = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
+    if (nextMatch) {
+      try {
+        const nd = JSON.parse(nextMatch[1]);
+        const pp = nd?.props?.pageProps || {};
+        const prop = pp.property || pp.listing || pp.classified || pp.result || {};
+        const loc = prop.location || prop.address || {};
+        const straat = loc.street || loc.streetAddress || loc.straat || null;
+        const nr = loc.number || loc.houseNumber || '';
+        const gemeente = loc.locality || loc.city || loc.gemeente || '';
+        if (straat) {
+          const adres = [straat, nr].filter(Boolean).join(' ').trim();
+          console.log(`📍 Adres via __NEXT_DATA__: ${adres}, ${gemeente}`);
+          return gemeente ? `${adres}, ${gemeente}` : adres;
+        }
+      } catch {}
+    }
+
+    // Methode 3: Regex patronen voor veelgebruikte immo-sites
+    const adresPatterns = [
+      // defooz.com: "streetAddress":"Okkernootsteeg 1"
+      /"streetAddress"\s*:\s*"([^"]{5,80})"/i,
+      // Algemeen JSON patroon
+      /"adres"\s*:\s*"([^"]{5,80})"/i,
+      /"address"\s*:\s*"([^"]{5,80})"/i,
+      // HTML class patronen
+      /<[^>]*class="[^"]*(?:adres|address|location|locatie)[^"]*"[^>]*>\s*([A-Z][^<]{4,60})</i,
+    ];
+    for (const pattern of adresPatterns) {
+      const match = html.match(pattern);
+      if (match) {
+        const adres = match[1].trim();
+        console.log(`📍 Adres via regex: ${adres}`);
+        return adres;
+      }
+    }
+
+    console.log('⚠️ Geen adres gevonden op detailpagina:', url);
+    return null;
+  } catch (e) {
+    console.warn('fetchAdresVanListing fout:', e.message);
+    return null;
+  }
+}
+
 // ── Nominatim reverse geocoding ───────────────────────────────────
 async function reverseGeocode(lat, lon) {
   try {
@@ -702,6 +780,13 @@ Kies de beste match uit de Immoweb-lijst. Als geen enkele listing past, gebruik 
     result.makelaar_betrouwbaarheid = result.makelaar_betrouwbaarheid || bordInfo.makelaar_betrouwbaarheid;
     result.telefoon              = result.telefoon || bordInfo.telefoon;
 
+    // ── Adres ophalen van de listing detailpagina ────────────────
+    let adresListing = null;
+    if (result.url && result.status !== 'niet_gevonden') {
+      adresListing = await fetchAdresVanListing(result.url);
+      if (adresListing) console.log('📍 Adres van detailpagina:', adresListing);
+    }
+
     // ── URL verificatie ──────────────────────────────────────────
     if (result.url) {
       const urlActief = await checkUrlActief(result.url);
@@ -742,7 +827,7 @@ Kies de beste match uit de Immoweb-lijst. Als geen enkele listing past, gebruik 
         listing_type:            result.listing_type,
         pand_type:               result.pand_type,
         adres_foto:              adresFoto,
-        adres:                   result.adres || null,
+        adres:                   adresListing || result.adres || null,
         gemeente:                result.gemeente,
         prijs:                   result.prijs,
         slaapkamers:             result.slaapkamers,
