@@ -759,31 +759,18 @@ app.post('/api/scan', async (req, res) => {
     const postcode = geocodeResultaat?.postcode || '9000';
 
     // ══════════════════════════════════════════════════════════════
-    // STAP 1.5 — Makelaar onzeker? Probeer via Immoweb-adres + correcties
+    // STAP 1.5 — Extra verificatie: telefoon, correcties, adres
     // ══════════════════════════════════════════════════════════════
     const betrouwbaarheid = (bordInfo.makelaar_betrouwbaarheid || '').toUpperCase();
     const makelaarOnzeker = betrouwbaarheid === 'LAAG' || bordInfo.makelaar === 'onbekend';
 
-    if (makelaarOnzeker && !makelaar_override) {
-      console.log('🔎 STAP 1.5: Makelaar onzeker — extra zoekpaden activeren...');
+    if (!makelaar_override) {
 
-      // 1.5a: Check of deze makelaar eerder gecorrigeerd werd door gebruikers
-      const correcties = await laadMakelaarCorrecties();
-      const makelaarLower = (bordInfo.makelaar || '').toLowerCase();
-      const correctieMatch = Object.keys(correcties).find(naam =>
-        naam.toLowerCase().includes(makelaarLower) || makelaarLower.includes(naam.toLowerCase())
-      );
-      if (correctieMatch) {
-        console.log(`✅ Stap 1.5a: Eerder gecorrigeerd — gebruik "${correctieMatch}"`);
-        bordInfo.makelaar = correctieMatch;
-        bordInfo.makelaar_herkenning += ` (bevestigd via ${correcties[correctieMatch]}x gebruikerscorrectie)`;
-        bordInfo.makelaar_betrouwbaarheid = 'MIDDEL';
-      }
-
-      // 1.5b: Telefoonnummer op bord → web search → makelaar identificeren
+      // 1.5a: Telefoonnummer ALTIJD opzoeken als het zichtbaar is op het bord
+      // — telefoonnummer is betrouwbaarder dan visuele herkenning
       const telefoon = bordInfo.telefoon;
-      if (telefoon && (betrouwbaarheid === 'LAAG' || bordInfo.makelaar === 'onbekend' || betrouwbaarheid === 'MIDDEL')) {
-        console.log(`📞 Stap 1.5b: Telefoonnummer "${telefoon}" opzoeken via web search...`);
+      if (telefoon) {
+        console.log(`📞 Stap 1.5a: Telefoonnummer "${telefoon}" ALTIJD opzoeken als verificatie...`);
         try {
           const telResp = await fetch('https://api.anthropic.com/v1/messages', {
             method: 'POST',
@@ -851,18 +838,37 @@ Als je het niet kan vinden: RESULTAAT: {"naam": null, "website": null}`,
         }
       }
 
-      // 1.5c: GPS beschikbaar → zoek op Immoweb via adres om makelaar te identificeren
-      const betrouwbaarheidNa15b = (bordInfo.makelaar_betrouwbaarheid || '').toUpperCase();
-      if (geocodeResultaat?.straat && (betrouwbaarheidNa15b === 'LAAG' || bordInfo.makelaar === 'onbekend')) {
-        console.log('🔎 Stap 1.5c: Makelaar afleiden via Immoweb-adres...');
-        const gevonden = await ontdekMakelaarViaAdres(
-          geocodeResultaat.straat, gemeente, postcode
+      // 1.5b: Als nog steeds onzeker — correcties uit Supabase + adres-lookup
+      const betrouwbaarheidNa15a = (bordInfo.makelaar_betrouwbaarheid || '').toUpperCase();
+      if (betrouwbaarheidNa15a === 'LAAG' || bordInfo.makelaar === 'onbekend') {
+        console.log('🔎 Stap 1.5b: Makelaar nog steeds onzeker — correcties + adres proberen...');
+
+        // Correcties uit Supabase
+        const correcties = await laadMakelaarCorrecties();
+        const makelaarLower = (bordInfo.makelaar || '').toLowerCase();
+        const correctieMatch = Object.keys(correcties).find(naam =>
+          naam.toLowerCase().includes(makelaarLower) || makelaarLower.includes(naam.toLowerCase())
         );
-        if (gevonden) {
-          bordInfo.makelaar = gevonden.naam;
-          bordInfo.makelaar_herkenning += ` (afgeleid via ${gevonden.via})`;
+        if (correctieMatch) {
+          console.log(`✅ Stap 1.5b: Eerder gecorrigeerd — gebruik "${correctieMatch}"`);
+          bordInfo.makelaar = correctieMatch;
+          bordInfo.makelaar_herkenning += ` (bevestigd via ${correcties[correctieMatch]}x gebruikerscorrectie)`;
           bordInfo.makelaar_betrouwbaarheid = 'MIDDEL';
-          console.log(`✅ Stap 1.5c: Makelaar bijgewerkt naar "${gevonden.naam}"`);
+        }
+
+        // GPS adres-lookup via Immoweb
+        const betrouwbaarheidNa15b = (bordInfo.makelaar_betrouwbaarheid || '').toUpperCase();
+        if (geocodeResultaat?.straat && (betrouwbaarheidNa15b === 'LAAG' || bordInfo.makelaar === 'onbekend')) {
+          console.log('🔎 Stap 1.5b-adres: Makelaar afleiden via Immoweb-adres...');
+          const gevonden = await ontdekMakelaarViaAdres(
+            geocodeResultaat.straat, gemeente, postcode
+          );
+          if (gevonden) {
+            bordInfo.makelaar = gevonden.naam;
+            bordInfo.makelaar_herkenning += ` (afgeleid via ${gevonden.via})`;
+            bordInfo.makelaar_betrouwbaarheid = 'MIDDEL';
+            console.log(`✅ Stap 1.5b-adres: Makelaar bijgewerkt naar "${gevonden.naam}"`);
+          }
         }
       }
     }
