@@ -141,82 +141,100 @@ async function reverseGeocode(lat, lon) {
   }
 }
 
-// ── Makelaarsite rechtstreeks doorzoeken ─────────────────────────
-// Bezoekt de listingpagina van de makelaar direct — geen Google nodig.
-// Elke makelaar heeft een andere URL-structuur, dus we werken met een database.
-const MAKELAAR_LISTINGS_DB = {
-  'defooz.com': {
-    huur:  'https://www.defooz.com/te-huur',
-    koop:  'https://www.defooz.com/te-koop',
-    // Filter op gemeente via URL-parameter indien ondersteund
-    huurGemeente: (g) => `https://www.defooz.com/te-huur?locality=${g}`,
-    koopGemeente: (g) => `https://www.defooz.com/te-koop?locality=${g}`,
-  },
-  'era.be': {
-    huur:  (g, pc) => `https://www.era.be/nl/te-huur/${pc}-${g}`,
-    koop:  (g, pc) => `https://www.era.be/nl/te-koop/${pc}-${g}`,
-  },
-  'dewaele.com': {
-    huur:  (g, pc) => `https://www.dewaele.com/nl/te-huur/${pc}-${g}`,
-    koop:  (g, pc) => `https://www.dewaele.com/nl/te-koop/${pc}-${g}`,
-  },
-  'trevi.be': {
-    huur:  (g) => `https://www.trevi.be/nl/properties?transaction=rental&locality=${g}`,
-    koop:  (g) => `https://www.trevi.be/nl/properties?transaction=sale&locality=${g}`,
-  },
-  'huysewinkel.be': {
-    huur:  'https://www.huysewinkel.be/te-huur',
-    koop:  'https://www.huysewinkel.be/te-koop',
-  },
-  'crevits.be': {
-    huur:  'https://crevits.be/nl/te-huur',
-    koop:  'https://crevits.be/nl/te-koop',
-  },
-  'quares.be': {
-    huur:  (g) => `https://immo.quares.be/nl/te-huur?city=${g}`,
-    koop:  (g) => `https://immo.quares.be/nl/te-koop?city=${g}`,
-  },
-  'hillewaere-vastgoed.be': {
-    huur:  (g) => `https://www.hillewaere-vastgoed.be/nl/te-huur?city=${g}`,
-    koop:  (g) => `https://www.hillewaere-vastgoed.be/nl/te-koop?city=${g}`,
-  },
-  'heylenvastgoed.be': {
-    huur:  (g) => `https://www.heylenvastgoed.be/nl/te-huur?city=${g}`,
-    koop:  (g) => `https://www.heylenvastgoed.be/nl/te-koop?city=${g}`,
-  },
-  'carloeggermont.be': {
-    huur:  'https://carloeggermont.be/te-huur',
-    koop:  'https://carloeggermont.be/te-koop',
-  },
-};
+// ── Makelaar database via Supabase ────────────────────────────────
+// Makelaars worden opgeslagen in Supabase (tabel: makelaars).
+// URL-templates gebruiken {gemeente} en {postcode} als placeholders.
 
-async function searchMakelaar(makelaarNaam, listingType, gemeente, postcode) {
-  // Zoek de makelaar in de database op basis van naam-match
-  const naamLower = makelaarNaam?.toLowerCase() || '';
-  let config = null;
-  let domein = null;
+let _makelaarsCacheTs  = 0;
+let _makelaarsCache    = [];
+const CACHE_TTL_MS     = 5 * 60 * 1000; // 5 minuten cache
 
-  for (const [site, cfg] of Object.entries(MAKELAAR_LISTINGS_DB)) {
-    // Match op domeinnaam in de maakelaarsnaam of omgekeerd
-    const siteBase = site.replace('.be', '').replace('.com', '');
-    if (naamLower.includes(siteBase) || siteBase.includes(naamLower.split(' ')[0])) {
-      config = cfg;
-      domein = site;
-      break;
+async function laadMakelaarsUitSupabase() {
+  const nu = Date.now();
+  if (nu - _makelaarsCacheTs < CACHE_TTL_MS && _makelaarsCache.length > 0) {
+    return _makelaarsCache; // gebruik cache
+  }
+  if (!supabase) return [];
+  const { data, error } = await supabase
+    .from('makelaars')
+    .select('domein, naam, koop_url, huur_url')
+    .order('bevestigd', { ascending: false });
+  if (error) { console.warn('Makelaars laden mislukt:', error.message); return []; }
+  _makelaarsCache   = data || [];
+  _makelaarsCacheTs = nu;
+  console.log(`📚 ${_makelaarsCache.length} makelaars geladen uit Supabase`);
+  return _makelaarsCache;
+}
+
+function vulUrlIn(template, gemeente, postcode) {
+  if (!template) return null;
+  return template
+    .replace(/\{gemeente\}/g, (gemeente || 'gent').toLowerCase())
+    .replace(/\{postcode\}/g, postcode || '9000');
+}
+
+async function voegMakelaarToeAanSupabase(domein, naam, koopUrl, huurUrl) {
+  if (!supabase || !domein) return;
+  const { error } = await supabase.from('makelaars').upsert({
+    domein, naam: naam || domein,
+    koop_url: koopUrl || null,
+    huur_url: huurUrl || null,
+    toegevoegd_door: 'automatisch',
+    bevestigd: false,
+    updated_at: new Date().toISOString()
+  }, { onConflict: 'domein', ignoreDuplicates: false });
+  if (error) console.warn('Makelaar toevoegen mislukt:', error.message);
+  else {
+    console.log(`✅ Makelaar "${naam || domein}" toegevoegd/bijgewerkt in Supabase`);
+    _makelaarsCacheTs = 0; // cache invalideren
+  }
+}
+
+async function searchMakelaar(makelaarNaam, listingType, gemeente, postcode, makelaarWebsite) {
+  const normaliseer  = (s) => (s || '').toLowerCase().replace(/[-\s]+/g, ' ').trim();
+  const naamLower    = normaliseer(makelaarNaam);
+  const websiteLower = (makelaarWebsite || '').toLowerCase().replace('www.', '');
+
+  // Laad makelaars uit Supabase (gecached)
+  const makelaars = await laadMakelaarsUitSupabase();
+
+  let match = null;
+
+  for (const m of makelaars) {
+    const siteNorm   = normaliseer(m.domein.replace(/\.(be|com|nl)$/, ''));
+    const domeinClean = m.domein.replace('www.', '');
+
+    // Match 1: website van bord = domein in database
+    if (websiteLower && (websiteLower === domeinClean || websiteLower.includes(domeinClean) || domeinClean.includes(websiteLower))) {
+      match = m; break;
+    }
+    // Match 2: naam bevat sitebase of omgekeerd
+    if (naamLower.includes(siteNorm) || siteNorm.includes(naamLower.split(' ')[0])) {
+      match = m; break;
+    }
+    // Match 3: alle woorden van naam zitten in sitebase
+    const woorden = naamLower.split(' ').filter(w => w.length > 2);
+    if (woorden.length > 0 && woorden.every(w => siteNorm.includes(w))) {
+      match = m; break;
     }
   }
 
-  if (!config) {
-    console.log(`⚠️  Makelaar "${makelaarNaam}" niet in database, sla directe zoek over`);
+  if (!match) {
+    console.log(`⚠️  Makelaar "${makelaarNaam}" (website: ${makelaarWebsite || 'onbekend'}) niet in database`);
     return [];
   }
 
-  const isHuur = listingType === 'Te huur';
-  const urlFn  = isHuur ? config.huur : config.koop;
-  const gem    = gemeente?.toLowerCase() || 'gent';
-  const pc     = postcode || '9000';
+  const domein   = match.domein;
+  const isHuur   = listingType === 'Te huur';
+  const urlTemplate = isHuur ? match.huur_url : match.koop_url;
+  const gem      = gemeente?.toLowerCase() || 'gent';
+  const pc       = postcode || '9000';
 
-  const url = typeof urlFn === 'function' ? urlFn(gem, pc) : urlFn;
+  const url = vulUrlIn(urlTemplate, gem, pc);
+  if (!url) {
+    console.log(`⚠️  Geen URL-template voor ${domein} (${isHuur ? 'huur' : 'koop'})`);
+    return [];
+  }
   console.log(`🏢 Makelaar ${domein} rechtstreeks ophalen:`, url);
 
   try {
@@ -805,13 +823,18 @@ Als je het niet kan vinden: RESULTAAT: {"naam": null, "website": null}`,
             if (telMatch) {
               const telInfo = JSON.parse(telMatch[1]);
               if (telInfo.naam) {
-                console.log(`✅ Stap 1.5b: Makelaar gevonden via telefoonnummer: "${telInfo.naam}"`);
+                console.log(`✅ Stap 1.5a: Makelaar gevonden via telefoonnummer: "${telInfo.naam}"`);
                 bordInfo.makelaar = telInfo.naam;
                 if (telInfo.website) bordInfo.makelaar_website = telInfo.website;
                 bordInfo.makelaar_herkenning += ` (gevonden via telefoonnummer ${telefoon})`;
                 bordInfo.makelaar_betrouwbaarheid = 'HOOG';
+                // Automatisch toevoegen aan Supabase als nog niet bekend
+                if (telInfo.website) {
+                  const domeinNieuw = telInfo.website.replace('www.', '').replace(/^https?:\/\//, '');
+                  voegMakelaarToeAanSupabase(domeinNieuw, telInfo.naam, null, null);
+                }
               } else {
-                console.log('⚠️ Stap 1.5b: Telefoonnummer niet herkend als makelaar');
+                console.log('⚠️ Stap 1.5a: Telefoonnummer niet herkend als makelaar');
               }
             } else {
               // Fallback: zoek gewoon naar een JSON object in de tekst
@@ -820,11 +843,15 @@ Als je het niet kan vinden: RESULTAAT: {"naam": null, "website": null}`,
                 try {
                   const telInfo = JSON.parse(jsonMatch[0]);
                   if (telInfo.naam) {
-                    console.log(`✅ Stap 1.5b (fallback): "${telInfo.naam}"`);
+                    console.log(`✅ Stap 1.5a (fallback): "${telInfo.naam}"`);
                     bordInfo.makelaar = telInfo.naam;
                     if (telInfo.website) bordInfo.makelaar_website = telInfo.website;
                     bordInfo.makelaar_herkenning += ` (gevonden via telefoonnummer ${telefoon})`;
                     bordInfo.makelaar_betrouwbaarheid = 'HOOG';
+                    if (telInfo.website) {
+                      const domeinNieuw = telInfo.website.replace('www.', '').replace(/^https?:\/\//, '');
+                      voegMakelaarToeAanSupabase(domeinNieuw, telInfo.naam, null, null);
+                    }
                   }
                 } catch {}
               }
@@ -883,7 +910,8 @@ Als je het niet kan vinden: RESULTAAT: {"naam": null, "website": null}`,
       bordInfo.makelaar,
       bordInfo.listing_type,
       gemeente,
-      postcode
+      postcode,
+      bordInfo.makelaar_website
     );
     let listingsBron = 'makelaar_direct';
 
