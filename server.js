@@ -490,6 +490,89 @@ async function searchImmoweb(pandType, listingType, gemeente, postcode) {
 }
 
 
+// ── Makelaar afleiden via Immoweb op adres ───────────────────────
+// Gebruikt wanneer visuele herkenning onzeker is (betrouwbaarheid LAAG).
+// Zoekt Immoweb op het GPS-adres en extraheert de makelaar uit de listing.
+async function ontdekMakelaarViaAdres(straat, gemeente, postcode) {
+  if (!straat || !gemeente) return null;
+  const gem = gemeente.toLowerCase().replace(/\s+/g, '-');
+  const pc  = postcode || '9000';
+  // Zoek breed: alle types te koop én te huur, sorteer op relevantie
+  const urls = [
+    `https://www.immoweb.be/nl/zoeken/appartement/te-koop/${gem}/${pc}?orderBy=relevance`,
+    `https://www.immoweb.be/nl/zoeken/huis/te-koop/${gem}/${pc}?orderBy=relevance`,
+    `https://www.immoweb.be/nl/zoeken/appartement/te-huur/${gem}/${pc}?orderBy=relevance`,
+  ];
+  const straatNorm = straat.toLowerCase().replace(/\s+/g, ' ').trim();
+
+  for (const url of urls) {
+    try {
+      const resp = await fetch(url, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+          'Accept-Language': 'nl-BE,nl;q=0.9'
+        },
+        signal: AbortSignal.timeout(10000)
+      });
+      if (!resp.ok) continue;
+      const html = await resp.text();
+
+      // Zoek __NEXT_DATA__ voor listing-data inclusief agency/makelaar
+      const nextMatch = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
+      if (!nextMatch) continue;
+      const nd = JSON.parse(nextMatch[1]);
+      const results = nd?.props?.pageProps?.searchResults?.results ||
+                      nd?.props?.pageProps?.classifieds || [];
+
+      for (const item of results) {
+        const loc = item.property?.location || item.location || {};
+        const itemStraat = (loc.street || loc.streetAddress || '').toLowerCase();
+        // Controleer of straat overeenkomt
+        if (itemStraat && straatNorm && itemStraat.includes(straatNorm.split(' ')[0])) {
+          const agency = item.customers?.[0] || item.agency || item.customer || {};
+          const naam = agency.name || agency.agencyName || null;
+          if (naam) {
+            console.log(`🔍 Stap 1.5: Makelaar gevonden via Immoweb-adres: "${naam}" (straat match: ${itemStraat})`);
+            return { naam, via: 'immoweb_adres_match' };
+          }
+        }
+      }
+    } catch (e) {
+      console.warn('ontdekMakelaarViaAdres fout:', e.message);
+    }
+  }
+  console.log('⚠️ Stap 1.5: Geen makelaar gevonden via Immoweb-adres voor', straat, gemeente);
+  return null;
+}
+
+// ── Correcties laden uit Supabase feedback-tabel ─────────────────
+// Bouwt een dynamische map van "fout herkende naam" → "juiste naam"
+// op basis van eerdere gebruikerscorrecties.
+async function laadMakelaarCorrecties() {
+  if (!supabase) return {};
+  try {
+    const { data, error } = await supabase
+      .from('feedback')
+      .select('makelaar_naam_correct')
+      .not('makelaar_naam_correct', 'is', null)
+      .order('created_at', { ascending: false })
+      .limit(100);
+    if (error || !data) return {};
+    // Tel hoe vaak elke naam voorkomt — meest voorkomende zijn betrouwbaarst
+    const tellingen = {};
+    for (const row of data) {
+      const naam = row.makelaar_naam_correct.trim();
+      tellingen[naam] = (tellingen[naam] || 0) + 1;
+    }
+    console.log(`📚 ${Object.keys(tellingen).length} gecorrigeerde makelaars geladen:`, Object.keys(tellingen));
+    return tellingen;
+  } catch (e) {
+    console.warn('laadMakelaarCorrecties fout:', e.message);
+    return {};
+  }
+}
+
+
 // ═══════════════════════════════════════════════════════════════════
 //  SYSTEM PROMPTS
 // ═══════════════════════════════════════════════════════════════════
@@ -498,16 +581,28 @@ async function searchImmoweb(pandType, listingType, gemeente, postcode) {
 const PROMPT_STAP1 = `Analyseer dit makelaarsbord. Geef ENKEL deze JSON terug, niets anders:
 {
   "makelaar": "naam van de makelaar",
+  "makelaar_website": "domeinnaam als zichtbaar op bord (bv. janssen.be), anders null",
   "makelaar_herkenning": "hoe herkend (kleur + logo + tekst)",
-  "makelaar_betrouwbaarheid": "hoog" | "middel" | "laag",
+  "makelaar_betrouwbaarheid": "HOOG" | "MIDDEL" | "LAAG",
   "listing_type": "Te koop" | "Te huur",
   "pand_type_slug": "duplex" | "appartement" | "huis" | "studio" | "penthouse" | "grond" | "handelspand" | "kantoor" | "garage",
   "pand_type_display": "🏠 Woning" | "🏢 Appartement" | "🏗️ Nieuwbouw" | "🏭 Commercieel" | "🌳 Grond",
   "referentienummer": "als zichtbaar op het bord, anders null",
-  "telefoon": "als zichtbaar op het bord, anders null"
+  "telefoon": "als zichtbaar op het bord, anders null",
+  "tekst_op_bord": "alle leesbare tekst op het bord letterlijk overgetypt, ook gedeeltelijk"
 }
 
-MAKELAARS DATABASE (kleur → naam → website):
+## STAP 1: LEES EERST ALLE TEKST OP HET BORD
+Dit is je belangrijkste taak. Lees ALLE zichtbare tekst, ook als het bord scheef staat, gedeeltelijk zichtbaar is, of de letters klein zijn:
+- De naam van de makelaar staat bijna ALTIJD op het bord in letters — lees ze letterlijk over
+- Website-URL: zoek naar .be, .com, .nl achteraan een woord → dat is de website van de makelaar
+- Telefoonnummer: Belgische nummers beginnen met 09xx (vast) of 04xx (mobiel)
+- Referentienummer: bv. "Ref: 12345" of een code op het bord
+
+## STAP 2: HERKENN VIA LOGO + KLEUR + TEKST GECOMBINEERD
+Gebruik de tekst uit stap 1 als primaire bron, kleur/logo als bevestiging:
+
+BEKENDE MAKELAARS (kleur → naam → website):
 - ERA: rood + wit, "ERA" vetgedrukt blokschrift → era.be
 - Trevi: rood + wit, "Trevi" cursief → trevi.be
 - DeWaele: rood + wit, "Dewaele" schreefloos → dewaele.com
@@ -524,6 +619,14 @@ MAKELAARS DATABASE (kleur → naam → website):
 
 Onderscheid bij rood: ERA = vetgedrukt blokschrift. Trevi = cursief. DeWaele = schreefloos.
 Onderscheid bij H-logo: Heylen = BLAUW. Hillewaere = ORANJE.
+
+## STAP 3: BETROUWBAARHEID BEPALEN
+- HOOG: naam letterlijk gelezen op het bord OF logo + kleur 100% duidelijk
+- MIDDEL: logo/kleur herkend maar naam niet volledig leesbaar
+- LAAG: onzeker, bord gedeeltelijk zichtbaar, of onbekende makelaar
+
+Als de makelaar onbekend is maar de naam leesbaar: gebruik die naam en zet betrouwbaarheid op MIDDEL.
+Zet "onbekend" ALLEEN als er werkelijk niets leesbaar is.
 
 Geef ENKEL de JSON terug.`;
 
@@ -574,7 +677,7 @@ Geef ENKEL de JSON terug, geen extra tekst.`;
 
 // ── /api/scan ─────────────────────────────────────────────────────
 app.post('/api/scan', async (req, res) => {
-  const { image, mime, gps } = req.body;
+  const { image, mime, gps, makelaar_override } = req.body;
 
   if (!image) return res.status(400).json({ error: 'Geen foto meegestuurd.' });
   if (!API_KEY) return res.status(500).json({ error: 'API key niet geconfigureerd.' });
@@ -635,17 +738,66 @@ app.post('/api/scan', async (req, res) => {
     }
 
     const bordInfo = JSON.parse(stap1Match[0]);
+
+    // Makelaar override: gebruiker heeft zelf de juiste naam opgegeven
+    if (makelaar_override) {
+      console.log(`🔄 Makelaar override door gebruiker: "${makelaar_override}" (was: "${bordInfo.makelaar}")`);
+      bordInfo.makelaar = makelaar_override;
+      bordInfo.makelaar_herkenning = `Gecorrigeerd door gebruiker naar: ${makelaar_override}`;
+      bordInfo.makelaar_betrouwbaarheid = 'HOOG';
+    }
+
     console.log('✅ STAP 1 klaar:', {
       makelaar: bordInfo.makelaar,
+      betrouwbaarheid: bordInfo.makelaar_betrouwbaarheid,
+      tekst: bordInfo.tekst_op_bord,
       type: bordInfo.listing_type,
       pand: bordInfo.pand_type_slug
     });
 
+    const gemeente = geocodeResultaat?.gemeente || 'Gent';
+    const postcode = geocodeResultaat?.postcode || '9000';
+
+    // ══════════════════════════════════════════════════════════════
+    // STAP 1.5 — Makelaar onzeker? Probeer via Immoweb-adres + correcties
+    // ══════════════════════════════════════════════════════════════
+    const betrouwbaarheid = (bordInfo.makelaar_betrouwbaarheid || '').toUpperCase();
+    const makelaarOnzeker = betrouwbaarheid === 'LAAG' || bordInfo.makelaar === 'onbekend';
+
+    if (makelaarOnzeker && !makelaar_override) {
+      console.log('🔎 STAP 1.5: Makelaar onzeker — extra zoekpaden activeren...');
+
+      // 1.5a: Check of deze makelaar eerder gecorrigeerd werd door gebruikers
+      const correcties = await laadMakelaarCorrecties();
+      const makelaarLower = (bordInfo.makelaar || '').toLowerCase();
+      const correctieMatch = Object.keys(correcties).find(naam =>
+        naam.toLowerCase().includes(makelaarLower) || makelaarLower.includes(naam.toLowerCase())
+      );
+      if (correctieMatch) {
+        console.log(`✅ Stap 1.5a: Eerder gecorrigeerd — gebruik "${correctieMatch}"`);
+        bordInfo.makelaar = correctieMatch;
+        bordInfo.makelaar_herkenning += ` (bevestigd via ${correcties[correctieMatch]}x gebruikerscorrectie)`;
+        bordInfo.makelaar_betrouwbaarheid = 'MIDDEL';
+      }
+
+      // 1.5b: GPS beschikbaar → zoek op Immoweb via adres om makelaar te identificeren
+      if (geocodeResultaat?.straat && (betrouwbaarheid === 'LAAG' || bordInfo.makelaar === 'onbekend')) {
+        console.log('🔎 Stap 1.5b: Makelaar afleiden via Immoweb-adres...');
+        const gevonden = await ontdekMakelaarViaAdres(
+          geocodeResultaat.straat, gemeente, postcode
+        );
+        if (gevonden) {
+          bordInfo.makelaar = gevonden.naam;
+          bordInfo.makelaar_herkenning += ` (afgeleid via ${gevonden.via})`;
+          bordInfo.makelaar_betrouwbaarheid = 'MIDDEL';
+          console.log(`✅ Stap 1.5b: Makelaar bijgewerkt naar "${gevonden.naam}"`);
+        }
+      }
+    }
+
     // ══════════════════════════════════════════════════════════════
     // STAP 2 — Zoeken: makelaarsite eerst, dan Immoweb als fallback
     // ══════════════════════════════════════════════════════════════
-    const gemeente = geocodeResultaat?.gemeente || 'Gent';
-    const postcode = geocodeResultaat?.postcode || '9000';
 
     // 2a. Probeer eerst de makelaarsite rechtstreeks
     console.log('🏢 STAP 2a: Makelaarsite rechtstreeks doorzoeken...');
@@ -879,12 +1031,13 @@ app.get('/api/test-zoeken', async (req, res) => {
 
 // ── /api/feedback ─────────────────────────────────────────────────
 app.post('/api/feedback', async (req, res) => {
-  const { scan_id, feedback_type, makelaar_correct, faal_categorie_override } = req.body;
-  console.log('💬 FEEDBACK:', { scan_id, feedback_type, makelaar_correct });
+  const { scan_id, feedback_type, makelaar_correct, makelaar_naam_correct, faal_categorie_override } = req.body;
+  console.log('💬 FEEDBACK:', { scan_id, feedback_type, makelaar_correct, makelaar_naam_correct });
   if (supabase && scan_id) {
     const { error } = await supabase.from('feedback').insert({
       scan_id, feedback_type,
       makelaar_correct:        makelaar_correct ?? null,
+      makelaar_naam_correct:   makelaar_naam_correct || null,
       faal_categorie_override: faal_categorie_override || null
     });
     if (error) console.error('Supabase feedback fout:', error.message);
