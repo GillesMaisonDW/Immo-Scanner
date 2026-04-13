@@ -76,6 +76,7 @@
     .btn-orange   { background: var(--orange);  color: white; }
     .btn-green    { background: var(--green);   color: white; }
     .btn-red      { background: var(--red);     color: white; }
+    .btn-blue     { background: var(--blue);    color: white; }
     .btn-outline  { background: white; color: var(--blue); border: 2px solid var(--blue); }
 
     /* SCAN SCREEN */
@@ -193,6 +194,22 @@
     }
     .followup-card h3 { font-size: 15px; font-weight: 700; color: #856404; margin-bottom: 6px; }
     .followup-card p  { font-size: 13px; color: #856404; margin-bottom: 16px; line-height: 1.4; }
+
+    /* MAKELAAR CORRECTIE */
+    .correctie-card {
+      background: #F0F7FF; border: 2px solid #90C4F0;
+      border-radius: 16px; padding: 20px; margin-bottom: 16px;
+    }
+    .correctie-card h3 { font-size: 15px; font-weight: 700; color: #1a5c9e; margin-bottom: 6px; }
+    .correctie-card p  { font-size: 13px; color: #1a5c9e; margin-bottom: 12px; line-height: 1.4; }
+    .correctie-input {
+      width: 100%; padding: 12px 14px; font-size: 15px;
+      border: 2px solid #90C4F0; border-radius: 12px;
+      box-sizing: border-box; margin-bottom: 12px;
+      font-family: inherit; outline: none;
+    }
+    .correctie-input:focus { border-color: #1a5c9e; }
+    .correctie-hint { font-size: 12px; color: #5a8fc0; margin-bottom: 12px; }
 
     /* ERROR */
     .error-card {
@@ -327,7 +344,21 @@
     <p id="followup-text">Ik herkende: ...</p>
     <div class="feedback-btns">
       <button class="btn btn-green" onclick="makelaarJa()">✅ Ja, makelaar klopt</button>
-      <button class="btn btn-red"   onclick="makelaarNee()">❌ Nee, andere makelaar</button>
+      <button class="btn btn-red"   onclick="toonCorrectieVeld()">❌ Nee, andere makelaar</button>
+    </div>
+  </div>
+
+  <!-- Makelaar correctie -->
+  <div id="correctie" class="correctie-card" style="display:none;">
+    <h3>Welke makelaar is het wel?</h3>
+    <p>Vul de naam in — ik zoek dan meteen de listing op via hun website.</p>
+    <input id="correctie-input" class="correctie-input" type="text"
+           placeholder="bv. Vastgoed Janssen, Immo De Smet…"
+           onkeydown="if(event.key==='Enter') bevestigCorrectie()" />
+    <p class="correctie-hint">💡 Zo leert de app deze makelaar herkennen voor de volgende keer.</p>
+    <div class="feedback-btns">
+      <button class="btn btn-outline" onclick="makelaarNee()">Overslaan</button>
+      <button class="btn btn-blue"    onclick="bevestigCorrectie()">🔍 Zoek opnieuw</button>
     </div>
   </div>
 
@@ -347,6 +378,7 @@ let currentPhoto    = null;
 let currentMime     = 'image/jpeg';
 let currentGPS      = null;
 let lastResult      = null;
+let lastScanPayload = null;
 let compassHeading  = null;  // graden vanaf noord (0 = noord, 90 = oost, ...)
 
 // ── KOMPAS ───────────────────────────────
@@ -474,10 +506,11 @@ async function startScan() {
   showScreen('screen-loading');
   animateSteps();
   try {
+    lastScanPayload = { image: currentPhoto, mime: currentMime, gps: currentGPS };
     const resp = await fetch('/api/scan', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ image: currentPhoto, mime: currentMime, gps: currentGPS })
+      body: JSON.stringify(lastScanPayload)
     });
     const data = await resp.json();
     if (!resp.ok) throw new Error(data.error || 'Serverfout');
@@ -562,10 +595,56 @@ function makelaarJa() {
   alert('Bedankt. Makelaar klopte, listing niet gevonden. We verbeteren het zoekpatroon.');
   newScan();
 }
+function toonCorrectieVeld() {
+  document.getElementById('followup').style.display = 'none';
+  const card = document.getElementById('correctie');
+  card.style.display = 'block';
+  card.scrollIntoView({ behavior: 'smooth' });
+  setTimeout(() => document.getElementById('correctie-input').focus(), 400);
+}
 function makelaarNee() {
+  // Gebruikt als "overslaan" vanuit het correctie-veld
   logResult('onjuist_makelaar', 'MAKELAAR_NIET_HERKEND');
-  alert('Bedankt. We voegen deze makelaar toe aan de database.');
+  alert('Bedankt. We houden dit bij.');
   newScan();
+}
+async function bevestigCorrectie() {
+  const naam = document.getElementById('correctie-input').value.trim();
+  if (!naam) {
+    alert('Vul eerst de naam van de makelaar in.');
+    return;
+  }
+  // Sla correctie op in Supabase
+  logResultMetMakelaar('onjuist_makelaar', 'MAKELAAR_NIET_HERKEND', naam);
+  // Toon laad-indicator en zoek opnieuw via de opgegeven makelaar
+  document.getElementById('correctie').style.display = 'none';
+  toonLaden(`🔍 Opnieuw zoeken via ${naam}…`);
+  try {
+    const body = { ...lastScanPayload, makelaar_override: naam };
+    const resp = await fetch('/api/scan', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    const data = await resp.json();
+    toonResultaat(data);
+  } catch (e) {
+    verbergLaden();
+    alert('Zoeken mislukt. Probeer opnieuw.');
+  }
+}
+function logResultMetMakelaar(feedbackType, faal, makelaarNaamCorrect) {
+  fetch('/api/feedback', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      scan_id:                 lastResult?.scan_id || null,
+      feedback_type:           feedbackType,
+      makelaar_correct:        false,
+      makelaar_naam_correct:   makelaarNaamCorrect,
+      faal_categorie_override: faal || null
+    })
+  }).catch(() => {});
 }
 
 // ── LOGGING ──────────────────────────────
