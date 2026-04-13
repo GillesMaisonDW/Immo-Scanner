@@ -795,29 +795,56 @@ app.post('/api/scan', async (req, res) => {
             },
             body: JSON.stringify({
               model:      'claude-sonnet-4-6',
-              max_tokens: 300,
-              tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: 1 }],
-              system: 'Je bent een assistent die op basis van een telefoonnummer de naam van een Belgische vastgoedmakelaar opzoekt. Geef ENKEL een JSON terug: {"naam": "...", "website": "..."} — niets anders. Als je het niet vindt, geef {"naam": null, "website": null}.',
+              max_tokens: 1024,
+              tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: 2 }],
+              system: `Je bent een assistent die Belgische vastgoedmakelaars identificeert via hun telefoonnummer.
+Zoek het telefoonnummer op via web search. Kijk welk bedrijf erbij hoort.
+Aan het einde van je antwoord geef je ALTIJD deze JSON op een aparte lijn:
+RESULTAAT: {"naam": "bedrijfsnaam", "website": "domein.be"}
+Als je het niet kan vinden: RESULTAAT: {"naam": null, "website": null}`,
               messages: [{
                 role: 'user',
-                content: `Zoek op wie dit telefoonnummer toebehoort: ${telefoon}. Het gaat om een Belgische vastgoedmakelaar. Geef de bedrijfsnaam en website terug als JSON.`
+                content: `Zoek op welke Belgische vastgoedmakelaar dit telefoonnummer heeft: ${telefoon}`
               }]
             })
           });
           if (telResp.ok) {
             const telData = await telResp.json();
-            const telText = telData.content?.find(b => b.type === 'text')?.text || '';
-            const telMatch = telText.match(/\{[\s\S]*?\}/);
+            // Zoek het tekstblok op — kan na tool_use blokken staan
+            const telText = telData.content?.filter(b => b.type === 'text').map(b => b.text).join('\n') || '';
+            console.log(`📞 Telefoonnummer lookup response: ${telText.substring(0, 200)}`);
+            // Zoek "RESULTAAT: {...}" patroon
+            const telMatch = telText.match(/RESULTAAT:\s*(\{[\s\S]*?\})/);
             if (telMatch) {
-              const telInfo = JSON.parse(telMatch[0]);
+              const telInfo = JSON.parse(telMatch[1]);
               if (telInfo.naam) {
                 console.log(`✅ Stap 1.5b: Makelaar gevonden via telefoonnummer: "${telInfo.naam}"`);
                 bordInfo.makelaar = telInfo.naam;
                 if (telInfo.website) bordInfo.makelaar_website = telInfo.website;
                 bordInfo.makelaar_herkenning += ` (gevonden via telefoonnummer ${telefoon})`;
                 bordInfo.makelaar_betrouwbaarheid = 'HOOG';
+              } else {
+                console.log('⚠️ Stap 1.5b: Telefoonnummer niet herkend als makelaar');
               }
+            } else {
+              // Fallback: zoek gewoon naar een JSON object in de tekst
+              const jsonMatch = telText.match(/\{[^{}]*"naam"[^{}]*\}/);
+              if (jsonMatch) {
+                try {
+                  const telInfo = JSON.parse(jsonMatch[0]);
+                  if (telInfo.naam) {
+                    console.log(`✅ Stap 1.5b (fallback): "${telInfo.naam}"`);
+                    bordInfo.makelaar = telInfo.naam;
+                    if (telInfo.website) bordInfo.makelaar_website = telInfo.website;
+                    bordInfo.makelaar_herkenning += ` (gevonden via telefoonnummer ${telefoon})`;
+                    bordInfo.makelaar_betrouwbaarheid = 'HOOG';
+                  }
+                } catch {}
+              }
+              console.log('⚠️ Stap 1.5b: Geen RESULTAAT-patroon gevonden in response');
             }
+          } else {
+            console.warn(`Stap 1.5b API fout: ${telResp.status}`);
           }
         } catch (e) {
           console.warn('Stap 1.5b telefoonnummer lookup fout:', e.message);
