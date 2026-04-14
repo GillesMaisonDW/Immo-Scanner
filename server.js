@@ -776,9 +776,10 @@ app.post('/api/scan', async (req, res) => {
         'anthropic-version': '2023-06-01'
       },
       body: JSON.stringify({
-        model:      'claude-sonnet-4-6',
-        max_tokens: 500,
-        system:     PROMPT_STAP1,
+        model:       'claude-sonnet-4-6',
+        max_tokens:  500,
+        temperature: 0,
+        system:      PROMPT_STAP1,
         messages: [{
           role: 'user',
           content: [
