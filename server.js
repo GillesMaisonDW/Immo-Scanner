@@ -315,6 +315,19 @@ async function fetchWithPuppeteer(url, timeout = 20000) {
       else req.continue();
     });
     await page.goto(url, { waitUntil: 'networkidle2', timeout });
+
+    // Scroll naar beneden om lazy-loaded listings te triggeren,
+    // dan terug omhoog, dan opnieuw naar beneden (sommige sites
+    // laden pas bij echte scroll-beweging).
+    await page.evaluate(() => {
+      window.scrollTo(0, document.body.scrollHeight / 2);
+    });
+    await new Promise(r => setTimeout(r, 800));
+    await page.evaluate(() => {
+      window.scrollTo(0, document.body.scrollHeight);
+    });
+    await new Promise(r => setTimeout(r, 1200));
+
     const html = await page.content();
     console.log(`🤖 Puppeteer ${url.slice(0, 60)}: ${html.length} bytes`);
     return html;
@@ -565,13 +578,15 @@ async function searchMakelaar(makelaarNaam, listingType, gemeente, postcode, mak
     while ((lm = linkRegex.exec(html)) !== null) {
       let href = lm[1];
       if (!href.startsWith('http')) href = `https://${domein}${href}`;
-      if (!seenUrls.has(href) && !href.includes('?') && href.split('/').length > 4) {
-        seenUrls.add(href);
+      // Strip query string voor deduplicatie, maar behoud de schone URL
+      const hrefZonderQuery = href.split('?')[0];
+      if (!seenUrls.has(hrefZonderQuery) && hrefZonderQuery.split('/').length > 4) {
+        seenUrls.add(hrefZonderQuery);
         // Gebruik de beschrijvende slug (2e-laatste segment) als titel, niet het ID-nummer.
         // Bv. /detail/te-koop-woning-lochristi/7514688 → "te koop woning lochristi"
-        const urlSegmenten = href.split('/').filter(Boolean);
+        const urlSegmenten = hrefZonderQuery.split('/').filter(Boolean);
         const beschrijvend = urlSegmenten.slice(-2).find(s => !/^\d+$/.test(s)) || urlSegmenten[urlSegmenten.length - 1] || 'Listing';
-        listings.push({ url: href, title: beschrijvend.replace(/-/g, ' '), bron: `${domein}_regex` });
+        listings.push({ url: hrefZonderQuery, title: beschrijvend.replace(/-/g, ' '), bron: `${domein}_regex` });
       }
     }
 
