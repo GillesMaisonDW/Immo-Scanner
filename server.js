@@ -46,16 +46,9 @@ async function checkUrlActief(url) {
 async function fetchAdresVanListing(url) {
   if (!url) return null;
   try {
-    const resp = await fetch(url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Language': 'nl-BE,nl;q=0.9,en;q=0.8'
-      },
-      signal: AbortSignal.timeout(8000)
-    });
-    if (!resp.ok) return null;
-    const html = await resp.text();
+    // slimFetchHtml valt automatisch terug op Puppeteer voor JS-rendered sites
+    const html = await slimFetchHtml(url);
+    if (!html) return null;
 
     // Methode 1: JSON-LD structured data (meest betrouwbaar)
     const jsonldRegex = /<script[^>]*type="application\/ld\+json"[^>]*>([\s\S]*?)<\/script>/gi;
@@ -233,6 +226,146 @@ async function voegMakelaarToeAanSupabase(domein, naam, koopUrl, huurUrl) {
   }
 }
 
+// ── Puppeteer: headless browser voor client-side rendered sites ───
+// Wordt lazy geladen — alleen gestart als de gewone fetch te weinig
+// HTML-tekst teruggeeft (JS-rendered site zoals immo-home.be).
+//
+// @sparticuz/chromium is geoptimaliseerd voor cloud/serverless:
+//   - Geen extra systeempakketten nodig
+//   - Werkt op Render, Lambda, etc.
+//   - Blokkeert afbeeldingen/fonts → sneller laden
+
+let _chromium  = null;
+let _puppeteer = null;
+let _browser   = null;
+let _browserLastUsed = 0;
+
+async function laadPuppeteer() {
+  if (_chromium && _puppeteer) return true;
+  try {
+    _chromium  = require('@sparticuz/chromium');
+    _puppeteer = require('puppeteer-core');
+    console.log('🤖 Puppeteer + Chromium module geladen');
+    return true;
+  } catch (e) {
+    console.warn('⚠️  Puppeteer niet beschikbaar:', e.message);
+    return false;
+  }
+}
+
+async function getPuppeteerBrowser() {
+  if (_browser) {
+    try { if (_browser.isConnected()) { _browserLastUsed = Date.now(); return _browser; } }
+    catch (_) { /* browser gecrasht */ }
+    _browser = null;
+  }
+  if (!(await laadPuppeteer())) return null;
+  try {
+    const execPath = await _chromium.executablePath();
+    _browser = await _puppeteer.launch({
+      args: [
+        ..._chromium.args,
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--no-first-run',
+        '--no-zygote',
+        '--single-process'
+      ],
+      defaultViewport: _chromium.defaultViewport,
+      executablePath: execPath,
+      headless: _chromium.headless,
+      ignoreHTTPSErrors: true
+    });
+    _browserLastUsed = Date.now();
+    console.log('🌐 Puppeteer browser gestart');
+    return _browser;
+  } catch (e) {
+    console.warn('Puppeteer browser starten mislukt:', e.message);
+    _browser = null;
+    return null;
+  }
+}
+
+// Sluit browser na 3 minuten inactiviteit om geheugen vrij te maken
+setInterval(() => {
+  if (_browser && Date.now() - _browserLastUsed > 3 * 60 * 1000) {
+    console.log('🔒 Puppeteer browser gesloten (inactiviteit)');
+    _browser.close().catch(() => {});
+    _browser = null;
+  }
+}, 60 * 1000);
+
+async function fetchWithPuppeteer(url, timeout = 20000) {
+  const browser = await getPuppeteerBrowser();
+  if (!browser) return null;
+  let page = null;
+  try {
+    page = await browser.newPage();
+    await page.setUserAgent(
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+      '(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36'
+    );
+    // Blokkeer zware resources om sneller te laden
+    await page.setRequestInterception(true);
+    page.on('request', req => {
+      const t = req.resourceType();
+      if (['image', 'font', 'media'].includes(t)) req.abort();
+      else req.continue();
+    });
+    await page.goto(url, { waitUntil: 'networkidle2', timeout });
+    const html = await page.content();
+    console.log(`🤖 Puppeteer ${url.slice(0, 60)}: ${html.length} bytes`);
+    return html;
+  } catch (e) {
+    console.warn('Puppeteer fetch fout voor', url, ':', e.message);
+    // Browser kan gecrasht zijn — reset singleton
+    if (_browser) { _browser.close().catch(() => {}); _browser = null; }
+    return null;
+  } finally {
+    if (page) await page.close().catch(() => {});
+  }
+}
+
+// ── Slim fetch: regulier eerst, Puppeteer als fallback ────────────
+// Detectie: als de body-tekst < 800 tekens is, dan is de site
+// vermoedelijk client-side rendered en sturen we Puppeteer in.
+async function slimFetchHtml(url) {
+  try {
+    const resp = await fetch(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'nl-BE,nl;q=0.9,en;q=0.8'
+      },
+      signal: AbortSignal.timeout(10000)
+    });
+    if (!resp.ok) {
+      console.warn(`slimFetchHtml: HTTP ${resp.status} voor ${url}`);
+    } else {
+      const html = await resp.text();
+      // Hoeveel zichtbare tekst zit er in de body?
+      const bodyMatch = html.match(/<body[^>]*>([\s\S]*?)<\/body>/i);
+      const zichtbareTekst = (bodyMatch?.[1] || html)
+        .replace(/<script[\s\S]*?<\/script>/gi, '')
+        .replace(/<style[\s\S]*?<\/style>/gi, '')
+        .replace(/<[^>]+>/g, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+      if (zichtbareTekst.length >= 800) {
+        console.log(`📄 Reguliere fetch OK voor ${url.slice(0, 60)}: ${zichtbareTekst.length} tekens tekst`);
+        return html;
+      }
+      console.log(`⚠️  Slechts ${zichtbareTekst.length} tekens tekst — client-side rendered? → Puppeteer proberen`);
+    }
+  } catch (e) {
+    console.warn(`slimFetchHtml reguliere fetch mislukt voor ${url}: ${e.message}`);
+  }
+  // Fallback: Puppeteer
+  return await fetchWithPuppeteer(url);
+}
+
 async function searchMakelaar(makelaarNaam, listingType, gemeente, postcode, makelaarWebsite) {
   const normaliseer  = (s) => (s || '').toLowerCase().replace(/[-\s]+/g, ' ').trim();
   const naamLower    = normaliseer(makelaarNaam);
@@ -281,21 +414,13 @@ async function searchMakelaar(makelaarNaam, listingType, gemeente, postcode, mak
   console.log(`🏢 Makelaar ${domein} rechtstreeks ophalen:`, url);
 
   try {
-    const resp = await fetch(url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Language': 'nl-BE,nl;q=0.9,en;q=0.8'
-      },
-      signal: AbortSignal.timeout(10000)
-    });
-
-    if (!resp.ok) {
-      console.warn(`Makelaarsite HTTP ${resp.status} voor ${url}`);
+    // slimFetchHtml probeert eerst regulier fetch, en valt terug op Puppeteer
+    // als de pagina client-side rendered is (te weinig zichtbare tekst)
+    const html = await slimFetchHtml(url);
+    if (!html) {
+      console.warn(`Makelaarsite ophalen volledig mislukt voor ${url}`);
       return [];
     }
-
-    const html = await resp.text();
     console.log(`📄 ${domein} HTML: ${html.length} bytes`);
 
     const listings = [];
