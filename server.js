@@ -366,6 +366,76 @@ async function slimFetchHtml(url) {
   return await fetchWithPuppeteer(url);
 }
 
+// ── Auto-ontdekking van makelaar listing-URLs ─────────────────────
+// Wanneer een nieuwe makelaar in de database staat zonder koop_url/huur_url,
+// haalt deze functie de homepage op en zoekt automatisch de zoek-URLs.
+// Gevonden URLs worden opgeslagen in Supabase zodat de volgende scan
+// ze direct kan gebruiken — zonder manuele tussenkomst.
+
+async function ontdekMakelaarUrls(domein) {
+  console.log(`🔍 URL-ontdekking voor ${domein}...`);
+  const homepage = `https://${domein.startsWith('www.') ? domein : 'www.' + domein}`;
+
+  const html = await slimFetchHtml(homepage);
+  if (!html) {
+    console.warn(`URL-ontdekking: geen HTML van ${homepage}`);
+    return { koopUrl: null, huurUrl: null };
+  }
+
+  // Extraheer alle links uit de navigatie
+  const alleLinks = [];
+  const linkRegex = /href="([^"]{5,120})"/g;
+  let m;
+  while ((m = linkRegex.exec(html)) !== null) {
+    let href = m[1];
+    // Relatieve paden aanvullen
+    if (href.startsWith('/')) href = `https://${domein.startsWith('www.') ? domein : 'www.' + domein}${href}`;
+    if (href.startsWith('http') && href.includes(domein.replace('www.', ''))) {
+      alleLinks.push(href);
+    }
+  }
+
+  // Zoek "te koop" en "te huur" kandidaten — kortste = meest generiek
+  const koopKandidaten = alleLinks
+    .filter(l => /te-koop|tekoop|\/koop|\/sale|\/properties|\/aanbod/i.test(l))
+    .sort((a, b) => a.length - b.length);
+
+  const huurKandidaten = alleLinks
+    .filter(l => /te-huur|tehuur|\/huur|\/rent|\/location|\/verhuur/i.test(l))
+    .sort((a, b) => a.length - b.length);
+
+  // Filter kandidaten die te specifiek zijn (bv. "/te-koop/gent/9000/villa")
+  const kiesBesteUrl = (kandidaten) => {
+    for (const url of kandidaten) {
+      const pad = url.replace(/https?:\/\/[^/]+/, '');
+      const segmenten = pad.split('/').filter(Boolean).length;
+      if (segmenten <= 3) return url; // max 3 niveaus diep = generiek genoeg
+    }
+    return kandidaten[0] || null;
+  };
+
+  const koopUrl = kiesBesteUrl(koopKandidaten);
+  const huurUrl = kiesBesteUrl(huurKandidaten);
+
+  console.log(`🔗 Ontdekte URLs voor ${domein}: koop=${koopUrl || 'niet gevonden'}, huur=${huurUrl || 'niet gevonden'}`);
+
+  // Sla onmiddellijk op in Supabase zodat de volgende scan ze direct heeft
+  if (supabase && (koopUrl || huurUrl)) {
+    const { error } = await supabase.from('makelaars').update({
+      koop_url:   koopUrl  || null,
+      huur_url:   huurUrl  || null,
+      updated_at: new Date().toISOString()
+    }).eq('domein', domein);
+    if (error) console.warn('Makelaar URLs opslaan mislukt:', error.message);
+    else {
+      console.log(`✅ URLs voor ${domein} opgeslagen in Supabase`);
+      _makelaarsCacheTs = 0; // cache invalideren
+    }
+  }
+
+  return { koopUrl, huurUrl };
+}
+
 async function searchMakelaar(makelaarNaam, listingType, gemeente, postcode, makelaarWebsite) {
   const normaliseer  = (s) => (s || '').toLowerCase().replace(/[-\s]+/g, ' ').trim();
   const naamLower    = normaliseer(makelaarNaam);
@@ -402,13 +472,27 @@ async function searchMakelaar(makelaarNaam, listingType, gemeente, postcode, mak
 
   const domein   = match.domein;
   const isHuur   = listingType === 'Te huur';
-  const urlTemplate = isHuur ? match.huur_url : match.koop_url;
+  let urlTemplate = isHuur ? match.huur_url : match.koop_url;
   const gem      = gemeente?.toLowerCase() || 'gent';
   const pc       = postcode || '9000';
 
+  // ── Auto-ontdekking als URL-template ontbreekt ───────────────────
+  // Nieuwe makelaars worden automatisch toegevoegd maar zonder URL.
+  // Hier proberen we de URL automatisch te vinden via de homepage.
+  if (!urlTemplate) {
+    console.log(`⚠️  Geen URL voor ${domein} → automatisch ontdekken...`);
+    const ontdekt = await ontdekMakelaarUrls(domein);
+    urlTemplate = isHuur ? ontdekt.huurUrl : ontdekt.koopUrl;
+    if (!urlTemplate) {
+      console.log(`❌ URL-ontdekking mislukt voor ${domein} — geen listings mogelijk`);
+      return [];
+    }
+    console.log(`✅ URL automatisch ontdekt voor ${domein}: ${urlTemplate}`);
+  }
+
   const url = vulUrlIn(urlTemplate, gem, pc);
   if (!url) {
-    console.log(`⚠️  Geen URL-template voor ${domein} (${isHuur ? 'huur' : 'koop'})`);
+    console.log(`⚠️  Geen geldige URL voor ${domein} (${isHuur ? 'huur' : 'koop'})`);
     return [];
   }
   console.log(`🏢 Makelaar ${domein} rechtstreeks ophalen:`, url);
