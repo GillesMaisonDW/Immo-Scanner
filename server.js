@@ -1132,7 +1132,7 @@ Kies de beste match uit de Immoweb-lijst. Als geen enkele listing past, gebruik 
       const { data: dbData, error } = await supabase.from('scans').insert({
         makelaar:                result.makelaar,
         makelaar_herkenning:     result.makelaar_herkenning,
-        makelaar_betrouwbaarheid:result.makelaar_betrouwbaarheid,
+        makelaar_betrouwbaarheid:(result.makelaar_betrouwbaarheid || '').toLowerCase() || null,
         listing_type:            result.listing_type,
         pand_type:               result.pand_type,
         adres_foto:              adresFoto,
