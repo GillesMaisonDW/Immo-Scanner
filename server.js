@@ -706,9 +706,9 @@ const PROMPT_STAP2 = `Je bent de Immo Scanner. Je hebt zojuist een makelaarsbord
 ## HOE TE ZOEKEN
 - Kijk eerst in de meegeleverde lijst of een listing overeenkomt met GPS-locatie + type + makelaar.
 - Geen match in de lijst? Gebruik je web_search tool met GERICHTE zoekopdrachten:
-  1. Eerste poging: `"{straatnaam}" site:{makelaar_website}` — zoek het exacte adres op de makelaarsite
-  2. Tweede poging: `{makelaar} "{straatnaam}" {gemeente} te koop` — bredere zoekopdracht
-  3. Derde poging: `{makelaar} {gemeente} te koop` — als straatnaam niets oplevert
+  1. Eerste poging: straatnaam + site:makelaar_website — bv. "Rechtstraat" site:immo-home.be
+  2. Tweede poging: makelaar + straatnaam + gemeente + te koop
+  3. Derde poging: makelaar + gemeente + te koop — als straatnaam niets oplevert
 - Het GPS-adres (straatnaam) is je belangrijkste zoekterm — gebruik het altijd in de eerste web_search.
 - Nog steeds niets? Gebruik faal_categorie "LISTING_NIET_ONLINE" en laat adres/prijs/url op null.
 
