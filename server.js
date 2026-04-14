@@ -705,7 +705,11 @@ const PROMPT_STAP2 = `Je bent de Immo Scanner. Je hebt zojuist een makelaarsbord
 
 ## HOE TE ZOEKEN
 - Kijk eerst in de meegeleverde lijst of een listing overeenkomt met GPS-locatie + type + makelaar.
-- Geen match in de lijst? Gebruik dan je web_search tool (zoek op makelaar + adres + gemeente).
+- Geen match in de lijst? Gebruik je web_search tool met GERICHTE zoekopdrachten:
+  1. Eerste poging: `"{straatnaam}" site:{makelaar_website}` — zoek het exacte adres op de makelaarsite
+  2. Tweede poging: `{makelaar} "{straatnaam}" {gemeente} te koop` — bredere zoekopdracht
+  3. Derde poging: `{makelaar} {gemeente} te koop` — als straatnaam niets oplevert
+- Het GPS-adres (straatnaam) is je belangrijkste zoekterm — gebruik het altijd in de eerste web_search.
 - Nog steeds niets? Gebruik faal_categorie "LISTING_NIET_ONLINE" en laat adres/prijs/url op null.
 
 ## OUTPUT — gebruik EXACT dit JSON-formaat:
@@ -995,7 +999,8 @@ Als je het niet kan vinden: RESULTAAT: {"naam": null, "website": null}`,
         listingsContext += '\n';
       }
     } else {
-      listingsContext = '\n\n## GEEN LISTINGS gevonden via makelaarsite of Immoweb. Gebruik je web_search tool als laatste redmiddel.\n';
+      const straatTip = geocodeResultaat?.straat ? `\nAanbevolen eerste zoekopdracht: "${geocodeResultaat.straat}" site:${bordInfo.makelaar_website || (bordInfo.makelaar || '').toLowerCase().replace(/\s+/g,'')+'.be'}` : '';
+      listingsContext = `\n\n## GEEN LISTINGS gevonden via directe opvraging. Gebruik web_search als volgende stap.${straatTip}\n`;
     }
 
     // Locatie info
@@ -1047,7 +1052,8 @@ Telefoon: ${bordInfo.telefoon || 'niet zichtbaar'}
 ## LOCATIE
 ${locatieInfo}
 ${listingsContext}
-Kies de beste match uit de Immoweb-lijst. Als geen enkele listing past, gebruik dan web_search als fallback. Geef het resultaat als JSON.`
+Kies de beste match uit de lijst. Als geen listing past, gebruik web_search.
+Bij web_search: begin ALTIJD met "${geocodeResultaat?.straat || ''}" site:${bordInfo.makelaar_website || bordInfo.makelaar} als eerste zoekopdracht. Geef het resultaat als JSON.`
             }
           ]
         }]
