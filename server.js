@@ -43,69 +43,103 @@ async function checkUrlActief(url) {
 
 // ── Adres ophalen van detail-pagina van een listing ───────────────
 // Na matching bezoeken we de detailpagina om het exacte adres te extraheren.
+function _extractAdresUitHtml(html, urlLabel) {
+  // Methode 1: JSON-LD structured data
+  // Checkt meerdere niveaus: ld.address, ld.location.address, ld.geo.address
+  const jsonldRegex = /<script[^>]*type="application\/ld\+json"[^>]*>([\s\S]*?)<\/script>/gi;
+  let jm;
+  while ((jm = jsonldRegex.exec(html)) !== null) {
+    try {
+      const ld = JSON.parse(jm[1]);
+      // immo-home.be zet adres onder ld.geo.address — controleer alle paden
+      const addr = ld.address || ld.location?.address || ld.geo?.address;
+      if (addr && addr.streetAddress) {
+        const straat   = addr.streetAddress.trim();
+        // addressLocality bij immo-home.be bevat soms "65A Rechtstraat" (omgekeerd)
+        // — gebruik postalCode + addressRegion als fallback voor gemeente
+        const gemeente = addr.addressRegion || addr.addressLocality || '';
+        const resultaat = gemeente ? `${straat}, ${gemeente}` : straat;
+        console.log(`📍 Adres via JSON-LD (${urlLabel}): ${resultaat}`);
+        return resultaat;
+      }
+    } catch {}
+  }
+
+  // Methode 2: meta og:title (bv. "Woning Te koop - Rechtstraat 65A, 9080 Lochristi")
+  const ogTitleMatch = html.match(/<meta[^>]*(?:name|property)="og:title"[^>]*content="([^"]+)"/i)
+    || html.match(/<meta[^>]*content="([^"]+)"[^>]*(?:name|property)="og:title"/i);
+  if (ogTitleMatch) {
+    // Patroon: "... - Straatnaam Huisnummer, Postcode Gemeente"
+    const adresMatch = ogTitleMatch[1].match(/[-–]\s*([A-Z][^,]{4,50},\s*\d{4}\s+\S[^"]{2,40})/);
+    if (adresMatch) {
+      console.log(`📍 Adres via og:title (${urlLabel}): ${adresMatch[1].trim()}`);
+      return adresMatch[1].trim();
+    }
+  }
+
+  // Methode 3: __NEXT_DATA__ (Next.js SSR)
+  const nextMatch = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
+  if (nextMatch) {
+    try {
+      const nd = JSON.parse(nextMatch[1]);
+      const pp   = nd?.props?.pageProps || {};
+      const prop = pp.property || pp.listing || pp.classified || pp.result || {};
+      const loc  = prop.location || prop.address || {};
+      const straat   = loc.street || loc.streetAddress || loc.straat || null;
+      const nr       = loc.number || loc.houseNumber || '';
+      const gemeente = loc.locality || loc.city || loc.gemeente || '';
+      if (straat) {
+        const adres = [straat, nr].filter(Boolean).join(' ').trim();
+        console.log(`📍 Adres via __NEXT_DATA__ (${urlLabel}): ${adres}, ${gemeente}`);
+        return gemeente ? `${adres}, ${gemeente}` : adres;
+      }
+    } catch {}
+  }
+
+  // Methode 4: Regex patronen
+  const adresPatterns = [
+    /"streetAddress"\s*:\s*"([^"]{5,80})"/i,
+    /"adres"\s*:\s*"([^"]{5,80})"/i,
+    /"address"\s*:\s*"([^"]{5,80})"/i,
+    /<[^>]*class="[^"]*(?:adres|address|location|locatie)[^"]*"[^>]*>\s*([A-Z][^<]{4,60})</i,
+  ];
+  for (const pattern of adresPatterns) {
+    const match = html.match(pattern);
+    if (match) {
+      console.log(`📍 Adres via regex (${urlLabel}): ${match[1].trim()}`);
+      return match[1].trim();
+    }
+  }
+
+  return null;
+}
+
 async function fetchAdresVanListing(url) {
   if (!url) return null;
   try {
-    // slimFetchHtml valt automatisch terug op Puppeteer voor JS-rendered sites
-    const html = await slimFetchHtml(url);
-    if (!html) return null;
-
-    // Methode 1: JSON-LD structured data (meest betrouwbaar)
-    const jsonldRegex = /<script[^>]*type="application\/ld\+json"[^>]*>([\s\S]*?)<\/script>/gi;
-    let jm;
-    while ((jm = jsonldRegex.exec(html)) !== null) {
-      try {
-        const ld = JSON.parse(jm[1]);
-        const addr = ld.address || ld.location?.address;
-        if (addr && addr.streetAddress) {
-          const straat = addr.streetAddress.trim();
-          const gemeente = addr.addressLocality ? addr.addressLocality.trim() : '';
-          console.log(`📍 Adres via JSON-LD: ${straat}, ${gemeente}`);
-          return gemeente ? `${straat}, ${gemeente}` : straat;
-        }
-      } catch {}
+    // Eerste poging: directe fetch — JSON-LD is server-side rendered op de meeste sites.
+    // Puppeteer is hier NIET nodig voor structuurdata; dat spaart geheugen op Render.
+    const directResp = await fetch(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'nl-BE,nl;q=0.9,en;q=0.8'
+      },
+      signal: AbortSignal.timeout(8000)
+    });
+    if (directResp.ok) {
+      const html = await directResp.text();
+      const adres = _extractAdresUitHtml(html, url.split('/').slice(-2).join('/'));
+      if (adres) return adres;
+      console.log(`⚠️  Geen adres via directe fetch voor ${url} — Puppeteer proberen`);
     }
 
-    // Methode 2: __NEXT_DATA__ (Next.js SSR)
-    const nextMatch = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
-    if (nextMatch) {
-      try {
-        const nd = JSON.parse(nextMatch[1]);
-        const pp = nd?.props?.pageProps || {};
-        const prop = pp.property || pp.listing || pp.classified || pp.result || {};
-        const loc = prop.location || prop.address || {};
-        const straat = loc.street || loc.streetAddress || loc.straat || null;
-        const nr = loc.number || loc.houseNumber || '';
-        const gemeente = loc.locality || loc.city || loc.gemeente || '';
-        if (straat) {
-          const adres = [straat, nr].filter(Boolean).join(' ').trim();
-          console.log(`📍 Adres via __NEXT_DATA__: ${adres}, ${gemeente}`);
-          return gemeente ? `${adres}, ${gemeente}` : adres;
-        }
-      } catch {}
-    }
-
-    // Methode 3: Regex patronen voor veelgebruikte immo-sites
-    const adresPatterns = [
-      // defooz.com: "streetAddress":"Okkernootsteeg 1"
-      /"streetAddress"\s*:\s*"([^"]{5,80})"/i,
-      // Algemeen JSON patroon
-      /"adres"\s*:\s*"([^"]{5,80})"/i,
-      /"address"\s*:\s*"([^"]{5,80})"/i,
-      // HTML class patronen
-      /<[^>]*class="[^"]*(?:adres|address|location|locatie)[^"]*"[^>]*>\s*([A-Z][^<]{4,60})</i,
-    ];
-    for (const pattern of adresPatterns) {
-      const match = html.match(pattern);
-      if (match) {
-        const adres = match[1].trim();
-        console.log(`📍 Adres via regex: ${adres}`);
-        return adres;
-      }
-    }
-
-    console.log('⚠️ Geen adres gevonden op detailpagina:', url);
-    return null;
+    // Tweede poging: Puppeteer (voor volledig client-side rendered detail pagina's)
+    const renderedHtml = await fetchWithPuppeteer(url, 15000);
+    if (!renderedHtml) return null;
+    const adres = _extractAdresUitHtml(renderedHtml, url.split('/').slice(-2).join('/') + ' (Puppeteer)');
+    if (!adres) console.log('⚠️ Geen adres gevonden op detailpagina:', url);
+    return adres;
   } catch (e) {
     console.warn('fetchAdresVanListing fout:', e.message);
     return null;
@@ -447,6 +481,52 @@ async function ontdekMakelaarUrls(domein) {
   }
 
   return { koopUrl, huurUrl };
+}
+
+// ── Adres-verrijking van kandidaat-listings ───────────────────────
+// Listings van makelaarssites bevatten vaak enkel een URL — geen
+// straatnaam. Zonder straatnaam kan Claude niet matchen op GPS-locatie.
+// Deze functie haalt de detailpagina op van kandidaat-listings die
+// in het juiste postcode-gebied liggen, en vult het adres aan.
+// Zo kan Claude "Rechtstraat" koppelen aan de juiste listing.
+async function verrijkListingAdressen(listings, hoofdgemeente, postcode, straatGps) {
+  if (!listings || listings.length === 0) return listings;
+
+  // Filter: enkel listings zonder adres die mogelijk in het juiste gebied liggen
+  const gem = (hoofdgemeente || '').toLowerCase();
+  const pc  = (postcode || '').toString();
+
+  const kandidaten = listings.filter(l => {
+    if (l.address) return false; // al een adres, niets te doen
+    if (!l.url)    return false;
+    const urlLow = l.url.toLowerCase();
+    const titleLow = (l.title || '').toLowerCase();
+    // Neem listing mee als gemeente/postcode in URL of titel voorkomt
+    return urlLow.includes(gem) || urlLow.includes(pc) ||
+           titleLow.includes(gem) || titleLow.includes(pc);
+  }).slice(0, 4); // max 4 detail-pagina's ophalen
+
+  if (kandidaten.length === 0) {
+    console.log('📍 Geen kandidaat-listings om te verrijken');
+    return listings;
+  }
+
+  console.log(`📍 Adres ophalen voor ${kandidaten.length} kandidaat-listings (postcode ${pc})...`);
+
+  // Sequentieel ophalen om geheugen te sparen (Puppeteer kan zwaar zijn)
+  for (const listing of kandidaten) {
+    try {
+      const adres = await fetchAdresVanListing(listing.url);
+      if (adres) {
+        listing.address = adres;
+        console.log(`  ✅ ${listing.url.split('/').slice(-2).join('/')} → ${adres}`);
+      }
+    } catch (e) {
+      console.warn(`  ⚠️  Adres ophalen mislukt voor ${listing.url}: ${e.message}`);
+    }
+  }
+
+  return listings;
 }
 
 async function searchMakelaar(makelaarNaam, listingType, gemeente, postcode, makelaarWebsite) {
@@ -1209,6 +1289,12 @@ Als je het niet kan vinden: RESULTAAT: {"naam": null, "website": null}`,
         postcode
       );
       listingsBron = 'immoweb_fallback';
+    }
+
+    // 2c. Verrijk listings zonder adres: haal straatnaam op van detailpagina
+    // Zo kan Claude matchen op "Rechtstraat" i.p.v. enkel gemeente-naam in URL
+    if (listings.length > 0 && listingsBron === 'makelaar_direct') {
+      listings = await verrijkListingAdressen(listings, hoofdgemeente, postcode, geocodeResultaat?.straat);
     }
 
     console.log(`✅ STAP 2 klaar: ${listings.length} listings via ${listingsBron}`);
