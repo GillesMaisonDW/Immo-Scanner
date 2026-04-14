@@ -119,6 +119,40 @@ async function fetchAdresVanListing(url) {
   }
 }
 
+// ── Postcode → officiële hoofdgemeente via Nominatim ─────────────
+// Werkt voor BE, NL, DE, FR, ... — geen hardcoded mapping nodig.
+// Cache om herhaalde lookups te vermijden.
+const _postcodeCachce = {};
+
+async function gemeenteViaPostcode(postcode, landcode) {
+  if (!postcode || !landcode) return null;
+  const cacheKey = `${landcode}-${postcode}`;
+  if (_postcodeCachce[cacheKey]) return _postcodeCachce[cacheKey];
+
+  try {
+    const url = `https://nominatim.openstreetmap.org/search?postalcode=${encodeURIComponent(postcode)}&country=${landcode}&format=json&limit=1&addressdetails=1`;
+    const resp = await fetch(url, {
+      headers: { 'User-Agent': 'ImmoScannerApp/1.0 (gilles@maisondw.be)' },
+      signal: AbortSignal.timeout(5000)
+    });
+    if (!resp.ok) return null;
+    const data = await resp.json();
+    if (!data || data.length === 0) return null;
+
+    const addr = data[0].address || {};
+    // Nominatim geeft de officiële hoofdgemeente terug, niet het deelgemeente
+    const gemeente = addr.city || addr.town || addr.village || addr.municipality || null;
+    if (gemeente) {
+      _postcodeCachce[cacheKey] = gemeente.toLowerCase();
+      console.log(`📮 Postcode ${postcode} (${landcode}) → hoofdgemeente: ${gemeente}`);
+    }
+    return gemeente ? gemeente.toLowerCase() : null;
+  } catch (e) {
+    console.warn('Postcode lookup fout:', e.message);
+    return null;
+  }
+}
+
 // ── Nominatim reverse geocoding ───────────────────────────────────
 async function reverseGeocode(lat, lon) {
   try {
@@ -129,11 +163,20 @@ async function reverseGeocode(lat, lon) {
     if (!resp.ok) return null;
     const data = await resp.json();
     const addr = data.address || {};
+    const postcode  = addr.postcode || null;
+    const landcode  = addr.country_code?.toUpperCase() || 'BE';
+    // Gebruik city/town als primaire gemeente (= officiële hoofdgemeente)
+    // village/suburb kan een deelgemeente zijn
+    const deelgemeente = addr.village || addr.suburb || null;
+    const hoofdstad    = addr.city || addr.town || addr.municipality || null;
+
     return {
-      straat:    addr.road || addr.pedestrian || addr.path || null,
-      gemeente:  addr.city || addr.town || addr.village || addr.municipality || null,
-      postcode:  addr.postcode || null,
-      volledig:  data.display_name
+      straat:      addr.road || addr.pedestrian || addr.path || null,
+      gemeente:    deelgemeente || hoofdstad,   // voor weergave
+      hoofdgemeente: hoofdstad?.toLowerCase() || deelgemeente?.toLowerCase() || null,
+      postcode,
+      landcode,
+      volledig:    data.display_name
     };
   } catch (e) {
     console.warn('Nominatim fout:', e.message);
@@ -649,41 +692,42 @@ Zet "onbekend" ALLEEN als er werkelijk niets leesbaar is.
 Geef ENKEL de JSON terug.`;
 
 // Stap 2: Match listing uit Immoweb-resultaten + web_search fallback
-const PROMPT_STAP2 = `Je bent de Immo Scanner. Je hebt zojuist een makelaarsbord geanalyseerd en je krijgt nu een lijst met vastgoedlistings van Immoweb. Kies de listing die het best overeenkomt.
+const PROMPT_STAP2 = `Je bent de Immo Scanner. Je hebt zojuist een makelaarsbord geanalyseerd en je krijgt nu een lijst met vastgoedlistings. Kies de listing die het best overeenkomt.
 
-## ABSOLUTE REGELS
-1. **GEEN hallucinations.** Toon alleen listings die echt in de lijst staan.
-2. **"Niet gevonden" is een geldig antwoord** als geen enkele listing overeenkomt.
-3. **Locatie**: het pand moet in dezelfde gemeente en idealiter binnen 200m van de GPS-locatie liggen. Hoekpanden staan op zijstraten — dat is normaal.
-4. **Type**: te koop vs te huur moet kloppen.
-5. **Makelaar**: als de makelaar/agency in de listing overeenkomt met het bord, is dat een sterke bevestiging.
-6. **Visuele match**: als de foto het gebouw toont, vergelijk de gevel/architectuur met de beschrijving.
+## ABSOLUTE REGELS — NOOIT OVERTREDEN
+1. **GEEN hallucinations.** Vul ENKEL velden in met data die letterlijk in een gevonden listing staan.
+2. **adres = ALLEEN van de gematchte listing.** Als geen listing gevonden is, is adres altijd null. Vul NOOIT het adres van een andere listing in als gok of benadering.
+3. **url = ALLEEN een URL die effectief bestaat en naar de juiste listing verwijst.** Geen verzonnen URLs.
+4. **"Niet gevonden" is een correct antwoord.** Wees eerlijk — een foute match is slechter dan geen match.
+5. **Locatie**: het GPS-adres is waar de gebruiker stond. Het pand kan op diezelfde straat staan, of op een hoek/zijstraat. Gebruik het als zoekfilter, niet als absoluut adres.
+6. **Type**: te koop vs te huur moet kloppen.
+7. **Adres-match is vereist**: als een listing een ander adres heeft dan de GPS-locatie aangeeft, en er is geen duidelijke verklaring (hoek, zijstraat), kies dan liever "niet_gevonden" dan een foutieve match.
 
-## KIES UIT DE KANDIDATEN
-- Meerdere mogelijke matches? Toon de beste 1-3 met een korte uitleg waarom.
-- Geen match? Gebruik dan je web_search tool als fallback (zoek breed op makelaar + gemeente + type).
-- Nog steeds niets? Status = "niet_gevonden", geef eerlijk aan wat je geprobeerd hebt.
+## HOE TE ZOEKEN
+- Kijk eerst in de meegeleverde lijst of een listing overeenkomt met GPS-locatie + type + makelaar.
+- Geen match in de lijst? Gebruik dan je web_search tool (zoek op makelaar + adres + gemeente).
+- Nog steeds niets? Gebruik faal_categorie "LISTING_NIET_ONLINE" en laat adres/prijs/url op null.
 
 ## OUTPUT — gebruik EXACT dit JSON-formaat:
 {
   "status": "gevonden" | "niet_gevonden" | "gedeeltelijk",
   "makelaar": "naam",
   "makelaar_herkenning": "hoe herkend",
-  "makelaar_betrouwbaarheid": "hoog" | "middel" | "laag",
+  "makelaar_betrouwbaarheid": "HOOG" | "MIDDEL" | "LAAG",
   "pand_type": "🏠 Woning" | "🏢 Appartement" | "🏗️ Nieuwbouw" | "🏭 Commercieel" | "🌳 Grond",
   "listing_type": "Te koop" | "Te huur",
-  "adres": "volledig adres uit de listing, of null",
+  "adres": "adres UIT DE GEVONDEN LISTING, of null als niet gevonden",
   "gemeente": "gemeente",
-  "prijs": "€ bedrag of 'Op aanvraag' of 'Niet gevonden'",
+  "prijs": "€ bedrag of 'Op aanvraag' of null",
   "slaapkamers": "aantal of null",
   "oppervlakte": "m² of null",
   "staat": "Instapklaar" | "Op te frissen" | "Te renoveren" | "Nieuwbouw" | "Onbekend",
   "extras": ["garage", "tuin", "terras"],
-  "url": "directe Immoweb/makelaar URL of null",
+  "url": "directe URL van de gevonden listing, of null",
   "telefoon": "telefoonnummer of null",
-  "gevonden_via": "immoweb_direct" | "web_search" | "niet gevonden",
+  "gevonden_via": "makelaar_direct" | "immoweb_fallback" | "web_search" | "niet_gevonden",
   "faal_categorie": null | "MAKELAAR_NIET_HERKEND" | "LISTING_NIET_ONLINE" | "ADRES_NIET_BEPAALBAAR" | "FALLBACK_OOK_LEEG" | "FOTO_ONLEESBAAR",
-  "notitie": "korte uitleg voor de gebruiker"
+  "notitie": "eerlijke uitleg: wat gevonden, wat niet, en waarom"
 }
 
 Geef ENKEL de JSON terug, geen extra tekst.`;
@@ -773,8 +817,15 @@ app.post('/api/scan', async (req, res) => {
       pand: bordInfo.pand_type_slug
     });
 
-    const gemeente = geocodeResultaat?.gemeente || 'Gent';
-    const postcode = geocodeResultaat?.postcode || '9000';
+    const gemeente = geocodeResultaat?.gemeente   || 'Gent';
+    const postcode = geocodeResultaat?.postcode   || '9000';
+    const landcode = geocodeResultaat?.landcode   || 'BE';
+
+    // Gebruik postcode om de officiële hoofdgemeente op te zoeken
+    // Dit lost deelgemeente-problemen op voor BE, NL, DE, FR, ...
+    const hoofdgemeenteViaPostcode = await gemeenteViaPostcode(postcode, landcode);
+    const hoofdgemeente = hoofdgemeenteViaPostcode || geocodeResultaat?.hoofdgemeente || gemeente.toLowerCase();
+    console.log(`📍 Gemeente: ${gemeente} | Postcode: ${postcode} (${landcode}) → zoekgemeente: ${hoofdgemeente}`);
 
     // ══════════════════════════════════════════════════════════════
     // STAP 1.5 — Extra verificatie: telefoon, correcties, adres
@@ -888,7 +939,7 @@ Als je het niet kan vinden: RESULTAAT: {"naam": null, "website": null}`,
         if (geocodeResultaat?.straat && (betrouwbaarheidNa15b === 'LAAG' || bordInfo.makelaar === 'onbekend')) {
           console.log('🔎 Stap 1.5b-adres: Makelaar afleiden via Immoweb-adres...');
           const gevonden = await ontdekMakelaarViaAdres(
-            geocodeResultaat.straat, gemeente, postcode
+            geocodeResultaat.straat, hoofdgemeente, postcode
           );
           if (gevonden) {
             bordInfo.makelaar = gevonden.naam;
@@ -909,7 +960,7 @@ Als je het niet kan vinden: RESULTAAT: {"naam": null, "website": null}`,
     let listings = await searchMakelaar(
       bordInfo.makelaar,
       bordInfo.listing_type,
-      gemeente,
+      hoofdgemeente,
       postcode,
       bordInfo.makelaar_website
     );
@@ -921,7 +972,7 @@ Als je het niet kan vinden: RESULTAAT: {"naam": null, "website": null}`,
       listings = await searchImmoweb(
         bordInfo.pand_type_slug,
         bordInfo.listing_type,
-        gemeente,
+        hoofdgemeente,
         postcode
       );
       listingsBron = 'immoweb_fallback';
@@ -950,9 +1001,9 @@ Als je het niet kan vinden: RESULTAAT: {"naam": null, "website": null}`,
     // Locatie info
     let locatieInfo = '';
     if (adresFoto) {
-      locatieInfo = `Gebruiker stond bij: ${adresFoto} (GPS). Let op: het pand kan op een zijstraat of hoek staan.`;
+      locatieInfo = `Gebruiker stond bij: ${adresFoto} (GPS). Zoekgemeente: ${hoofdgemeente} (postcode ${postcode}). Let op: het pand kan op een zijstraat of hoek staan.`;
     } else if (gps) {
-      locatieInfo = `GPS: ${gps.lat}°N, ${gps.lon}°O (±${gps.accuracy}m). Straatnaam onbekend.`;
+      locatieInfo = `GPS: ${gps.lat}°N, ${gps.lon}°O (±${gps.accuracy}m). Zoekgemeente: ${hoofdgemeente} (postcode ${postcode}).`;
     } else {
       locatieInfo = 'Geen GPS beschikbaar.';
     }
