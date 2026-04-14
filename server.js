@@ -43,22 +43,36 @@ async function checkUrlActief(url) {
 
 // ── Adres ophalen van detail-pagina van een listing ───────────────
 // Na matching bezoeken we de detailpagina om het exacte adres te extraheren.
+// ── Diepte-zoekactie in JSON-object ──────────────────────────────
+// Vindt een sleutel op elk nestniveau, ongeacht de structuur van de site.
+// Werkt voor ld.address, ld.geo.address, ld.location.address, enz.
+function _deepFind(obj, sleutel, maxDiepte = 8) {
+  if (!obj || typeof obj !== 'object' || maxDiepte === 0) return undefined;
+  if (sleutel in obj) return obj[sleutel];
+  for (const waarde of Object.values(obj)) {
+    const gevonden = _deepFind(waarde, sleutel, maxDiepte - 1);
+    if (gevonden !== undefined) return gevonden;
+  }
+  return undefined;
+}
+
 function _extractAdresUitHtml(html, urlLabel) {
-  // Methode 1: JSON-LD structured data
-  // Checkt meerdere niveaus: ld.address, ld.location.address, ld.geo.address
+  // Methode 1: JSON-LD structured data — diepte-zoekactie
+  // Werkt voor elke site die schema.org gebruikt, ongeacht nestniveau.
+  // Meeste professionele makelaarsites doen dit voor SEO (Google vereist het).
   const jsonldRegex = /<script[^>]*type="application\/ld\+json"[^>]*>([\s\S]*?)<\/script>/gi;
   let jm;
   while ((jm = jsonldRegex.exec(html)) !== null) {
     try {
       const ld = JSON.parse(jm[1]);
-      // immo-home.be zet adres onder ld.geo.address — controleer alle paden
-      const addr = ld.address || ld.location?.address || ld.geo?.address;
-      if (addr && addr.streetAddress) {
-        const straat   = addr.streetAddress.trim();
-        // addressLocality bij immo-home.be bevat soms "65A Rechtstraat" (omgekeerd)
-        // — gebruik postalCode + addressRegion als fallback voor gemeente
-        const gemeente = addr.addressRegion || addr.addressLocality || '';
-        const resultaat = gemeente ? `${straat}, ${gemeente}` : straat;
+      const straat   = _deepFind(ld, 'streetAddress');
+      const postcode = _deepFind(ld, 'postalCode');
+      const regio    = _deepFind(ld, 'addressRegion');
+      if (straat && typeof straat === 'string' && straat.length > 3) {
+        // Bouw adres: "Rechtstraat 65A, 9080 Lochristi"
+        const delen = [straat.trim()];
+        if (postcode || regio) delen.push([postcode, regio].filter(Boolean).join(' '));
+        const resultaat = delen.join(', ');
         console.log(`📍 Adres via JSON-LD (${urlLabel}): ${resultaat}`);
         return resultaat;
       }
