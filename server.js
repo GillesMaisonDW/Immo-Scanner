@@ -567,7 +567,11 @@ async function searchMakelaar(makelaarNaam, listingType, gemeente, postcode, mak
       if (!href.startsWith('http')) href = `https://${domein}${href}`;
       if (!seenUrls.has(href) && !href.includes('?') && href.split('/').length > 4) {
         seenUrls.add(href);
-        listings.push({ url: href, title: href.split('/').pop()?.replace(/-/g, ' ') || 'Listing', bron: `${domein}_regex` });
+        // Gebruik de beschrijvende slug (2e-laatste segment) als titel, niet het ID-nummer.
+        // Bv. /detail/te-koop-woning-lochristi/7514688 → "te koop woning lochristi"
+        const urlSegmenten = href.split('/').filter(Boolean);
+        const beschrijvend = urlSegmenten.slice(-2).find(s => !/^\d+$/.test(s)) || urlSegmenten[urlSegmenten.length - 1] || 'Listing';
+        listings.push({ url: href, title: beschrijvend.replace(/-/g, ' '), bron: `${domein}_regex` });
       }
     }
 
@@ -1215,10 +1219,17 @@ Als je het niet kan vinden: RESULTAAT: {"naam": null, "website": null}`,
 
     // Locatie info
     let locatieInfo = '';
+    const deelgemeente = geocodeResultaat?.gemeente || null;
+    const deelInfo = (deelgemeente && hoofdgemeente && deelgemeente.toLowerCase() !== hoofdgemeente.toLowerCase())
+      ? ` (deelgemeente van ${hoofdgemeente})`
+      : '';
     if (adresFoto) {
-      locatieInfo = `Gebruiker stond bij: ${adresFoto} (GPS). Zoekgemeente: ${hoofdgemeente} (postcode ${postcode}). Let op: het pand kan op een zijstraat of hoek staan.`;
+      locatieInfo = `Gebruiker stond bij: ${adresFoto}${deelInfo} (GPS-locatie).
+Zoekgemeente: ${hoofdgemeente} (postcode ${postcode}).
+BELANGRIJK: Deelgemeentes en hoofdgemeentes delen hetzelfde postcode-gebied. Een listing met "${hoofdgemeente}" in de URL is ook geldig voor panden in deelgemeentes zoals ${deelgemeente || hoofdgemeente}. Kies op basis van straatnaam, niet op basis van welke gemeentenaam in de URL staat.
+Het pand kan ook op een hoek of naastgelegen zijstraat staan.`;
     } else if (gps) {
-      locatieInfo = `GPS: ${gps.lat}°N, ${gps.lon}°O (±${gps.accuracy}m). Zoekgemeente: ${hoofdgemeente} (postcode ${postcode}).`;
+      locatieInfo = `GPS: ${gps.lat}°N, ${gps.lon}°O (±${gps.accuracy}m). Zoekgemeente: ${hoofdgemeente} (postcode ${postcode}).${deelInfo ? ' ' + deelInfo : ''}`;
     } else {
       locatieInfo = 'Geen GPS beschikbaar.';
     }
