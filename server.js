@@ -693,98 +693,6 @@ async function searchMakelaar(makelaarNaam, listingType, gemeente, postcode, mak
   }
 }
 
-// ── Web search op makelaarssite (brug als scraping mislukt) ──────
-// Wanneer slimFetchHtml 0 listings teruggeeft (JS-rendered / AJAX site),
-// gebruiken we Google met "site:makelaar.be straatnaam" om de listing-URL
-// te VINDEN. De echte data halen we daarna van de makelaarssite zelf.
-// Zo profiteren we van Google's index zonder afhankelijk te zijn van
-// Google voor de inhoud — dat lost het "niet recent geïndexeerd" probleem op.
-async function searchViaWebSearch(straat, domein, listingType) {
-  if (!straat || !domein || !API_KEY) return [];
-
-  // Domein normaliseren
-  const domeinClean = domein
-    .replace(/^https?:\/\//, '')
-    .replace(/^www\./, '')
-    .split('/')[0];
-
-  const transactie = listingType === 'Te huur' ? 'te huur' : 'te koop';
-  const zoekopdracht = `"${straat}" site:${domeinClean} ${transactie}`;
-  console.log(`🔍 STAP 2a.5: Web search → "${zoekopdracht}"`);
-
-  try {
-    const resp = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type':      'application/json',
-        'x-api-key':         API_KEY,
-        'anthropic-version': '2023-06-01',
-        'anthropic-beta':    'web-search-2025-03-05'
-      },
-      body: JSON.stringify({
-        model:      'claude-haiku-4-5-20251001',
-        max_tokens: 800,
-        tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: 2 }],
-        system: `Zoek een vastgoedlisting via web_search. Gebruik de web_search tool.`,
-        messages: [{
-          role: 'user',
-          content: `Gebruik web_search om te zoeken: ${zoekopdracht}`
-        }]
-      })
-    });
-
-    if (!resp.ok) {
-      console.warn(`searchViaWebSearch API fout: ${resp.status}`);
-      return [];
-    }
-
-    const data = await resp.json();
-
-    // ── Robuuste URL-extractie ────────────────────────────────────
-    // We zoeken naar URLs van het doeldomein in ALLE blokken:
-    // text-blokken (Claude's antwoord) én tool_result-blokken (ruwe zoekresultaten).
-    // Zo zijn we niet afhankelijk van een specifiek antwoordformaat.
-    const urlPattern = new RegExp(
-      `https?://(?:www\\.)?${domeinClean.replace(/\./g, '\\.')}[^\\s"'<>\\]\\[),]+`,
-      'gi'
-    );
-
-    const gevondenUrls = new Set();
-
-    for (const block of (data.content || [])) {
-      // Tekst-blok: Claude's eigen antwoord
-      if (block.type === 'text' && block.text) {
-        (block.text.match(urlPattern) || []).forEach(u => gevondenUrls.add(u.replace(/[.,;:!?]+$/, '')));
-      }
-      // Tool_result-blok: ruwe zoekresultaten van de web_search tool
-      if (block.type === 'tool_result') {
-        const inhoud = Array.isArray(block.content)
-          ? block.content.map(c => c.text || '').join('\n')
-          : (block.content || '');
-        (inhoud.match(urlPattern) || []).forEach(u => gevondenUrls.add(u.replace(/[.,;:!?]+$/, '')));
-      }
-    }
-
-    // Filter: enkel detail-pagina URLs (niet de zoekpagina zelf)
-    const detailUrls = [...gevondenUrls].filter(u => {
-      const pad = u.replace(/^https?:\/\/[^/]+/, '');
-      return pad.split('/').filter(Boolean).length >= 2; // min 2 segmenten = detail-pagina
-    });
-
-    console.log(`✅ Web search gevonden: ${detailUrls.length} URL(s) op ${domeinClean}`, detailUrls);
-
-    return detailUrls.map(u => ({
-      url:   u,
-      title: u.split('/').filter(Boolean).slice(-2).find(s => !/^\d+$/.test(s)) || 'listing',
-      bron:  'web_search_makelaar'
-    }));
-
-  } catch (e) {
-    console.warn('searchViaWebSearch fout:', e.message);
-    return [];
-  }
-}
-
 // ── Immoweb zoeken ───────────────────────────────────────────────
 // Haalt listings rechtstreeks op van Immoweb (geen Google nodig).
 // Probeert meerdere extractiemethodes (Next.js data, regex, etc.)
@@ -1105,42 +1013,31 @@ Zet "onbekend" ALLEEN als er werkelijk niets leesbaar is.
 
 Geef ENKEL de JSON terug.`;
 
-// Stap 2: Match listing uit resultaten + web_search
-const PROMPT_STAP2 = `Je bent de Immo Scanner. Je krijgt een lijst met vastgoedlistings en GPS-locatieinfo. Zoek de juiste listing.
+// Stap 3: Zoek en match de listing
+// Twee scenario's — welk van toepassing staat bovenaan de user-message.
+const PROMPT_STAP2 = `Je bent de Immo Scanner. Je werkt in één van twee scenario's.
 
-## ABSOLUTE REGELS — NOOIT OVERTREDEN
-1. **GEEN hallucinations.** Vul ENKEL velden in met data die letterlijk in een gevonden listing staan.
-2. **adres = ALLEEN van de gematchte listing.** Als geen listing gevonden is, is adres null.
-3. **url = ALLEEN een URL die effectief bestaat.** Geen verzonnen URLs.
-4. **Type**: te koop vs te huur moet kloppen.
-5. **Makelaar-prioriteit**: als de makelaar op het bord bekend is, verkies dan listings van die makelaar boven Immoweb-listings van andere makelaars.
+## ALTIJD GELDENDE REGELS
+1. Geen hallucinations. Vul enkel velden in met data uit echte gevonden listings.
+2. Geen verzonnen URLs. Alleen URLs die effectief bestaan.
+3. Transactie (te koop / te huur) moet kloppen met het bord.
+4. "niet_gevonden" is eerlijk — een foute match is erger dan geen match.
 
-## MATCH-KWALITEIT — gebruik altijd het juiste niveau
+## SCENARIO A — GPS-straatnaam + makelaar website bekend
+Er zijn geen pre-geladen listings. Je gebruikt web_search om de listing te vinden.
+Volgorde:
+1. web_search: "[GPS-straatnaam]" site:[makelaar-website]
+2. Als niets gevonden: web_search: "[GPS-straatnaam]" "[gemeente]" [makelaar naam] te koop/huur
+3. Als nog niets: status "niet_gevonden", faal_categorie "LISTING_NIET_ONLINE"
 
-**NIVEAU 1 — "gevonden"** (hoge zekerheid):
-- Listing adres bevat de GPS-straatnaam, OF
-- Listing staat op de hoek (beide straatnamen zichtbaar), OF
-- Referentienummer op bord stemt overeen met listing
+## SCENARIO B — Geen GPS of makelaar onbekend
+Je krijgt een lijst van listings. Kies de beste match op basis van:
+- Pand-type (woning, appartement, …) en transactie (koop/huur)
+- Locatie (gemeente, postcode)
+- Info van het bord (referentienummer, telefoon, visuele kenmerken)
 
-**NIVEAU 2 — "gedeeltelijk"** (lage zekerheid, toon met waarschuwing):
-- Listing is van de juiste makelaar + zelfde postcode, maar straat NIET bevestigd
-- GPS-offset situaties: foto van overkant kanaal, schuine hoek, overkant straat
-- Gebruik dit niveau als je vermoedt dat het klopt maar niet zeker bent
-
-**NIVEAU 3 — "niet_gevonden"** (gebruik web_search EERST):
-- Nooit "niet_gevonden" teruggeven zonder eerst web_search geprobeerd te hebben
-- Enkel als web_search ook niets oplevert
-
-## HOE TE ZOEKEN — VOLG DEZE VOLGORDE
-**Stap A**: Is er een listing met de GPS-straatnaam in het adres EN van de juiste makelaar? → "gevonden"
-**Stap B**: Is er een listing van de juiste makelaar in het juiste postcodegebied, maar straat onzeker? → "gedeeltelijk"
-**Stap C**: Listings van verkeerde makelaars (bv. Immoweb terwijl makelaar bekend is)? → negeer ze, ga naar Stap D
-**Stap D**: Gebruik web_search:
-  - Zoekopdracht 1: "[GPS-straatnaam]" site:[makelaar-website]
-  - Zoekopdracht 2: "[GPS-straatnaam]" "[gemeente]" [makelaar naam] te koop
-**Stap E**: Web_search geeft niets → "niet_gevonden" met faal_categorie "LISTING_NIET_ONLINE"
-
-**KERNREGEL**: Een listing van een andere makelaar (bijv. ERA-listing als het bord van Immo Home is) is NOOIT een geldige match, ongeacht het adres.
+Gebruik "gevonden" als je zeker bent, "gedeeltelijk" als je twijfelt.
+Als de lijst leeg is of niets bruikbaar bevat: gebruik web_search voor je "niet_gevonden" geeft.
 
 ## OUTPUT — gebruik EXACT dit JSON-formaat:
 {
@@ -1150,7 +1047,7 @@ const PROMPT_STAP2 = `Je bent de Immo Scanner. Je krijgt een lijst met vastgoedl
   "makelaar_betrouwbaarheid": "HOOG" | "MIDDEL" | "LAAG",
   "pand_type": "🏠 Woning" | "🏢 Appartement" | "🏗️ Nieuwbouw" | "🏭 Commercieel" | "🌳 Grond",
   "listing_type": "Te koop" | "Te huur",
-  "adres": "adres UIT DE GEVONDEN LISTING, of null als niet gevonden",
+  "adres": "adres UIT DE GEVONDEN LISTING, of null",
   "gemeente": "gemeente",
   "prijs": "€ bedrag of 'Op aanvraag' of null",
   "slaapkamers": "aantal of null",
@@ -1159,7 +1056,7 @@ const PROMPT_STAP2 = `Je bent de Immo Scanner. Je krijgt een lijst met vastgoedl
   "extras": ["garage", "tuin", "terras"],
   "url": "directe URL van de gevonden listing, of null",
   "telefoon": "telefoonnummer of null",
-  "gevonden_via": "makelaar_direct" | "immoweb_fallback" | "web_search" | "niet_gevonden",
+  "gevonden_via": "web_search" | "makelaar_direct" | "immoweb_fallback" | "niet_gevonden",
   "faal_categorie": null | "MAKELAAR_NIET_HERKEND" | "LISTING_NIET_ONLINE" | "ADRES_NIET_BEPAALBAAR" | "FALLBACK_OOK_LEEG" | "FOTO_ONLEESBAAR",
   "notitie": "eerlijke uitleg: wat gevonden, wat niet, en waarom"
 }
@@ -1387,31 +1284,16 @@ Als je het niet kan vinden: RESULTAAT: {"naam": null, "website": null}`,
     }
 
     // ══════════════════════════════════════════════════════════════
-    // STAP 2 — Zoeken: makelaarsite eerst, dan Immoweb als fallback
+    // STAP 2 — Scenario bepalen en listings ophalen
     // ══════════════════════════════════════════════════════════════
 
-    // 2a. Probeer eerst de makelaarsite rechtstreeks
-    console.log('🏢 STAP 2a: Makelaarsite rechtstreeks doorzoeken...');
-    let listings = await searchMakelaar(
-      bordInfo.makelaar,
-      bordInfo.listing_type,
-      hoofdgemeente,
-      postcode,
-      bordInfo.makelaar_website
-    );
-    let listingsBron = 'makelaar_direct';
-
-    // 2b. Stap 2a.5: als scraping mislukte + GPS beschikbaar → web search op makelaarssite
-    // Google vindt de URL → wij halen de echte data van de makelaarssite zelf.
-    // Zo blijft de data actueel, ook voor JS-rendered sites die niet scrapbaar zijn.
-    //
-    // Domein-fallback: als het website-adres niet op het bord stond (makelaar_website = null),
-    // zoeken we het domein op in Supabase via de herkende naam — dat weten we toch al.
-    let domeinVoorWebSearch = bordInfo.makelaar_website
+    // ── Domein bepalen ─────────────────────────────────────────────
+    // Eerst uit bordInfo, anders opzoeken in Supabase via herkende naam.
+    let domeinMakelaar = bordInfo.makelaar_website
       ? bordInfo.makelaar_website.replace(/^https?:\/\//, '').replace(/^www\./, '').split('/')[0]
       : null;
 
-    if (!domeinVoorWebSearch && bordInfo.makelaar) {
+    if (!domeinMakelaar && bordInfo.makelaar) {
       const allesMakelaars = await laadMakelaarsUitSupabase();
       const naamLow = (bordInfo.makelaar || '').toLowerCase().replace(/[-\s]+/g, ' ').trim();
       const gevondenM = allesMakelaars.find(m => {
@@ -1419,76 +1301,71 @@ Als je het niet kan vinden: RESULTAAT: {"naam": null, "website": null}`,
         return naamLow.includes(siteBase) || siteBase.includes(naamLow.split(' ')[0]);
       });
       if (gevondenM) {
-        domeinVoorWebSearch = gevondenM.domein.replace('www.', '');
-        console.log(`🔗 Domein-fallback: "${bordInfo.makelaar}" → ${domeinVoorWebSearch} (uit Supabase)`);
+        domeinMakelaar = gevondenM.domein.replace('www.', '');
+        console.log(`🔗 Domein-fallback: "${bordInfo.makelaar}" → ${domeinMakelaar} (uit Supabase)`);
       }
     }
 
-    if (listings.length === 0 && geocodeResultaat?.straat && domeinVoorWebSearch) {
-      console.log('🔍 STAP 2a.5: Scraping mislukt → web search op makelaarssite als brug...');
-      const webSearchListings = await searchViaWebSearch(
-        geocodeResultaat.straat,
-        domeinVoorWebSearch,
-        bordInfo.listing_type
-      );
-      if (webSearchListings.length > 0) {
-        listings = webSearchListings;
-        listingsBron = 'web_search_makelaar';
-        console.log(`✅ STAP 2a.5: ${listings.length} listing(s) gevonden via web search`);
-      } else {
-        console.log('⚠️  STAP 2a.5: web search ook leeg → Immoweb proberen...');
-      }
-    }
+    // ── Scenario bepalen ───────────────────────────────────────────
+    // Scenario A: GPS-straatnaam + makelaar domein gekend
+    //   → Claude Sonnet zoekt zelf via web_search in stap 3. Geen pre-fetch.
+    // Scenario B: Geen GPS of makelaar onbekend
+    //   → Scraping van makelaarssite, daarna Immoweb als fallback.
+    const gpsStraat = geocodeResultaat?.straat || null;
+    const scenarioA = !!(gpsStraat && domeinMakelaar);
+    let listings = [];
+    let listingsBron = 'geen';
 
-    // 2c. Fallback: Immoweb als ook web search op makelaarssite niets opleverde.
-    // UITZONDERING: als GPS-straatnaam én makelaardomein bekend zijn, sla Immoweb over.
-    // Immoweb-listings zijn van andere makelaars — Claude zou dan Begoniastraat kiezen
-    // i.p.v. web_search te gebruiken. Stap 3 (Claude Sonnet) zoekt dan zelf via web_search.
-    const slaImmowebOver = geocodeResultaat?.straat && domeinVoorWebSearch;
-    if (listings.length === 0 && !slaImmowebOver) {
-      console.log('⚠️  Makelaarsite leeg — Immoweb als fallback...');
-      listings = await searchImmoweb(
-        bordInfo.pand_type_slug,
+    if (scenarioA) {
+      console.log(`🎯 SCENARIO A: GPS "${gpsStraat}" + makelaar "${domeinMakelaar}" → stap 3 zoekt via web_search`);
+      listingsBron = 'scenario_a';
+    } else {
+      console.log('🔍 SCENARIO B: Geen GPS of makelaar onbekend → scraping + Immoweb');
+      listings = await searchMakelaar(
+        bordInfo.makelaar,
         bordInfo.listing_type,
         hoofdgemeente,
-        postcode
+        postcode,
+        bordInfo.makelaar_website
       );
-      listingsBron = 'immoweb_fallback';
-    } else if (listings.length === 0 && slaImmowebOver) {
-      console.log('⏭️  Immoweb overgeslagen (GPS + makelaar bekend) → stap 3 gebruikt web_search');
-    }
+      listingsBron = 'makelaar_direct';
 
-    // 2d. Verrijk listings zonder adres: haal straatnaam op van detailpagina
-    // Zo kan Claude matchen op "Rechtstraat" i.p.v. enkel gemeente-naam in URL.
-    // Geldt ook voor web_search_makelaar: URL's gevonden via Google, data van makelaarssite.
-    if (listings.length > 0 && (listingsBron === 'makelaar_direct' || listingsBron === 'web_search_makelaar')) {
-      listings = await verrijkListingAdressen(listings, hoofdgemeente, postcode, geocodeResultaat?.straat);
-    }
+      if (listings.length === 0) {
+        console.log('⚠️  Makelaarsite leeg — Immoweb als fallback...');
+        listings = await searchImmoweb(
+          bordInfo.pand_type_slug,
+          bordInfo.listing_type,
+          hoofdgemeente,
+          postcode
+        );
+        listingsBron = 'immoweb_fallback';
+      }
 
-    // 2e. STRAATNAAM-CHECK: als GPS een straatnaam geeft maar geen enkele listing
-    // die straatnaam bevat na verrijking → gooi de listings weg.
-    // Claude wordt dan gedwongen web_search te gebruiken in stap 3 (Sonnet = betrouwbaar).
-    // Dit lost het Begoniastraat-probleem op: scraping vond listings, maar verkeerde straat.
-    if (geocodeResultaat?.straat && listings.length > 0) {
-      const straatLow = geocodeResultaat.straat.toLowerCase();
-      const heeftJuisteStraat = listings.some(l =>
-        (l.address || '').toLowerCase().includes(straatLow)
-      );
-      if (!heeftJuisteStraat) {
-        console.log(`⚠️  Geen listing met straat "${geocodeResultaat.straat}" → ${listings.length} listings weggegooid, web_search verplicht in stap 3`);
-        listings = [];
-        listingsBron = 'straat_mismatch';
-      } else {
-        console.log(`✅ Listing(s) met straatnaam "${geocodeResultaat.straat}" gevonden`);
+      // Verrijk listings: haal straatnaam op van detailpagina's (enkel bij directe scraping)
+      if (listings.length > 0 && listingsBron === 'makelaar_direct') {
+        listings = await verrijkListingAdressen(listings, hoofdgemeente, postcode, gpsStraat);
       }
     }
 
-    console.log(`✅ STAP 2 klaar: ${listings.length} listings via ${listingsBron}`);
+    console.log(`✅ STAP 2 klaar: ${scenarioA ? 'Scenario A' : 'Scenario B'} — ${listings.length} listings via ${listingsBron}`);
 
-    // Bouw context voor Claude
+    // Bouw context voor Claude op basis van scenario
     let listingsContext = '';
-    if (listings.length > 0) {
-      listingsContext = `\n\n## LISTINGS GEVONDEN VIA ${listingsBron.toUpperCase()} (${listings.length} resultaten)\n\n`;
+    if (scenarioA) {
+      // Scenario A: Claude zoekt zelf via web_search — geen pre-geladen listings
+      listingsContext = `\n\n## SCENARIO A — GPS + MAKELAAR BEKEND
+GPS-straatnaam: "${gpsStraat}"
+Makelaarswebsite: ${domeinMakelaar}
+
+Je hebt geen pre-geladen listings. Zoek zelf via web_search:
+1. web_search: "${gpsStraat}" site:${domeinMakelaar}
+2. Niets gevonden? web_search: "${gpsStraat}" "${hoofdgemeente}" ${bordInfo.makelaar} ${bordInfo.listing_type}
+3. Nog steeds niets? → status "niet_gevonden", faal_categorie "LISTING_NIET_ONLINE"
+
+REGEL: web_search is VERPLICHT. Geef nooit "niet_gevonden" zonder minstens 2 searches geprobeerd.\n`;
+    } else if (listings.length > 0) {
+      // Scenario B met listings
+      listingsContext = `\n\n## SCENARIO B — LISTINGS VIA SCRAPING (${listings.length} resultaten — bron: ${listingsBron})\n\n`;
       for (const l of listings.slice(0, 25)) {
         listingsContext += `- **${l.title || 'Geen titel'}**\n`;
         if (l.address)  listingsContext += `  Adres: ${l.address}\n`;
@@ -1499,20 +1376,15 @@ Als je het niet kan vinden: RESULTAAT: {"naam": null, "website": null}`,
         if (l.url)      listingsContext += `  URL: ${l.url}\n`;
         listingsContext += '\n';
       }
+      if (listingsBron === 'immoweb_fallback') {
+        listingsContext += `\n⚠️ IMMOWEB-FALLBACK: deze listings zijn van andere makelaars op Immoweb. Gebruik enkel als beste beschikbare optie.\n`;
+      }
     } else {
-      const straatTip = geocodeResultaat?.straat
-        ? `\n⚠️ VERPLICHT: Gebruik web_search als eerste stap. Zoekopdracht: "${geocodeResultaat.straat}" site:${domeinVoorWebSearch || bordInfo.makelaar_website || (bordInfo.makelaar || '').toLowerCase().replace(/\s+/g, '') + '.be'}`
-        : '';
-      listingsContext = `\n\n## GEEN LISTINGS gevonden via directe opvraging.${straatTip}\nZonder web_search mag je NIET "niet_gevonden" teruggeven.\n`;
-    }
-
-    // Waarschuwing bij Immoweb-fallback: makelaar heeft eigen site, gebruik web_search
-    if (listingsBron === 'immoweb_fallback' && domeinVoorWebSearch && geocodeResultaat?.straat) {
-      listingsContext += `\n## ⚠️ IMMOWEB-FALLBACK — ACTIE VEREIST
-De listing staat op de website van de makelaar zelf: ${domeinVoorWebSearch}
-De Immoweb-resultaten hierboven zijn van ANDERE makelaars — gebruik ze NIET als match tenzij niets gevonden op makelaarssite.
-VERPLICHTE eerste web_search: "${geocodeResultaat.straat}" site:${domeinVoorWebSearch}
-Pas als web_search op makelaarssite niets oplevert, kies je uit Immoweb.\n`;
+      // Scenario B maar geen listings gevonden
+      const domeinHint = domeinMakelaar || (bordInfo.makelaar || '').toLowerCase().replace(/\s+/g, '') + '.be';
+      listingsContext = `\n\n## SCENARIO B — GEEN LISTINGS GEVONDEN VIA SCRAPING
+${gpsStraat ? `⚠️ Probeer alsnog web_search: "${gpsStraat}" site:${domeinHint}` : 'Geen GPS beschikbaar en scraping leverde niets op.'}
+Als web_search ook niets oplevert: status "niet_gevonden", faal_categorie "SCRAPING_MISLUKT".\n`;
     }
 
     // Locatie info
@@ -1560,19 +1432,14 @@ Het pand kan ook op een hoek of naastgelegen zijstraat staan.`;
             { type: 'image', source: { type: 'base64', media_type: mime || 'image/jpeg', data: image } },
             {
               type: 'text',
-              text: `${geocodeResultaat?.straat ? `## GPS-STRAATNAAM: "${geocodeResultaat.straat}"
-Zoek eerst naar een listing op deze straat (niveau 1 = gevonden).
-Geen match op straatnaam? → gebruik web_search op de makelaarssite vóór je opgeeft.
-Pas als alles mislukt: toon de beste nabije match met status "gedeeltelijk".
-
-` : ''}## BORDANALYSE (stap 1)
+              text: `## BORDANALYSE (stap 1)
 Makelaar: ${bordInfo.makelaar} (${bordInfo.makelaar_herkenning})
 Betrouwbaarheid: ${bordInfo.makelaar_betrouwbaarheid}
 Type: ${bordInfo.listing_type}
 Pand: ${bordInfo.pand_type_slug}
 Referentienummer: ${bordInfo.referentienummer || 'niet zichtbaar'}
 Telefoon: ${bordInfo.telefoon || 'niet zichtbaar'}
-Makelaar website: ${domeinVoorWebSearch || bordInfo.makelaar_website || 'onbekend'}
+Makelaar website: ${domeinMakelaar || bordInfo.makelaar_website || 'onbekend'}
 
 ## LOCATIE
 ${locatieInfo}
