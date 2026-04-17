@@ -510,18 +510,18 @@ async function verrijkListingAdressen(listings, hoofdgemeente, postcode, straatG
   const gem = (hoofdgemeente || '').toLowerCase();
   const pc  = (postcode || '').toString();
 
+  // Verrijk alle listings zonder adres — we beperken ons niet langer tot listings
+  // waarvan gemeente/postcode in de URL staat. Sommige makelaars gebruiken
+  // generieke URL-structuren (bv. /detail/7514688) zonder locatieinfo in de slug.
+  // We pakken de eerste 5 listings zonder adres en halen die detail-pagina op.
   const kandidaten = listings.filter(l => {
     if (l.address) return false; // al een adres, niets te doen
     if (!l.url)    return false;
-    const urlLow = l.url.toLowerCase();
-    const titleLow = (l.title || '').toLowerCase();
-    // Neem listing mee als gemeente/postcode in URL of titel voorkomt
-    return urlLow.includes(gem) || urlLow.includes(pc) ||
-           titleLow.includes(gem) || titleLow.includes(pc);
-  }).slice(0, 4); // max 4 detail-pagina's ophalen
+    return true; // verrijk alles wat een URL heeft maar geen adres
+  }).slice(0, 5); // max 5 detail-pagina's ophalen (was 4, nu iets ruimer)
 
   if (kandidaten.length === 0) {
-    console.log('📍 Geen kandidaat-listings om te verrijken');
+    console.log('📍 Geen kandidaat-listings om te verrijken (alles heeft al een adres)');
     return listings;
   }
 
@@ -674,7 +674,7 @@ async function searchMakelaar(makelaarNaam, listingType, gemeente, postcode, mak
       if (!href.startsWith('http')) href = `https://${domein}${href}`;
       // Strip query string voor deduplicatie, maar behoud de schone URL
       const hrefZonderQuery = href.split('?')[0];
-      if (!seenUrls.has(hrefZonderQuery) && hrefZonderQuery.split('/').length > 4) {
+      if (!seenUrls.has(hrefZonderQuery) && hrefZonderQuery.split('/').length > 3) {
         seenUrls.add(hrefZonderQuery);
         // Gebruik de beschrijvende slug (2e-laatste segment) als titel, niet het ID-nummer.
         // Bv. /detail/te-koop-woning-lochristi/7514688 → "te koop woning lochristi"
@@ -689,6 +689,82 @@ async function searchMakelaar(makelaarNaam, listingType, gemeente, postcode, mak
 
   } catch (e) {
     console.warn(`Makelaarsite fetch fout voor ${domein}:`, e.message);
+    return [];
+  }
+}
+
+// ── Web search op makelaarssite (brug als scraping mislukt) ──────
+// Wanneer slimFetchHtml 0 listings teruggeeft (JS-rendered / AJAX site),
+// gebruiken we Google met "site:makelaar.be straatnaam" om de listing-URL
+// te VINDEN. De echte data halen we daarna van de makelaarssite zelf.
+// Zo profiteren we van Google's index zonder afhankelijk te zijn van
+// Google voor de inhoud — dat lost het "niet recent geïndexeerd" probleem op.
+async function searchViaWebSearch(straat, makelaarWebsite, listingType, gemeente) {
+  if (!straat || !makelaarWebsite || !API_KEY) return [];
+
+  const domein = makelaarWebsite
+    .replace(/^https?:\/\//, '')
+    .replace(/^www\./, '')
+    .split('/')[0]; // alleen het domein, geen pad
+
+  const transactie = listingType === 'Te huur' ? 'te huur' : 'te koop';
+  const zoekopdracht = `"${straat}" site:${domein} ${transactie}`;
+  console.log(`🔍 STAP 2a.5: Web search op makelaarssite: "${zoekopdracht}"`);
+
+  try {
+    const resp = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type':      'application/json',
+        'x-api-key':         API_KEY,
+        'anthropic-version': '2023-06-01',
+        'anthropic-beta':    'web-search-2025-03-05'
+      },
+      body: JSON.stringify({
+        model:      'claude-haiku-4-5-20251001', // goedkoper model voor zoeken
+        max_tokens: 512,
+        tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: 2 }],
+        system: `Je zoekt een vastgoedlisting via web search.
+Gebruik web_search en zoek naar de URL van de listing.
+Geef ENKEL dit JSON terug op een aparte regel (niets anders):
+URLS: ["https://...", "https://..."]
+Als niets gevonden: URLS: []`,
+        messages: [{
+          role: 'user',
+          content: `Zoek: ${zoekopdracht}\n\nGeef de listing-URLs terug die je vindt op ${domein}.`
+        }]
+      })
+    });
+
+    if (!resp.ok) {
+      console.warn(`searchViaWebSearch API fout: ${resp.status}`);
+      return [];
+    }
+
+    const data = await resp.json();
+    const text = (data.content || [])
+      .filter(b => b.type === 'text')
+      .map(b => b.text)
+      .join('\n');
+
+    const match = text.match(/URLS:\s*(\[[\s\S]*?\])/);
+    if (!match) {
+      console.log('⚠️  searchViaWebSearch: geen URLS-patroon in response');
+      return [];
+    }
+
+    const urls = JSON.parse(match[1]);
+    const geldigeUrls = urls.filter(u => typeof u === 'string' && u.startsWith('http') && u.includes(domein));
+
+    console.log(`✅ Web search gevonden: ${geldigeUrls.length} URL(s) op ${domein}`);
+    return geldigeUrls.map(u => ({
+      url:   u,
+      title: u.split('/').filter(Boolean).slice(-2).find(s => !/^\d+$/.test(s)) || 'listing',
+      bron:  'web_search_makelaar'
+    }));
+
+  } catch (e) {
+    console.warn('searchViaWebSearch fout:', e.message);
     return [];
   }
 }
@@ -1293,7 +1369,27 @@ Als je het niet kan vinden: RESULTAAT: {"naam": null, "website": null}`,
     );
     let listingsBron = 'makelaar_direct';
 
-    // 2b. Fallback: Immoweb als makelaarsite niets opleverde
+    // 2b. Stap 2a.5: als scraping mislukte + GPS beschikbaar → web search op makelaarssite
+    // Google vindt de URL → wij halen de echte data van de makelaarssite zelf.
+    // Zo blijft de data actueel, ook voor JS-rendered sites die niet scrapbaar zijn.
+    if (listings.length === 0 && geocodeResultaat?.straat && bordInfo.makelaar_website) {
+      console.log('🔍 STAP 2a.5: Scraping mislukt → web search op makelaarssite als brug...');
+      const webSearchListings = await searchViaWebSearch(
+        geocodeResultaat.straat,
+        bordInfo.makelaar_website,
+        bordInfo.listing_type,
+        hoofdgemeente
+      );
+      if (webSearchListings.length > 0) {
+        listings = webSearchListings;
+        listingsBron = 'web_search_makelaar';
+        console.log(`✅ STAP 2a.5: ${listings.length} listing(s) gevonden via web search`);
+      } else {
+        console.log('⚠️  STAP 2a.5: web search ook leeg → Immoweb proberen...');
+      }
+    }
+
+    // 2c. Fallback: Immoweb als ook web search op makelaarssite niets opleverde
     if (listings.length === 0) {
       console.log('⚠️  Makelaarsite leeg — Immoweb als fallback...');
       listings = await searchImmoweb(
@@ -1305,9 +1401,10 @@ Als je het niet kan vinden: RESULTAAT: {"naam": null, "website": null}`,
       listingsBron = 'immoweb_fallback';
     }
 
-    // 2c. Verrijk listings zonder adres: haal straatnaam op van detailpagina
-    // Zo kan Claude matchen op "Rechtstraat" i.p.v. enkel gemeente-naam in URL
-    if (listings.length > 0 && listingsBron === 'makelaar_direct') {
+    // 2d. Verrijk listings zonder adres: haal straatnaam op van detailpagina
+    // Zo kan Claude matchen op "Rechtstraat" i.p.v. enkel gemeente-naam in URL.
+    // Geldt ook voor web_search_makelaar: URL's gevonden via Google, data van makelaarssite.
+    if (listings.length > 0 && (listingsBron === 'makelaar_direct' || listingsBron === 'web_search_makelaar')) {
       listings = await verrijkListingAdressen(listings, hoofdgemeente, postcode, geocodeResultaat?.straat);
     }
 
