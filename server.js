@@ -1372,11 +1372,31 @@ Als je het niet kan vinden: RESULTAAT: {"naam": null, "website": null}`,
     // 2b. Stap 2a.5: als scraping mislukte + GPS beschikbaar → web search op makelaarssite
     // Google vindt de URL → wij halen de echte data van de makelaarssite zelf.
     // Zo blijft de data actueel, ook voor JS-rendered sites die niet scrapbaar zijn.
-    if (listings.length === 0 && geocodeResultaat?.straat && bordInfo.makelaar_website) {
+    //
+    // Domein-fallback: als het website-adres niet op het bord stond (makelaar_website = null),
+    // zoeken we het domein op in Supabase via de herkende naam — dat weten we toch al.
+    let domeinVoorWebSearch = bordInfo.makelaar_website
+      ? bordInfo.makelaar_website.replace(/^https?:\/\//, '').replace(/^www\./, '').split('/')[0]
+      : null;
+
+    if (!domeinVoorWebSearch && bordInfo.makelaar) {
+      const allesMakelaars = await laadMakelaarsUitSupabase();
+      const naamLow = (bordInfo.makelaar || '').toLowerCase().replace(/[-\s]+/g, ' ').trim();
+      const gevondenM = allesMakelaars.find(m => {
+        const siteBase = m.domein.replace(/\.(be|com|nl)$/, '').replace('www.', '').toLowerCase();
+        return naamLow.includes(siteBase) || siteBase.includes(naamLow.split(' ')[0]);
+      });
+      if (gevondenM) {
+        domeinVoorWebSearch = gevondenM.domein.replace('www.', '');
+        console.log(`🔗 Domein-fallback: "${bordInfo.makelaar}" → ${domeinVoorWebSearch} (uit Supabase)`);
+      }
+    }
+
+    if (listings.length === 0 && geocodeResultaat?.straat && domeinVoorWebSearch) {
       console.log('🔍 STAP 2a.5: Scraping mislukt → web search op makelaarssite als brug...');
       const webSearchListings = await searchViaWebSearch(
         geocodeResultaat.straat,
-        bordInfo.makelaar_website,
+        domeinVoorWebSearch,
         bordInfo.listing_type,
         hoofdgemeente
       );
