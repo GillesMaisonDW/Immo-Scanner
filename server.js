@@ -1440,8 +1440,12 @@ Als je het niet kan vinden: RESULTAAT: {"naam": null, "website": null}`,
       }
     }
 
-    // 2c. Fallback: Immoweb als ook web search op makelaarssite niets opleverde
-    if (listings.length === 0) {
+    // 2c. Fallback: Immoweb als ook web search op makelaarssite niets opleverde.
+    // UITZONDERING: als GPS-straatnaam én makelaardomein bekend zijn, sla Immoweb over.
+    // Immoweb-listings zijn van andere makelaars — Claude zou dan Begoniastraat kiezen
+    // i.p.v. web_search te gebruiken. Stap 3 (Claude Sonnet) zoekt dan zelf via web_search.
+    const slaImmowebOver = geocodeResultaat?.straat && domeinVoorWebSearch;
+    if (listings.length === 0 && !slaImmowebOver) {
       console.log('⚠️  Makelaarsite leeg — Immoweb als fallback...');
       listings = await searchImmoweb(
         bordInfo.pand_type_slug,
@@ -1450,6 +1454,8 @@ Als je het niet kan vinden: RESULTAAT: {"naam": null, "website": null}`,
         postcode
       );
       listingsBron = 'immoweb_fallback';
+    } else if (listings.length === 0 && slaImmowebOver) {
+      console.log('⏭️  Immoweb overgeslagen (GPS + makelaar bekend) → stap 3 gebruikt web_search');
     }
 
     // 2d. Verrijk listings zonder adres: haal straatnaam op van detailpagina
@@ -1457,6 +1463,24 @@ Als je het niet kan vinden: RESULTAAT: {"naam": null, "website": null}`,
     // Geldt ook voor web_search_makelaar: URL's gevonden via Google, data van makelaarssite.
     if (listings.length > 0 && (listingsBron === 'makelaar_direct' || listingsBron === 'web_search_makelaar')) {
       listings = await verrijkListingAdressen(listings, hoofdgemeente, postcode, geocodeResultaat?.straat);
+    }
+
+    // 2e. STRAATNAAM-CHECK: als GPS een straatnaam geeft maar geen enkele listing
+    // die straatnaam bevat na verrijking → gooi de listings weg.
+    // Claude wordt dan gedwongen web_search te gebruiken in stap 3 (Sonnet = betrouwbaar).
+    // Dit lost het Begoniastraat-probleem op: scraping vond listings, maar verkeerde straat.
+    if (geocodeResultaat?.straat && listings.length > 0) {
+      const straatLow = geocodeResultaat.straat.toLowerCase();
+      const heeftJuisteStraat = listings.some(l =>
+        (l.address || '').toLowerCase().includes(straatLow)
+      );
+      if (!heeftJuisteStraat) {
+        console.log(`⚠️  Geen listing met straat "${geocodeResultaat.straat}" → ${listings.length} listings weggegooid, web_search verplicht in stap 3`);
+        listings = [];
+        listingsBron = 'straat_mismatch';
+      } else {
+        console.log(`✅ Listing(s) met straatnaam "${geocodeResultaat.straat}" gevonden`);
+      }
     }
 
     console.log(`✅ STAP 2 klaar: ${listings.length} listings via ${listingsBron}`);
