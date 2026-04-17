@@ -1600,6 +1600,11 @@ Bij web_search: begin ALTIJD met "${geocodeResultaat?.straat || ''}" site:${bord
     if (!result.gemeente && geocodeResultaat?.gemeente) result.gemeente = geocodeResultaat.gemeente;
     if (result.adres === 'Niet bepaald') result.adres = null;
 
+    // ── Adres van detailpagina ook naar frontend sturen ──────────
+    // adresListing wordt al correct opgeslagen in Supabase, maar werd
+    // nooit teruggestuurd naar de app — daarom stond er altijd "niet bepaald".
+    if (adresListing) result.adres = adresListing;
+
     console.log('📊 SCAN KLAAR:', {
       ts:        new Date().toISOString(),
       makelaar:  result.makelaar,
