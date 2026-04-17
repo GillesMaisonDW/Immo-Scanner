@@ -1105,26 +1105,42 @@ Zet "onbekend" ALLEEN als er werkelijk niets leesbaar is.
 
 Geef ENKEL de JSON terug.`;
 
-// Stap 2: Match listing uit Immoweb-resultaten + web_search fallback
-const PROMPT_STAP2 = `Je bent de Immo Scanner. Je hebt zojuist een makelaarsbord geanalyseerd en je krijgt nu een lijst met vastgoedlistings. Kies de listing die het best overeenkomt.
+// Stap 2: Match listing uit resultaten + web_search
+const PROMPT_STAP2 = `Je bent de Immo Scanner. Je krijgt een lijst met vastgoedlistings en GPS-locatieinfo. Zoek de juiste listing.
 
 ## ABSOLUTE REGELS — NOOIT OVERTREDEN
 1. **GEEN hallucinations.** Vul ENKEL velden in met data die letterlijk in een gevonden listing staan.
-2. **adres = ALLEEN van de gematchte listing.** Als geen listing gevonden is, is adres altijd null. Vul NOOIT het adres van een andere listing in als gok of benadering.
-3. **url = ALLEEN een URL die effectief bestaat en naar de juiste listing verwijst.** Geen verzonnen URLs.
-4. **"Niet gevonden" is een correct antwoord.** Wees eerlijk — een foute match is slechter dan geen match.
-5. **Locatie**: het GPS-adres is waar de gebruiker stond. Het pand kan op diezelfde straat staan, of op een hoek/zijstraat. Gebruik het als zoekfilter, niet als absoluut adres.
-6. **Type**: te koop vs te huur moet kloppen.
-7. **Adres-match is vereist**: als een listing een ander adres heeft dan de GPS-locatie aangeeft, en er is geen duidelijke verklaring (hoek, zijstraat), kies dan liever "niet_gevonden" dan een foutieve match.
+2. **adres = ALLEEN van de gematchte listing.** Als geen listing gevonden is, is adres null.
+3. **url = ALLEEN een URL die effectief bestaat.** Geen verzonnen URLs.
+4. **Type**: te koop vs te huur moet kloppen.
+5. **Makelaar-prioriteit**: als de makelaar op het bord bekend is, verkies dan listings van die makelaar boven Immoweb-listings van andere makelaars.
 
-## HOE TE ZOEKEN
-- Kijk eerst in de meegeleverde lijst of een listing overeenkomt met GPS-locatie + type + makelaar.
-- Geen match in de lijst? Gebruik je web_search tool met GERICHTE zoekopdrachten:
-  1. Eerste poging: straatnaam + site:makelaar_website — bv. "Rechtstraat" site:immo-home.be
-  2. Tweede poging: makelaar + straatnaam + gemeente + te koop
-  3. Derde poging: makelaar + gemeente + te koop — als straatnaam niets oplevert
-- Het GPS-adres (straatnaam) is je belangrijkste zoekterm — gebruik het altijd in de eerste web_search.
-- Nog steeds niets? Gebruik faal_categorie "LISTING_NIET_ONLINE" en laat adres/prijs/url op null.
+## MATCH-KWALITEIT — gebruik altijd het juiste niveau
+
+**NIVEAU 1 — "gevonden"** (hoge zekerheid):
+- Listing adres bevat de GPS-straatnaam, OF
+- Listing staat op de hoek (beide straatnamen zichtbaar), OF
+- Referentienummer op bord stemt overeen met listing
+
+**NIVEAU 2 — "gedeeltelijk"** (lage zekerheid, toon met waarschuwing):
+- Listing is van de juiste makelaar + zelfde postcode, maar straat NIET bevestigd
+- GPS-offset situaties: foto van overkant kanaal, schuine hoek, overkant straat
+- Gebruik dit niveau als je vermoedt dat het klopt maar niet zeker bent
+
+**NIVEAU 3 — "niet_gevonden"** (gebruik web_search EERST):
+- Nooit "niet_gevonden" teruggeven zonder eerst web_search geprobeerd te hebben
+- Enkel als web_search ook niets oplevert
+
+## HOE TE ZOEKEN — VOLG DEZE VOLGORDE
+**Stap A**: Is er een listing met de GPS-straatnaam in het adres EN van de juiste makelaar? → "gevonden"
+**Stap B**: Is er een listing van de juiste makelaar in het juiste postcodegebied, maar straat onzeker? → "gedeeltelijk"
+**Stap C**: Listings van verkeerde makelaars (bv. Immoweb terwijl makelaar bekend is)? → negeer ze, ga naar Stap D
+**Stap D**: Gebruik web_search:
+  - Zoekopdracht 1: "[GPS-straatnaam]" site:[makelaar-website]
+  - Zoekopdracht 2: "[GPS-straatnaam]" "[gemeente]" [makelaar naam] te koop
+**Stap E**: Web_search geeft niets → "niet_gevonden" met faal_categorie "LISTING_NIET_ONLINE"
+
+**KERNREGEL**: Een listing van een andere makelaar (bijv. ERA-listing als het bord van Immo Home is) is NOOIT een geldige match, ongeacht het adres.
 
 ## OUTPUT — gebruik EXACT dit JSON-formaat:
 {
@@ -1520,19 +1536,24 @@ Het pand kan ook op een hoek of naastgelegen zijstraat staan.`;
             { type: 'image', source: { type: 'base64', media_type: mime || 'image/jpeg', data: image } },
             {
               type: 'text',
-              text: `## BORDANALYSE (stap 1)
+              text: `${geocodeResultaat?.straat ? `## GPS-STRAATNAAM: "${geocodeResultaat.straat}"
+Zoek eerst naar een listing op deze straat (niveau 1 = gevonden).
+Geen match op straatnaam? → gebruik web_search op de makelaarssite vóór je opgeeft.
+Pas als alles mislukt: toon de beste nabije match met status "gedeeltelijk".
+
+` : ''}## BORDANALYSE (stap 1)
 Makelaar: ${bordInfo.makelaar} (${bordInfo.makelaar_herkenning})
 Betrouwbaarheid: ${bordInfo.makelaar_betrouwbaarheid}
 Type: ${bordInfo.listing_type}
 Pand: ${bordInfo.pand_type_slug}
 Referentienummer: ${bordInfo.referentienummer || 'niet zichtbaar'}
 Telefoon: ${bordInfo.telefoon || 'niet zichtbaar'}
+Makelaar website: ${domeinVoorWebSearch || bordInfo.makelaar_website || 'onbekend'}
 
 ## LOCATIE
 ${locatieInfo}
 ${listingsContext}
-Kies de beste match uit de lijst. Als geen listing past, gebruik web_search.
-Bij web_search: begin ALTIJD met "${geocodeResultaat?.straat || ''}" site:${bordInfo.makelaar_website || bordInfo.makelaar} als eerste zoekopdracht. Geef het resultaat als JSON.`
+Geef het resultaat als JSON.`
             }
           ]
         }]
