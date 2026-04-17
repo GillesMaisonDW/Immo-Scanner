@@ -699,17 +699,18 @@ async function searchMakelaar(makelaarNaam, listingType, gemeente, postcode, mak
 // te VINDEN. De echte data halen we daarna van de makelaarssite zelf.
 // Zo profiteren we van Google's index zonder afhankelijk te zijn van
 // Google voor de inhoud — dat lost het "niet recent geïndexeerd" probleem op.
-async function searchViaWebSearch(straat, makelaarWebsite, listingType, gemeente) {
-  if (!straat || !makelaarWebsite || !API_KEY) return [];
+async function searchViaWebSearch(straat, domein, listingType) {
+  if (!straat || !domein || !API_KEY) return [];
 
-  const domein = makelaarWebsite
+  // Domein normaliseren
+  const domeinClean = domein
     .replace(/^https?:\/\//, '')
     .replace(/^www\./, '')
-    .split('/')[0]; // alleen het domein, geen pad
+    .split('/')[0];
 
   const transactie = listingType === 'Te huur' ? 'te huur' : 'te koop';
-  const zoekopdracht = `"${straat}" site:${domein} ${transactie}`;
-  console.log(`🔍 STAP 2a.5: Web search op makelaarssite: "${zoekopdracht}"`);
+  const zoekopdracht = `"${straat}" site:${domeinClean} ${transactie}`;
+  console.log(`🔍 STAP 2a.5: Web search → "${zoekopdracht}"`);
 
   try {
     const resp = await fetch('https://api.anthropic.com/v1/messages', {
@@ -721,17 +722,13 @@ async function searchViaWebSearch(straat, makelaarWebsite, listingType, gemeente
         'anthropic-beta':    'web-search-2025-03-05'
       },
       body: JSON.stringify({
-        model:      'claude-haiku-4-5-20251001', // goedkoper model voor zoeken
-        max_tokens: 512,
+        model:      'claude-haiku-4-5-20251001',
+        max_tokens: 800,
         tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: 2 }],
-        system: `Je zoekt een vastgoedlisting via web search.
-Gebruik web_search en zoek naar de URL van de listing.
-Geef ENKEL dit JSON terug op een aparte regel (niets anders):
-URLS: ["https://...", "https://..."]
-Als niets gevonden: URLS: []`,
+        system: `Zoek een vastgoedlisting via web_search. Gebruik de web_search tool.`,
         messages: [{
           role: 'user',
-          content: `Zoek: ${zoekopdracht}\n\nGeef de listing-URLs terug die je vindt op ${domein}.`
+          content: `Gebruik web_search om te zoeken: ${zoekopdracht}`
         }]
       })
     });
@@ -742,22 +739,41 @@ Als niets gevonden: URLS: []`,
     }
 
     const data = await resp.json();
-    const text = (data.content || [])
-      .filter(b => b.type === 'text')
-      .map(b => b.text)
-      .join('\n');
 
-    const match = text.match(/URLS:\s*(\[[\s\S]*?\])/);
-    if (!match) {
-      console.log('⚠️  searchViaWebSearch: geen URLS-patroon in response');
-      return [];
+    // ── Robuuste URL-extractie ────────────────────────────────────
+    // We zoeken naar URLs van het doeldomein in ALLE blokken:
+    // text-blokken (Claude's antwoord) én tool_result-blokken (ruwe zoekresultaten).
+    // Zo zijn we niet afhankelijk van een specifiek antwoordformaat.
+    const urlPattern = new RegExp(
+      `https?://(?:www\\.)?${domeinClean.replace(/\./g, '\\.')}[^\\s"'<>\\]\\[),]+`,
+      'gi'
+    );
+
+    const gevondenUrls = new Set();
+
+    for (const block of (data.content || [])) {
+      // Tekst-blok: Claude's eigen antwoord
+      if (block.type === 'text' && block.text) {
+        (block.text.match(urlPattern) || []).forEach(u => gevondenUrls.add(u.replace(/[.,;:!?]+$/, '')));
+      }
+      // Tool_result-blok: ruwe zoekresultaten van de web_search tool
+      if (block.type === 'tool_result') {
+        const inhoud = Array.isArray(block.content)
+          ? block.content.map(c => c.text || '').join('\n')
+          : (block.content || '');
+        (inhoud.match(urlPattern) || []).forEach(u => gevondenUrls.add(u.replace(/[.,;:!?]+$/, '')));
+      }
     }
 
-    const urls = JSON.parse(match[1]);
-    const geldigeUrls = urls.filter(u => typeof u === 'string' && u.startsWith('http') && u.includes(domein));
+    // Filter: enkel detail-pagina URLs (niet de zoekpagina zelf)
+    const detailUrls = [...gevondenUrls].filter(u => {
+      const pad = u.replace(/^https?:\/\/[^/]+/, '');
+      return pad.split('/').filter(Boolean).length >= 2; // min 2 segmenten = detail-pagina
+    });
 
-    console.log(`✅ Web search gevonden: ${geldigeUrls.length} URL(s) op ${domein}`);
-    return geldigeUrls.map(u => ({
+    console.log(`✅ Web search gevonden: ${detailUrls.length} URL(s) op ${domeinClean}`, detailUrls);
+
+    return detailUrls.map(u => ({
       url:   u,
       title: u.split('/').filter(Boolean).slice(-2).find(s => !/^\d+$/.test(s)) || 'listing',
       bron:  'web_search_makelaar'
@@ -1397,8 +1413,7 @@ Als je het niet kan vinden: RESULTAAT: {"naam": null, "website": null}`,
       const webSearchListings = await searchViaWebSearch(
         geocodeResultaat.straat,
         domeinVoorWebSearch,
-        bordInfo.listing_type,
-        hoofdgemeente
+        bordInfo.listing_type
       );
       if (webSearchListings.length > 0) {
         listings = webSearchListings;
@@ -1445,8 +1460,19 @@ Als je het niet kan vinden: RESULTAAT: {"naam": null, "website": null}`,
         listingsContext += '\n';
       }
     } else {
-      const straatTip = geocodeResultaat?.straat ? `\nAanbevolen eerste zoekopdracht: "${geocodeResultaat.straat}" site:${bordInfo.makelaar_website || (bordInfo.makelaar || '').toLowerCase().replace(/\s+/g,'')+'.be'}` : '';
-      listingsContext = `\n\n## GEEN LISTINGS gevonden via directe opvraging. Gebruik web_search als volgende stap.${straatTip}\n`;
+      const straatTip = geocodeResultaat?.straat
+        ? `\n⚠️ VERPLICHT: Gebruik web_search als eerste stap. Zoekopdracht: "${geocodeResultaat.straat}" site:${domeinVoorWebSearch || bordInfo.makelaar_website || (bordInfo.makelaar || '').toLowerCase().replace(/\s+/g, '') + '.be'}`
+        : '';
+      listingsContext = `\n\n## GEEN LISTINGS gevonden via directe opvraging.${straatTip}\nZonder web_search mag je NIET "niet_gevonden" teruggeven.\n`;
+    }
+
+    // Waarschuwing bij Immoweb-fallback: makelaar heeft eigen site, gebruik web_search
+    if (listingsBron === 'immoweb_fallback' && domeinVoorWebSearch && geocodeResultaat?.straat) {
+      listingsContext += `\n## ⚠️ IMMOWEB-FALLBACK — ACTIE VEREIST
+De listing staat op de website van de makelaar zelf: ${domeinVoorWebSearch}
+De Immoweb-resultaten hierboven zijn van ANDERE makelaars — gebruik ze NIET als match tenzij niets gevonden op makelaarssite.
+VERPLICHTE eerste web_search: "${geocodeResultaat.straat}" site:${domeinVoorWebSearch}
+Pas als web_search op makelaarssite niets oplevert, kies je uit Immoweb.\n`;
     }
 
     // Locatie info
