@@ -1031,7 +1031,8 @@ Zoek in deze volgorde:
 
 ADRESREGEL: match ALTIJD op straatnaam — nooit op prijs of oppervlakte alleen.
 Als een gevonden listing een ander straatadres heeft dan de GPS-straatnaam → verwerp die URL, zoek verder.
-Voor de url: makelaar-URL heeft voorkeur. Als niet gevonden: Immoscoop/Realo/Spotto URL van de JUISTE listing is ook goed.
+Voor de url: ENKEL de URL op de eigen website van de makelaar (bv. immo-home.be, era.be). Null als die niet gevonden is.
+Voor url_alternatieven: verzamel alle andere URLs waar het pand op staat (Immoscoop, Realo, Spotto, Immoweb, ...) — elk met label en url. Lege array als niets gevonden.
 
 ## WANNEER JE EEN LIJST VAN LISTINGS KRIJGT
 Kies de listing die het beste overeenkomt met het bord op basis van:
@@ -1057,7 +1058,11 @@ Als de lijst leeg is of niets bruikbaar bevat: gebruik web_search (zie boven).
   "oppervlakte": "m² of null",
   "staat": "Instapklaar" | "Op te frissen" | "Te renoveren" | "Nieuwbouw" | "Onbekend",
   "extras": ["garage", "tuin", "terras"],
-  "url": "URL van de gevonden listing — makelaar-URL bij voorkeur, anders Realo/Immoscoop/Immoweb URL",
+  "url": "directe URL op de website van de makelaar zelf, of null als niet gevonden",
+  "url_alternatieven": [
+    {"label": "Immoscoop", "url": "https://..."},
+    {"label": "Realo", "url": "https://..."}
+  ],
   "telefoon": "telefoonnummer of null",
   "gevonden_via": "web_search" | "makelaar_direct" | "immoweb_fallback" | "niet_gevonden",
   "faal_categorie": null | "MAKELAAR_NIET_HERKEND" | "LISTING_NIET_ONLINE" | "ADRES_NIET_BEPAALBAAR" | "FALLBACK_OOK_LEEG" | "FOTO_ONLEESBAAR",
@@ -1549,6 +1554,9 @@ Geef het resultaat als JSON.`
     result.makelaar_herkenning   = result.makelaar_herkenning || bordInfo.makelaar_herkenning;
     result.makelaar_betrouwbaarheid = result.makelaar_betrouwbaarheid || bordInfo.makelaar_betrouwbaarheid;
     result.telefoon              = result.telefoon || bordInfo.telefoon;
+
+    // Normaliseer url_alternatieven: zorg dat het altijd een array is
+    if (!Array.isArray(result.url_alternatieven)) result.url_alternatieven = [];
 
     // ── Adres ophalen van de listing detailpagina ────────────────
     let adresListing = null;
