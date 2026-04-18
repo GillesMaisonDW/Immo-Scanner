@@ -1392,6 +1392,11 @@ Als je het niet kan vinden: RESULTAAT: {"naam": null, "website": null}`,
     let listingsContext = '';
     const domeinHint = domeinMakelaar || (bordInfo.makelaar || '').toLowerCase().replace(/\s+/g, '') + '.be';
 
+    // Deelgemeente-info — hier gedeclareerd zodat zowel listingsContext als locatieInfo het kunnen gebruiken
+    const deelgemeente = geocodeResultaat?.gemeente || null;
+    const heeftDeelgemeente = deelgemeente && hoofdgemeente &&
+      deelgemeente.toLowerCase() !== hoofdgemeente.toLowerCase();
+
     if (listingsBron === 'web_search_direct' || listingsBron === 'scraping_leeg' || listingsBron === 'straat_geen_match') {
       // Geen bruikbare listings — Claude moet zelf zoeken via web_search
       const waarom = {
@@ -1443,9 +1448,6 @@ Als web_search ook niets oplevert: status "niet_gevonden", faal_categorie "SCRAP
 
     // Locatie info
     let locatieInfo = '';
-    const deelgemeente = geocodeResultaat?.gemeente || null;
-    const heeftDeelgemeente = deelgemeente && hoofdgemeente &&
-      deelgemeente.toLowerCase() !== hoofdgemeente.toLowerCase();
 
     // Bouw een duidelijke lijst van alle geldige gemeentenamen voor deze postcode.
     // Dit voorkomt dat Claude "lochristi" vs "zaffelare" als tegenstrijdig ziet.
