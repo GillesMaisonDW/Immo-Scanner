@@ -1015,29 +1015,31 @@ Geef ENKEL de JSON terug.`;
 
 // Stap 3: Zoek en match de listing
 // Twee scenario's — welk van toepassing staat bovenaan de user-message.
-const PROMPT_STAP2 = `Je bent de Immo Scanner. Je werkt in één van twee scenario's.
+const PROMPT_STAP2 = `Je bent de Immo Scanner. Je analyseert een foto van een makelaarsbord en zoekt de bijhorende listing.
 
 ## ALTIJD GELDENDE REGELS
 1. Geen hallucinations. Vul enkel velden in met data uit echte gevonden listings.
-2. Geen verzonnen URLs. Alleen URLs die effectief bestaan.
-3. Transactie (te koop / te huur) moet kloppen met het bord.
-4. "niet_gevonden" is eerlijk — een foute match is erger dan geen match.
+2. Transactie (te koop / te huur) moet kloppen met het bord.
+3. Kies nooit raak. "niet_gevonden" of "gedeeltelijk" is eerlijker dan een verkeerde match.
+4. Een URL van Realo of Immoscoop is BETER dan geen URL — geef die terug als je de makelaar-URL niet vindt.
 
-## SCENARIO A — GPS-straatnaam + makelaar website bekend
-Er zijn geen pre-geladen listings. Je gebruikt web_search om de listing te vinden.
-Volgorde:
-1. web_search: "[GPS-straatnaam]" site:[makelaar-website]
-2. Als niets gevonden: web_search: "[GPS-straatnaam]" "[gemeente]" [makelaar naam] te koop/huur
-3. Als nog niets: status "niet_gevonden", faal_categorie "LISTING_NIET_ONLINE"
+## WANNEER JE WEB SEARCH GEBRUIKT (staat bovenaan je user-message)
+Zoek in deze volgorde:
+1. "[GPS-straatnaam]" site:[makelaarsdomein]
+2. Niets? "[GPS-straatnaam]" "[gemeente]" [makelaar naam] te koop
+3. Niets? "[GPS-straatnaam]" "[gemeente]" te koop (ook aggregators: Realo, Immoscoop, Immoweb)
+4. Pas na minstens 3 searches mag je "niet_gevonden" teruggeven.
 
-## SCENARIO B — Geen GPS of makelaar onbekend
-Je krijgt een lijst van listings. Kies de beste match op basis van:
-- Pand-type (woning, appartement, …) en transactie (koop/huur)
+Voor de url: gebruik de makelaar-URL als je die vindt. Als niet, gebruik dan de Realo/Immoscoop URL van de gevonden listing.
+
+## WANNEER JE EEN LIJST VAN LISTINGS KRIJGT
+Kies de listing die het beste overeenkomt met het bord op basis van:
+- GPS-straatnaam (indien vermeld bovenaan) — dit is de sterkste aanwijzing
+- Pand-type en transactie (koop/huur)
 - Locatie (gemeente, postcode)
-- Info van het bord (referentienummer, telefoon, visuele kenmerken)
+- Info van het bord (referentienummer, visuele kenmerken)
 
-Gebruik "gevonden" als je zeker bent, "gedeeltelijk" als je twijfelt.
-Als de lijst leeg is of niets bruikbaar bevat: gebruik web_search voor je "niet_gevonden" geeft.
+Als de lijst leeg is of niets bruikbaar bevat: gebruik web_search (zie boven).
 
 ## OUTPUT — gebruik EXACT dit JSON-formaat:
 {
@@ -1054,7 +1056,7 @@ Als de lijst leeg is of niets bruikbaar bevat: gebruik web_search voor je "niet_
   "oppervlakte": "m² of null",
   "staat": "Instapklaar" | "Op te frissen" | "Te renoveren" | "Nieuwbouw" | "Onbekend",
   "extras": ["garage", "tuin", "terras"],
-  "url": "directe URL van de gevonden listing, of null",
+  "url": "URL van de gevonden listing — makelaar-URL bij voorkeur, anders Realo/Immoscoop/Immoweb URL",
   "telefoon": "telefoonnummer of null",
   "gevonden_via": "web_search" | "makelaar_direct" | "immoweb_fallback" | "niet_gevonden",
   "faal_categorie": null | "MAKELAAR_NIET_HERKEND" | "LISTING_NIET_ONLINE" | "ADRES_NIET_BEPAALBAAR" | "FALLBACK_OOK_LEEG" | "FOTO_ONLEESBAAR",
@@ -1344,6 +1346,25 @@ Als je het niet kan vinden: RESULTAAT: {"naam": null, "website": null}`,
       if (listings.length > 0) {
         // Verrijk: haal straatnamen op van detail-pagina's zodat Claude kan matchen
         listings = await verrijkListingAdressen(listings, hoofdgemeente, postcode, gpsStraat);
+
+        // Straat-filter: als GPS een straatnaam geeft maar geen enkele listing die straat
+        // heeft na verrijking → gooi de listings weg. Zo wordt Begoniastraat nooit
+        // teruggegeven als de gebruiker aan de Rechtstraat staat.
+        // Claude wordt dan gedwongen web_search te gebruiken (ook op aggregators).
+        if (gpsStraat) {
+          const straatLow = gpsStraat.toLowerCase();
+          const straatMatches = listings.filter(l =>
+            (l.address || '').toLowerCase().includes(straatLow)
+          );
+          if (straatMatches.length > 0) {
+            console.log(`✅ ${straatMatches.length} listing(s) matchen GPS-straat "${gpsStraat}" → alleen die doorgeven`);
+            listings = straatMatches;
+          } else {
+            console.log(`⚠️  Geen listing met straat "${gpsStraat}" na verrijking → listings leeggemaakt, web_search in stap 3`);
+            listings = [];
+            listingsBron = 'straat_geen_match';
+          }
+        }
       } else {
         // Scraping mislukt → Claude gebruikt web_search als noodplan in stap 3
         listingsBron = 'scraping_leeg';
@@ -1371,18 +1392,26 @@ Als je het niet kan vinden: RESULTAAT: {"naam": null, "website": null}`,
     let listingsContext = '';
     const domeinHint = domeinMakelaar || (bordInfo.makelaar || '').toLowerCase().replace(/\s+/g, '') + '.be';
 
-    if (listingsBron === 'web_search_direct' || listingsBron === 'scraping_leeg') {
-      // Geen pre-geladen listings — Claude moet zelf zoeken via web_search
+    if (listingsBron === 'web_search_direct' || listingsBron === 'scraping_leeg' || listingsBron === 'straat_geen_match') {
+      // Geen bruikbare listings — Claude moet zelf zoeken via web_search
+      const waarom = {
+        'web_search_direct':  'Makelaar staat niet in onze database.',
+        'scraping_leeg':      'Directe scraping van de makelaarssite leverde geen listings op.',
+        'straat_geen_match':  `Scraping vond listings, maar geen enkele had adres "${gpsStraat}". Listing staat mogelijk niet op de overzichtspagina.`
+      }[listingsBron] || '';
       listingsContext = `\n\n## WEB SEARCH VEREIST
 ${gpsStraat ? `GPS-straatnaam: "${gpsStraat}"` : 'Geen GPS beschikbaar.'}
-Makelaarswebsite: ${domeinHint}
-${listingsBron === 'scraping_leeg' ? 'Directe scraping van de makelaarssite leverde geen listings op.\n' : ''}
-Zoek zelf via web_search:
-1. web_search: ${gpsStraat ? `"${gpsStraat}" site:${domeinHint}` : `"${bordInfo.makelaar}" te koop "${hoofdgemeente}"`}
-2. Niets gevonden? web_search: "${gpsStraat || hoofdgemeente}" "${hoofdgemeente}" ${bordInfo.makelaar} ${bordInfo.listing_type}
-3. Nog steeds niets? → status "niet_gevonden", faal_categorie "LISTING_NIET_ONLINE"
+Postcode: ${postcode} (dekt ${hoofdgemeente}${heeftDeelgemeente ? ` + ${deelgemeente}` : ''} en deelgemeentes)
+Makelaar: ${bordInfo.makelaar} (${domeinHint})
+Reden: ${waarom}
 
-REGEL: web_search is VERPLICHT. Geef nooit "niet_gevonden" zonder minstens 2 searches geprobeerd.\n`;
+Zoek via web_search — gebruik postcode ${postcode} als locatie-identifier (robuuster dan gemeente-naam):
+1. web_search: "${gpsStraat || postcode}" site:${domeinHint}
+2. Niets? web_search: "${gpsStraat || postcode}" "${postcode}" ${bordInfo.makelaar} ${bordInfo.listing_type}
+3. Nog niets? web_search: "${gpsStraat || postcode}" "${postcode}" ${bordInfo.listing_type} (ook Realo, Immoscoop)
+
+REGEL: web_search is VERPLICHT. Geef nooit "niet_gevonden" zonder minstens 3 searches geprobeerd.
+URL-prioriteit: makelaar-URL > Realo/Immoscoop > Immoweb. Aggregator-URL is beter dan geen URL.\n`;
     } else if (listings.length > 0) {
       // Listings beschikbaar via scraping of Immoweb
       listingsContext = `\n\n## LISTINGS (${listings.length} resultaten — bron: ${listingsBron})\n`;
@@ -1415,16 +1444,22 @@ Als web_search ook niets oplevert: status "niet_gevonden", faal_categorie "SCRAP
     // Locatie info
     let locatieInfo = '';
     const deelgemeente = geocodeResultaat?.gemeente || null;
-    const deelInfo = (deelgemeente && hoofdgemeente && deelgemeente.toLowerCase() !== hoofdgemeente.toLowerCase())
-      ? ` (deelgemeente van ${hoofdgemeente})`
-      : '';
+    const heeftDeelgemeente = deelgemeente && hoofdgemeente &&
+      deelgemeente.toLowerCase() !== hoofdgemeente.toLowerCase();
+
+    // Bouw een duidelijke lijst van alle geldige gemeentenamen voor deze postcode.
+    // Dit voorkomt dat Claude "lochristi" vs "zaffelare" als tegenstrijdig ziet.
+    const geldigeNamen = heeftDeelgemeente
+      ? `${postcode} (dekt: ${hoofdgemeente}, ${deelgemeente}, en andere deelgemeentes)`
+      : `${postcode} (${hoofdgemeente})`;
+
     if (adresFoto) {
-      locatieInfo = `Gebruiker stond bij: ${adresFoto}${deelInfo} (GPS-locatie).
-Zoekgemeente: ${hoofdgemeente} (postcode ${postcode}).
-BELANGRIJK: Deelgemeentes en hoofdgemeentes delen hetzelfde postcode-gebied. Een listing met "${hoofdgemeente}" in de URL is ook geldig voor panden in deelgemeentes zoals ${deelgemeente || hoofdgemeente}. Kies op basis van straatnaam, niet op basis van welke gemeentenaam in de URL staat.
-Het pand kan ook op een hoek of naastgelegen zijstraat staan.`;
+      locatieInfo = `Locatie: ${adresFoto}${heeftDeelgemeente ? ` (deelgemeente van ${hoofdgemeente})` : ''} — postcode ${geldigeNamen}.
+POSTCODEREGEL: Gebruik postcode ${postcode} als primaire locatie-identifier, niet de gemeentenaam.
+Een listing met "${hoofdgemeente}" in de URL is even geldig als een listing met "${deelgemeente || hoofdgemeente}" — ze vallen allebei onder postcode ${postcode}.
+Kies op basis van STRAATNAAM, niet op basis van welke gemeente-naam toevallig in de URL staat.`;
     } else if (gps) {
-      locatieInfo = `GPS: ${gps.lat}°N, ${gps.lon}°O (±${gps.accuracy}m). Zoekgemeente: ${hoofdgemeente} (postcode ${postcode}).${deelInfo ? ' ' + deelInfo : ''}`;
+      locatieInfo = `GPS: ${gps.lat}°N, ${gps.lon}°O (±${gps.accuracy}m) — postcode ${geldigeNamen}.`;
     } else {
       locatieInfo = 'Geen GPS beschikbaar.';
     }
