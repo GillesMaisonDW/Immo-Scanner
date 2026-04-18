@@ -518,7 +518,7 @@ async function verrijkListingAdressen(listings, hoofdgemeente, postcode, straatG
     if (l.address) return false; // al een adres, niets te doen
     if (!l.url)    return false;
     return true; // verrijk alles wat een URL heeft maar geen adres
-  }).slice(0, 5); // max 5 detail-pagina's ophalen (was 4, nu iets ruimer)
+  }).slice(0, 10); // max 10 detail-pagina's ophalen
 
   if (kandidaten.length === 0) {
     console.log('📍 Geen kandidaat-listings om te verrijken (alles heeft al een adres)');
@@ -1287,14 +1287,28 @@ Als je het niet kan vinden: RESULTAAT: {"naam": null, "website": null}`,
     // STAP 2 — Scenario bepalen en listings ophalen
     // ══════════════════════════════════════════════════════════════
 
-    // ── Domein bepalen ─────────────────────────────────────────────
-    // Eerst uit bordInfo, anders opzoeken in Supabase via herkende naam.
+    // ── Domein + DB-check ──────────────────────────────────────────
+    // Eerst domein bepalen vanuit bordInfo, daarna opzoeken in Supabase.
+    // makelaarInDB = true als we een URL-template hebben → scraping is betrouwbaarder
+    // dan Google (kleine makelaars zijn slecht geïndexeerd).
     let domeinMakelaar = bordInfo.makelaar_website
       ? bordInfo.makelaar_website.replace(/^https?:\/\//, '').replace(/^www\./, '').split('/')[0]
       : null;
+    let makelaarInDB = false;
 
-    if (!domeinMakelaar && bordInfo.makelaar) {
-      const allesMakelaars = await laadMakelaarsUitSupabase();
+    const allesMakelaars = await laadMakelaarsUitSupabase();
+
+    // Check of het bord-domein in onze DB staat
+    if (domeinMakelaar) {
+      const dbMatch = allesMakelaars.find(m => {
+        const d = m.domein.replace('www.', '');
+        return d === domeinMakelaar || d.includes(domeinMakelaar) || domeinMakelaar.includes(d);
+      });
+      if (dbMatch) makelaarInDB = true;
+    }
+
+    // Geen domein op bord → zoek via herkende naam
+    if (!makelaarInDB && bordInfo.makelaar) {
       const naamLow = (bordInfo.makelaar || '').toLowerCase().replace(/[-\s]+/g, ' ').trim();
       const gevondenM = allesMakelaars.find(m => {
         const siteBase = m.domein.replace(/\.(be|com|nl)$/, '').replace('www.', '').toLowerCase();
@@ -1302,25 +1316,22 @@ Als je het niet kan vinden: RESULTAAT: {"naam": null, "website": null}`,
       });
       if (gevondenM) {
         domeinMakelaar = gevondenM.domein.replace('www.', '');
+        makelaarInDB = true;
         console.log(`🔗 Domein-fallback: "${bordInfo.makelaar}" → ${domeinMakelaar} (uit Supabase)`);
       }
     }
 
     // ── Scenario bepalen ───────────────────────────────────────────
-    // Scenario A: GPS-straatnaam + makelaar domein gekend
-    //   → Claude Sonnet zoekt zelf via web_search in stap 3. Geen pre-fetch.
-    // Scenario B: Geen GPS of makelaar onbekend
-    //   → Scraping van makelaarssite, daarna Immoweb als fallback.
+    // 1. Makelaar in DB  → altijd scrapen + verrijken, GPS helpt bij matching
+    // 2. Niet in DB + GPS → web_search (Claude Sonnet zoekt zelf)
+    // 3. Niet in DB + geen GPS → Immoweb fallback
     const gpsStraat = geocodeResultaat?.straat || null;
-    const scenarioA = !!(gpsStraat && domeinMakelaar);
     let listings = [];
     let listingsBron = 'geen';
 
-    if (scenarioA) {
-      console.log(`🎯 SCENARIO A: GPS "${gpsStraat}" + makelaar "${domeinMakelaar}" → stap 3 zoekt via web_search`);
-      listingsBron = 'scenario_a';
-    } else {
-      console.log('🔍 SCENARIO B: Geen GPS of makelaar onbekend → scraping + Immoweb');
+    if (makelaarInDB) {
+      // Scraping is betrouwbaarder dan Google voor kleine makelaars
+      console.log(`🏢 SCRAPING: ${domeinMakelaar} in DB → scrapen${gpsStraat ? ` (GPS: "${gpsStraat}")` : ''}`);
       listings = await searchMakelaar(
         bordInfo.makelaar,
         bordInfo.listing_type,
@@ -1330,42 +1341,56 @@ Als je het niet kan vinden: RESULTAAT: {"naam": null, "website": null}`,
       );
       listingsBron = 'makelaar_direct';
 
-      if (listings.length === 0) {
-        console.log('⚠️  Makelaarsite leeg — Immoweb als fallback...');
-        listings = await searchImmoweb(
-          bordInfo.pand_type_slug,
-          bordInfo.listing_type,
-          hoofdgemeente,
-          postcode
-        );
-        listingsBron = 'immoweb_fallback';
-      }
-
-      // Verrijk listings: haal straatnaam op van detailpagina's (enkel bij directe scraping)
-      if (listings.length > 0 && listingsBron === 'makelaar_direct') {
+      if (listings.length > 0) {
+        // Verrijk: haal straatnamen op van detail-pagina's zodat Claude kan matchen
         listings = await verrijkListingAdressen(listings, hoofdgemeente, postcode, gpsStraat);
+      } else {
+        // Scraping mislukt → Claude gebruikt web_search als noodplan in stap 3
+        listingsBron = 'scraping_leeg';
+        console.log('⚠️  Scraping leverde niets op → Claude gebruikt web_search in stap 3');
       }
+    } else if (gpsStraat) {
+      // Makelaar niet in DB maar GPS beschikbaar → Claude zoekt via web_search
+      console.log(`🔍 WEB SEARCH: "${bordInfo.makelaar}" niet in DB, GPS="${gpsStraat}" → stap 3 zoekt`);
+      listingsBron = 'web_search_direct';
+    } else {
+      // Geen DB-makelaar, geen GPS → Immoweb als fallback
+      console.log('📋 IMMOWEB: geen DB-makelaar en geen GPS → Immoweb fallback');
+      listings = await searchImmoweb(
+        bordInfo.pand_type_slug,
+        bordInfo.listing_type,
+        hoofdgemeente,
+        postcode
+      );
+      listingsBron = 'immoweb_fallback';
     }
 
-    console.log(`✅ STAP 2 klaar: ${scenarioA ? 'Scenario A' : 'Scenario B'} — ${listings.length} listings via ${listingsBron}`);
+    console.log(`✅ STAP 2 klaar: ${listings.length} listings via ${listingsBron}${makelaarInDB ? ' (makelaar in DB)' : ''}`);
 
     // Bouw context voor Claude op basis van scenario
     let listingsContext = '';
-    if (scenarioA) {
-      // Scenario A: Claude zoekt zelf via web_search — geen pre-geladen listings
-      listingsContext = `\n\n## SCENARIO A — GPS + MAKELAAR BEKEND
-GPS-straatnaam: "${gpsStraat}"
-Makelaarswebsite: ${domeinMakelaar}
+    const domeinHint = domeinMakelaar || (bordInfo.makelaar || '').toLowerCase().replace(/\s+/g, '') + '.be';
 
-Je hebt geen pre-geladen listings. Zoek zelf via web_search:
-1. web_search: "${gpsStraat}" site:${domeinMakelaar}
-2. Niets gevonden? web_search: "${gpsStraat}" "${hoofdgemeente}" ${bordInfo.makelaar} ${bordInfo.listing_type}
+    if (listingsBron === 'web_search_direct' || listingsBron === 'scraping_leeg') {
+      // Geen pre-geladen listings — Claude moet zelf zoeken via web_search
+      listingsContext = `\n\n## WEB SEARCH VEREIST
+${gpsStraat ? `GPS-straatnaam: "${gpsStraat}"` : 'Geen GPS beschikbaar.'}
+Makelaarswebsite: ${domeinHint}
+${listingsBron === 'scraping_leeg' ? 'Directe scraping van de makelaarssite leverde geen listings op.\n' : ''}
+Zoek zelf via web_search:
+1. web_search: ${gpsStraat ? `"${gpsStraat}" site:${domeinHint}` : `"${bordInfo.makelaar}" te koop "${hoofdgemeente}"`}
+2. Niets gevonden? web_search: "${gpsStraat || hoofdgemeente}" "${hoofdgemeente}" ${bordInfo.makelaar} ${bordInfo.listing_type}
 3. Nog steeds niets? → status "niet_gevonden", faal_categorie "LISTING_NIET_ONLINE"
 
 REGEL: web_search is VERPLICHT. Geef nooit "niet_gevonden" zonder minstens 2 searches geprobeerd.\n`;
     } else if (listings.length > 0) {
-      // Scenario B met listings
-      listingsContext = `\n\n## SCENARIO B — LISTINGS VIA SCRAPING (${listings.length} resultaten — bron: ${listingsBron})\n\n`;
+      // Listings beschikbaar via scraping of Immoweb
+      listingsContext = `\n\n## LISTINGS (${listings.length} resultaten — bron: ${listingsBron})\n`;
+      if (gpsStraat) {
+        listingsContext += `GPS-straatnaam: "${gpsStraat}" — kies de listing met dit adres.\n\n`;
+      } else {
+        listingsContext += '\n';
+      }
       for (const l of listings.slice(0, 25)) {
         listingsContext += `- **${l.title || 'Geen titel'}**\n`;
         if (l.address)  listingsContext += `  Adres: ${l.address}\n`;
@@ -1377,13 +1402,13 @@ REGEL: web_search is VERPLICHT. Geef nooit "niet_gevonden" zonder minstens 2 sea
         listingsContext += '\n';
       }
       if (listingsBron === 'immoweb_fallback') {
-        listingsContext += `\n⚠️ IMMOWEB-FALLBACK: deze listings zijn van andere makelaars op Immoweb. Gebruik enkel als beste beschikbare optie.\n`;
+        listingsContext += `\n⚠️ IMMOWEB-FALLBACK: listings zijn van andere makelaars op Immoweb. Gebruik enkel als beste beschikbare optie.\n`;
       }
     } else {
-      // Scenario B maar geen listings gevonden
-      const domeinHint = domeinMakelaar || (bordInfo.makelaar || '').toLowerCase().replace(/\s+/g, '') + '.be';
-      listingsContext = `\n\n## SCENARIO B — GEEN LISTINGS GEVONDEN VIA SCRAPING
-${gpsStraat ? `⚠️ Probeer alsnog web_search: "${gpsStraat}" site:${domeinHint}` : 'Geen GPS beschikbaar en scraping leverde niets op.'}
+      // Geen listings gevonden via welk pad dan ook
+      listingsContext = `\n\n## GEEN LISTINGS GEVONDEN
+Scraping én Immoweb leverden niets op.
+${gpsStraat ? `Probeer alsnog web_search: "${gpsStraat}" site:${domeinHint}` : 'Geen GPS beschikbaar.'}
 Als web_search ook niets oplevert: status "niet_gevonden", faal_categorie "SCRAPING_MISLUKT".\n`;
     }
 
