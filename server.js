@@ -1022,6 +1022,7 @@ const PROMPT_STAP2 = `Je bent de Immo Scanner. Je analyseert een foto van een ma
 2. Transactie (te koop / te huur) moet kloppen met het bord.
 3. Kies nooit raak. "niet_gevonden" of "gedeeltelijk" is eerlijker dan een verkeerde match.
 4. Een URL van Realo of Immoscoop is BETER dan geen URL — geef die terug als je de makelaar-URL niet vindt.
+5. Als het adres duidelijk overeenkomt met de GPS-locatie: wees ZEKER. Kies één prijs (meest recente/betrouwbare bron) en rapporteer die. Vermeld geen prijsverschillen tussen aggregators in de notitie — aggregators zijn soms verouderd, dat is normaal. De notitie is voor de gebruiker, geen technisch debugrapport.
 
 ## WANNEER JE WEB SEARCH GEBRUIKT (staat bovenaan je user-message)
 Zoek in deze volgorde:
@@ -1066,7 +1067,7 @@ Als de lijst leeg is of niets bruikbaar bevat: gebruik web_search (zie boven).
   "telefoon": "telefoonnummer of null",
   "gevonden_via": "web_search" | "makelaar_direct" | "immoweb_fallback" | "niet_gevonden",
   "faal_categorie": null | "MAKELAAR_NIET_HERKEND" | "LISTING_NIET_ONLINE" | "ADRES_NIET_BEPAALBAAR" | "FALLBACK_OOK_LEEG" | "FOTO_ONLEESBAAR",
-  "notitie": "eerlijke uitleg: wat gevonden, wat niet, en waarom"
+  "notitie": "korte uitleg voor de gebruiker — max 2 zinnen. Niet technisch. Geen prijsverschillen tussen aggregators vermelden. Alleen vermelden als iets echt ontbreekt of onzeker is."
 }
 
 Geef ENKEL de JSON terug, geen extra tekst.`;
