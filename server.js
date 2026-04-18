@@ -1038,7 +1038,11 @@ Neem NOOIT een prijs van een andere zoekresultaat-pagina dan de gevonden listing
 
 URL-REGELS:
 - "url": ENKEL de URL op de website van de makelaar zelf (bv. immo-home.be). Null als niet gevonden.
-- "url_alternatieven": VERPLICHT invullen met ALLE URLs waar je het pand gevonden hebt (Realo, Immoscoop, Spotto, Immomaps...). Elk object heeft "label" (naam van de site) en "url" (volledige URL). Lege array [] enkel als het pand nergens gevonden werd.
+- "url_alternatieven": VERPLICHT — kopieer LETTERLIJK de volledige URLs van ELKE pagina waar je het pand gevonden hebt.
+  Formaat: [{"label": "Realo", "url": "https://www.realo.be/nl/..."}, {"label": "Immoscoop", "url": "https://www.immoscoop.be/..."}]
+  KRITIEK: als je in de notitie een site vermeldt (Realo, Immoscoop, Spotto...) dan MOET die URL ook in url_alternatieven staan.
+  NOOIT de volledige URL weglaten als je die in je zoekresultaten hebt gezien.
+  Lege array [] ENKEL als het pand werkelijk op GEEN ENKELE website gevonden werd.
 
 ## WANNEER JE EEN LIJST VAN LISTINGS KRIJGT
 Kies de listing die het beste overeenkomt met het bord op basis van:
@@ -1555,6 +1559,11 @@ Geef het resultaat als JSON.`
 
     const result = JSON.parse(jsonMatch[0]);
 
+    // ── Debug: log wat Claude exact teruggeeft voor url-velden ────
+    console.log('🔍 Claude raw url:', result.url);
+    console.log('🔍 Claude raw url_alternatieven:', JSON.stringify(result.url_alternatieven));
+    console.log('🔍 Claude status:', result.status);
+
     // Vul ontbrekende velden aan vanuit stap 1
     result.makelaar              = result.makelaar || bordInfo.makelaar;
     result.makelaar_herkenning   = result.makelaar_herkenning || bordInfo.makelaar_herkenning;
@@ -1563,6 +1572,47 @@ Geef het resultaat als JSON.`
 
     // Normaliseer url_alternatieven: zorg dat het altijd een array is
     if (!Array.isArray(result.url_alternatieven)) result.url_alternatieven = [];
+
+    // ── Fallback: extraheer URLs uit Claude's web_search tool resultaten ─
+    // Als Claude url_alternatieven leeg liet maar wél web_search gebruikte,
+    // kunnen we de gevonden URLs rechtstreeks uit de tool-results halen.
+    if (result.url_alternatieven.length === 0 && gpsStraat) {
+      const straatLower = gpsStraat.toLowerCase();
+      const aggregatorDomeinen = [
+        { domein: 'realo.be',       label: 'Realo'      },
+        { domein: 'immoscoop.be',   label: 'Immoscoop'  },
+        { domein: 'spotto.be',      label: 'Spotto'     },
+        { domein: 'immomaps.be',    label: 'Immomaps'   },
+        { domein: 'logic-immo.be',  label: 'Logic-immo' },
+      ];
+      const gevondenUrls = new Set();
+
+      for (const block of stap3Data.content) {
+        // Zoek in tool_result content (web_search geeft resultaten terug als JSON)
+        const blockStr = JSON.stringify(block);
+        for (const agg of aggregatorDomeinen) {
+          // Zoek naar URLs van dit domein in de block-tekst
+          const urlRegex = new RegExp(`https?://(?:www\\.)?${agg.domein.replace('.', '\\.')}[^"'\\s<>]+`, 'gi');
+          let m;
+          while ((m = urlRegex.exec(blockStr)) !== null) {
+            const gevondenUrl = m[0].replace(/\\u[0-9a-f]{4}/gi, c =>
+              String.fromCharCode(parseInt(c.slice(2), 16)));
+            // Controleer of de URL straatnaam bevat (ruw check)
+            if (gevondenUrl.toLowerCase().includes(straatLower.split(' ')[0]) ||
+                (postcode && gevondenUrl.includes(postcode))) {
+              if (!gevondenUrls.has(agg.domein)) {
+                gevondenUrls.add(agg.domein);
+                result.url_alternatieven.push({ label: agg.label, url: gevondenUrl });
+                console.log(`🔗 URL uit tool-result gehaald (${agg.label}): ${gevondenUrl}`);
+              }
+            }
+          }
+        }
+      }
+      if (result.url_alternatieven.length > 0) {
+        console.log(`✅ ${result.url_alternatieven.length} alternatieve URL(s) uit web_search tool-results gerecupereerd`);
+      }
+    }
 
     // ── Adres ophalen van de listing detailpagina ────────────────
     let adresListing = null;
@@ -1647,6 +1697,7 @@ Geef het resultaat als JSON.`
         extras:                  result.extras || [],
         status:                  result.status,
         url:                     result.url,
+        url_alternatieven:       result.url_alternatieven || [],
         telefoon:                result.telefoon,
         gevonden_via:            result.gevonden_via,
         faal_categorie:          result.faal_categorie,
