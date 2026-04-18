@@ -1028,12 +1028,17 @@ const PROMPT_STAP2 = `Je bent de Immo Scanner. Je analyseert een foto van een ma
 Zoek in deze volgorde:
 1. "[GPS-straatnaam]" site:[makelaarsdomein]
 2. Niets? "[GPS-straatnaam]" "[postcode]" te koop
-3. Pas na minstens 2 searches mag je "niet_gevonden" teruggeven.
 
 ADRESREGEL: match ALTIJD op straatnaam — nooit op prijs of oppervlakte alleen.
 Als een gevonden listing een ander straatadres heeft dan de GPS-straatnaam → verwerp die URL, zoek verder.
-Voor de url: ENKEL de URL op de eigen website van de makelaar (bv. immo-home.be, era.be). Null als die niet gevonden is.
-Voor url_alternatieven: verzamel alle andere URLs waar het pand op staat (Immoscoop, Realo, Spotto, Immoweb, ...) — elk met label en url. Lege array als niets gevonden.
+
+BRONREGEL — KRITIEK: prijs, oppervlakte en slaapkamers moeten van DEZELFDE pagina komen als de URL.
+Voorbeeld: je vindt Rechtstraat 65A op Realo → neem prijs en kenmerken van die Realo-pagina.
+Neem NOOIT een prijs van een andere zoekresultaat-pagina dan de gevonden listing-URL.
+
+URL-REGELS:
+- "url": ENKEL de URL op de website van de makelaar zelf (bv. immo-home.be). Null als niet gevonden.
+- "url_alternatieven": VERPLICHT invullen met ALLE URLs waar je het pand gevonden hebt (Realo, Immoscoop, Spotto, Immomaps...). Elk object heeft "label" (naam van de site) en "url" (volledige URL). Lege array [] enkel als het pand nergens gevonden werd.
 
 ## WANNEER JE EEN LIJST VAN LISTINGS KRIJGT
 Kies de listing die het beste overeenkomt met het bord op basis van:
