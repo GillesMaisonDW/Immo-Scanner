@@ -1597,12 +1597,19 @@ Geef het resultaat als JSON.`
     if (gpsStraat && adresListing) {
       const straatLow  = gpsStraat.toLowerCase();
       const adresLow   = adresListing.toLowerCase();
-      if (!adresLow.includes(straatLow)) {
-        console.log(`⚠️  Adres-mismatch: listing heeft "${adresListing}" maar GPS verwacht "${gpsStraat}" → URL gewist`);
+      const straatOk   = adresLow.includes(straatLow);
+      // Postcode check: als we een GPS-postcode hebben, moet die ook in het adres zitten.
+      // Zo wordt b.v. "Rechtstraat 233, 9160 Eksaarde" afgewezen als GPS-postcode 9080 is.
+      const postcodeOk = !postcode || adresListing.includes(postcode);
+      if (!straatOk || !postcodeOk) {
+        const reden = !straatOk
+          ? `straat "${gpsStraat}" niet gevonden in "${adresListing}"`
+          : `postcode ${postcode} komt niet overeen met "${adresListing}"`;
+        console.log(`⚠️  Adres-mismatch (${reden}) → URL gewist`);
         result.url    = null;
         result.status = 'niet_gevonden';
         result.faal_categorie = result.faal_categorie || 'ADRES_MISMATCH';
-        result.notitie = `Gevonden URL leidt naar "${adresListing}" maar GPS-locatie is "${gpsStraat}". Mogelijk een verkeerd pand gevonden. ` + (result.notitie || '');
+        result.notitie = `Gevonden URL leidt naar "${adresListing}" maar GPS-locatie is "${gpsStraat}${postcode ? ' / ' + postcode : ''}". Mogelijk een verkeerd pand gevonden. ` + (result.notitie || '');
         adresListing = null;
       }
     }
