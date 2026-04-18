@@ -1026,11 +1026,12 @@ const PROMPT_STAP2 = `Je bent de Immo Scanner. Je analyseert een foto van een ma
 ## WANNEER JE WEB SEARCH GEBRUIKT (staat bovenaan je user-message)
 Zoek in deze volgorde:
 1. "[GPS-straatnaam]" site:[makelaarsdomein]
-2. Niets? "[GPS-straatnaam]" "[gemeente]" [makelaar naam] te koop
-3. Niets? "[GPS-straatnaam]" "[gemeente]" te koop (ook aggregators: Realo, Immoscoop, Immoweb)
-4. Pas na minstens 3 searches mag je "niet_gevonden" teruggeven.
+2. Niets? "[GPS-straatnaam]" "[postcode]" te koop
+3. Pas na minstens 2 searches mag je "niet_gevonden" teruggeven.
 
-Voor de url: gebruik de makelaar-URL als je die vindt. Als niet, gebruik dan de Realo/Immoscoop URL van de gevonden listing.
+ADRESREGEL: match ALTIJD op straatnaam — nooit op prijs of oppervlakte alleen.
+Als een gevonden listing een ander straatadres heeft dan de GPS-straatnaam → verwerp die URL, zoek verder.
+Voor de url: makelaar-URL heeft voorkeur. Als niet gevonden: Immoscoop/Realo/Spotto URL van de JUISTE listing is ook goed.
 
 ## WANNEER JE EEN LIJST VAN LISTINGS KRIJGT
 Kies de listing die het beste overeenkomt met het bord op basis van:
@@ -1410,13 +1411,14 @@ Postcode: ${postcode} (dekt ${hoofdgemeente}${heeftDeelgemeente ? ` + ${deelgeme
 Makelaar: ${bordInfo.makelaar} (${domeinHint})
 Reden: ${waarom}
 
-Zoek via web_search — gebruik postcode ${postcode} als locatie-identifier (robuuster dan gemeente-naam):
+Zoek via web_search — gebruik het STRAATNAAM + POSTCODE als primaire zoekopdracht:
 1. web_search: "${gpsStraat || postcode}" site:${domeinHint}
-2. Niets? web_search: "${gpsStraat || postcode}" "${postcode}" ${bordInfo.makelaar} ${bordInfo.listing_type}
-3. Nog niets? web_search: "${gpsStraat || postcode}" "${postcode}" ${bordInfo.listing_type} (ook Realo, Immoscoop)
+2. Niets op makelaarssite? web_search: "${gpsStraat || postcode}" "${postcode}" ${bordInfo.listing_type}
+3. Controleer ALTIJD: het adres in de gevonden listing moet "${gpsStraat || postcode}" bevatten.
+   Komt het adres niet overeen → gooi die URL weg en zoek verder.
 
-REGEL: web_search is VERPLICHT. Geef nooit "niet_gevonden" zonder minstens 3 searches geprobeerd.
-URL-prioriteit: makelaar-URL > Realo/Immoscoop > Immoweb. Aggregator-URL is beter dan geen URL.\n`;
+URL-prioriteit: makelaar-URL (${domeinHint}) > Immoscoop/Realo/Spotto > Immoweb.
+Aggregator-URL is beter dan geen URL — maar enkel als het adres klopt met de GPS-straat.\n`;
     } else if (listings.length > 0) {
       // Listings beschikbaar via scraping of Immoweb
       listingsContext = `\n\n## LISTINGS (${listings.length} resultaten — bron: ${listingsBron})\n`;
@@ -1574,9 +1576,24 @@ Geef het resultaat als JSON.`
     if (!result.gemeente && geocodeResultaat?.gemeente) result.gemeente = geocodeResultaat.gemeente;
     if (result.adres === 'Niet bepaald') result.adres = null;
 
+    // ── GPS-straat validatie ──────────────────────────────────────
+    // Als we GPS hebben en het adres van de detailpagina klopt niet →
+    // URL wissen. Voorkomt dat een listing in Wachtebeke wordt getoond
+    // als de gebruiker aan de Rechtstraat in Lochristi staat.
+    if (gpsStraat && adresListing) {
+      const straatLow  = gpsStraat.toLowerCase();
+      const adresLow   = adresListing.toLowerCase();
+      if (!adresLow.includes(straatLow)) {
+        console.log(`⚠️  Adres-mismatch: listing heeft "${adresListing}" maar GPS verwacht "${gpsStraat}" → URL gewist`);
+        result.url    = null;
+        result.status = 'niet_gevonden';
+        result.faal_categorie = result.faal_categorie || 'ADRES_MISMATCH';
+        result.notitie = `Gevonden URL leidt naar "${adresListing}" maar GPS-locatie is "${gpsStraat}". Mogelijk een verkeerd pand gevonden. ` + (result.notitie || '');
+        adresListing = null;
+      }
+    }
+
     // ── Adres van detailpagina ook naar frontend sturen ──────────
-    // adresListing wordt al correct opgeslagen in Supabase, maar werd
-    // nooit teruggestuurd naar de app — daarom stond er altijd "niet bepaald".
     if (adresListing) result.adres = adresListing;
 
     console.log('📊 SCAN KLAAR:', {
