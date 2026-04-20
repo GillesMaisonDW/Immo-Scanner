@@ -146,11 +146,18 @@
     .rr-value { color: var(--dark); font-weight: 500; }
 
     .listing-btn {
-      display: block; margin: 0 20px 20px;
-      padding: 13px; background: var(--mid-blue); color: white;
+      display: block; margin: 0 20px 10px;
+      padding: 14px; background: var(--mid-blue); color: white;
       border-radius: 10px; text-decoration: none;
-      font-weight: 700; font-size: 14px; text-align: center;
+      font-weight: 700; font-size: 15px; text-align: center;
     }
+    .listing-btn-alt {
+      display: block; margin: 0 20px 8px;
+      padding: 10px 14px; background: white; color: var(--mid-blue);
+      border: 2px solid var(--mid-blue); border-radius: 10px;
+      text-decoration: none; font-weight: 600; font-size: 13px; text-align: center;
+    }
+    .listing-btn-alt:last-of-type { margin-bottom: 20px; }
     .phone-btn {
       display: block; margin: 0 20px 20px;
       padding: 13px; background: var(--orange); color: white;
@@ -560,8 +567,28 @@ function showResult(r) {
           ${r.notitie ? `<div class="result-row"><span class="rr-icon">💬</span><div><div class="rr-label">Notitie</div><div class="rr-value" style="font-style:italic;color:var(--mid-grey);">${r.notitie}</div></div></div>` : ''}
           ${r.faal_categorie ? `<div style="padding-top:8px;"><span class="faal-badge">${r.faal_categorie}</span></div>` : ''}
         </div>
-        ${r.url ? `<a class="listing-btn" href="${r.url}" target="_blank">🔗 Bekijk de listing</a>` : ''}
-        ${r.telefoon && !r.url ? `<a class="phone-btn" href="tel:${r.telefoon}">📞 Bel de makelaar</a>` : ''}
+        ${(function() {
+          const altUrls = Array.isArray(r.url_alternatieven) ? r.url_alternatieven.filter(u => u && u.url) : [];
+          let html = '';
+          if (r.url) {
+            // Makelaar-URL beschikbaar: grote primaire knop
+            const label = r.makelaar ? `🏠 Bekijk bij ${r.makelaar}` : '🏠 Bekijk bij de makelaar';
+            html += `<a class="listing-btn" href="${r.url}" target="_blank">${label}</a>`;
+            // Secundaire knoppen: aggregators
+            altUrls.forEach(u => {
+              html += `<a class="listing-btn-alt" href="${u.url}" target="_blank">🔗 Bekijk op ${u.label}</a>`;
+            });
+          } else if (altUrls.length > 0) {
+            // Geen makelaar-URL: eerste alternatief wordt grote primaire knop
+            html += `<a class="listing-btn" href="${altUrls[0].url}" target="_blank">🔗 Bekijk op ${altUrls[0].label}</a>`;
+            altUrls.slice(1).forEach(u => {
+              html += `<a class="listing-btn-alt" href="${u.url}" target="_blank">🔗 Bekijk op ${u.label}</a>`;
+            });
+          } else if (r.telefoon) {
+            html += `<a class="phone-btn" href="tel:${r.telefoon}">📞 Bel de makelaar</a>`;
+          }
+          return html;
+        })()}
       </div>`;
   }
 
@@ -618,7 +645,8 @@ async function bevestigCorrectie() {
   logResultMetMakelaar('onjuist_makelaar', 'MAKELAAR_NIET_HERKEND', naam);
   // Toon laad-indicator en zoek opnieuw via de opgegeven makelaar
   document.getElementById('correctie').style.display = 'none';
-  toonLaden(`🔍 Opnieuw zoeken via ${naam}…`);
+  showScreen('screen-loading');
+  animateSteps();
   try {
     const body = { ...lastScanPayload, makelaar_override: naam };
     const resp = await fetch('/api/scan', {
@@ -627,10 +655,13 @@ async function bevestigCorrectie() {
       body: JSON.stringify(body)
     });
     const data = await resp.json();
-    toonResultaat(data);
+    if (!resp.ok) throw new Error(data.error || 'Serverfout');
+    lastResult = data;
+    document.getElementById('debug-box').textContent = JSON.stringify(data, null, 2);
+    showResult(data);
   } catch (e) {
-    verbergLaden();
-    alert('Zoeken mislukt. Probeer opnieuw.');
+    showScreen('screen-home');
+    alert('Zoeken mislukt: ' + e.message);
   }
 }
 function logResultMetMakelaar(feedbackType, faal, makelaarNaamCorrect) {
