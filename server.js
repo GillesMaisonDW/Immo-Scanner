@@ -257,19 +257,21 @@ function vulUrlIn(template, gemeente, postcode) {
     .replace(/\{postcode\}/g, postcode || '9000');
 }
 
-async function voegMakelaarToeAanSupabase(domein, naam, koopUrl, huurUrl) {
+async function voegMakelaarToeAanSupabase(domein, naam, koopUrl, huurUrl, telefoon) {
   if (!supabase || !domein) return;
-  const { error } = await supabase.from('makelaars').upsert({
+  const record = {
     domein, naam: naam || domein,
     koop_url: koopUrl || null,
     huur_url: huurUrl || null,
     toegevoegd_door: 'automatisch',
     bevestigd: false,
     updated_at: new Date().toISOString()
-  }, { onConflict: 'domein', ignoreDuplicates: false });
+  };
+  if (telefoon) record.telefoon = telefoon;
+  const { error } = await supabase.from('makelaars').upsert(record, { onConflict: 'domein', ignoreDuplicates: false });
   if (error) console.warn('Makelaar toevoegen mislukt:', error.message);
   else {
-    console.log(`✅ Makelaar "${naam || domein}" toegevoegd/bijgewerkt in Supabase`);
+    console.log(`✅ Makelaar "${naam || domein}" (${domein}) toegevoegd/bijgewerkt in Supabase`);
     _makelaarsCacheTs = 0; // cache invalideren
   }
 }
@@ -972,15 +974,17 @@ const PROMPT_STAP1 = `Analyseer dit makelaarsbord. Geef ENKEL deze JSON terug, n
   "pand_type_display": "🏠 Woning" | "🏢 Appartement" | "🏗️ Nieuwbouw" | "🏭 Commercieel" | "🌳 Grond",
   "referentienummer": "als zichtbaar op het bord, anders null",
   "telefoon": "als zichtbaar op het bord, anders null",
-  "tekst_op_bord": "alle leesbare tekst op het bord letterlijk overgetypt, ook gedeeltelijk"
+  "tekst_op_bord": "alle leesbare tekst op het bord letterlijk overgetypt, ook gedeeltelijk",
+  "gebouw_naam": "naam van de residentie of het gebouw als zichtbaar op de gevel of het bord (bv. 'De Noordzee', 'Residentie Antwerpen'), anders null"
 }
 
-## STAP 1: LEES EERST ALLE TEKST OP HET BORD
+## STAP 1: LEES EERST ALLE TEKST OP HET BORD ÉN HET GEBOUW
 Dit is je belangrijkste taak. Lees ALLE zichtbare tekst, ook als het bord scheef staat, gedeeltelijk zichtbaar is, of de letters klein zijn:
 - De naam van de makelaar staat bijna ALTIJD op het bord in letters — lees ze letterlijk over
-- Website-URL: zoek naar .be, .com, .nl achteraan een woord → dat is de website van de makelaar
+- Website-URL: zoek naar .be, .com, .nl, .immo achteraan een woord → dat is de website van de makelaar
 - Telefoonnummer: Belgische nummers beginnen met 09xx (vast) of 04xx (mobiel)
 - Referentienummer: bv. "Ref: 12345" of een code op het bord
+- Gebouwnaam: kijk ook op de gevel van het gebouw zelf — residentienamen staan vaak in steen gebeiteld of op een naambord (bv. "De Noordzee", "Residentie Park"). Dit is CRUCIAAL voor het terugvinden van de listing.
 
 ## STAP 2: HERKENN VIA LOGO + KLEUR + TEKST GECOMBINEERD
 Gebruik de tekst uit stap 1 als primaire bron, kleur/logo als bevestiging:
@@ -1025,9 +1029,16 @@ const PROMPT_STAP2 = `Je bent de Immo Scanner. Je analyseert een foto van een ma
 5. Als het adres duidelijk overeenkomt met de GPS-locatie: wees ZEKER. Kies één prijs (meest recente/betrouwbare bron) en rapporteer die. Vermeld geen prijsverschillen tussen aggregators in de notitie — aggregators zijn soms verouderd, dat is normaal. De notitie is voor de gebruiker, geen technisch debugrapport.
 
 ## WANNEER JE WEB SEARCH GEBRUIKT (staat bovenaan je user-message)
-Zoek in deze volgorde:
-1. "[GPS-straatnaam]" site:[makelaarsdomein]
-2. Niets? "[GPS-straatnaam]" "[postcode]" te koop
+Je hebt: Makelaar naam, makelaar website, GPS-straatnaam, gemeente en postcode.
+Zoek in deze volgorde — stop zodra je een directe listing-URL hebt (niet een zoekresultatenpagina):
+
+1. "[GPS-straatnaam]" "[gemeente]" site:[makelaarsdomein]
+2. "[GPS-straatnaam]" "[gemeente]" site:realo.be
+3. "[GPS-straatnaam]" "[gemeente]" site:immoscoop.be
+4. "[GPS-straatnaam]" "[gemeente]" site:spotto.be
+5. "[Makelaar naam]" "[GPS-straatnaam]" "[gemeente]" te koop
+
+REDEN: aggregators zoals Realo, Immoscoop en Spotto indexeren listings van ALLE makelaars — ook kleine, slecht geïndexeerde makelaarsites. Zoek daarom altijd op meerdere aggregators als de makelaarsite niets oplevert.
 
 ADRESREGEL: match ALTIJD op straatnaam — nooit op prijs of oppervlakte alleen.
 Als een gevonden listing een ander straatadres heeft dan de GPS-straatnaam → verwerp die URL, zoek verder.
@@ -1037,12 +1048,14 @@ Voorbeeld: je vindt Rechtstraat 65A op Realo → neem prijs en kenmerken van die
 Neem NOOIT een prijs van een andere zoekresultaat-pagina dan de gevonden listing-URL.
 
 URL-REGELS:
-- "url": ENKEL de URL op de website van de makelaar zelf (bv. immo-home.be). Null als niet gevonden.
-- "url_alternatieven": VERPLICHT — kopieer LETTERLIJK de volledige URLs van ELKE pagina waar je het pand gevonden hebt.
-  Formaat: [{"label": "Realo", "url": "https://www.realo.be/nl/..."}, {"label": "Immoscoop", "url": "https://www.immoscoop.be/..."}]
-  KRITIEK: als je in de notitie een site vermeldt (Realo, Immoscoop, Spotto...) dan MOET die URL ook in url_alternatieven staan.
-  NOOIT de volledige URL weglaten als je die in je zoekresultaten hebt gezien.
-  Lege array [] ENKEL als het pand werkelijk op GEEN ENKELE website gevonden werd.
+- "url": ENKEL de URL op de website van de makelaar zelf (bv. immo-home.be, jo.immo...). Null als niet gevonden.
+- "url_alternatieven": VERPLICHT — kopieer LETTERLIJK de volledige URL van de DETAIL-PAGINA van het pand op elke aggregator.
+  Formaat: [{"label": "Realo", "url": "https://www.realo.be/nl/gent/rechtstraat/65a/..."}, ...]
+  BELANGRIJK: gebruik NOOIT een zoekresultatenpagina als URL (herkenbaar aan /search/, /zoeken/, /resultaten/, ?q=, ?page=).
+  Een geldige URL gaat naar één specifiek pand — niet naar een lijst van panden.
+  Als je enkel een zoekpagina hebt en geen directe listing-URL, zet die dan NIET in url_alternatieven.
+  KRITIEK: als je in de notitie een site vermeldt (Realo, Immoscoop, Spotto...) dan MOET die directe listing-URL ook in url_alternatieven staan.
+  Lege array [] ENKEL als het pand werkelijk op GEEN ENKELE website als aparte listing gevonden werd.
 
 ## WANNEER JE EEN LIJST VAN LISTINGS KRIJGT
 Kies de listing die het beste overeenkomt met het bord op basis van:
@@ -1231,8 +1244,8 @@ Als je het niet kan vinden: RESULTAAT: {"naam": null, "website": null}`,
                 bordInfo.makelaar_betrouwbaarheid = 'HOOG';
                 // Automatisch toevoegen aan Supabase als nog niet bekend
                 if (telInfo.website) {
-                  const domeinNieuw = telInfo.website.replace('www.', '').replace(/^https?:\/\//, '');
-                  voegMakelaarToeAanSupabase(domeinNieuw, telInfo.naam, null, null);
+                  const domeinNieuw = telInfo.website.replace('www.', '').replace(/^https?:\/\//, '').split('/')[0];
+                  voegMakelaarToeAanSupabase(domeinNieuw, telInfo.naam, null, null, telefoon);
                 }
               } else {
                 console.log('⚠️ Stap 1.5a: Telefoonnummer niet herkend als makelaar');
@@ -1250,8 +1263,8 @@ Als je het niet kan vinden: RESULTAAT: {"naam": null, "website": null}`,
                     bordInfo.makelaar_herkenning += ` (gevonden via telefoonnummer ${telefoon})`;
                     bordInfo.makelaar_betrouwbaarheid = 'HOOG';
                     if (telInfo.website) {
-                      const domeinNieuw = telInfo.website.replace('www.', '').replace(/^https?:\/\//, '');
-                      voegMakelaarToeAanSupabase(domeinNieuw, telInfo.naam, null, null);
+                      const domeinNieuw = telInfo.website.replace('www.', '').replace(/^https?:\/\//, '').split('/')[0];
+                      voegMakelaarToeAanSupabase(domeinNieuw, telInfo.naam, null, null, telefoon);
                     }
                   }
                 } catch {}
@@ -1337,6 +1350,21 @@ Als je het niet kan vinden: RESULTAAT: {"naam": null, "website": null}`,
         makelaarInDB = true;
         console.log(`🔗 Domein-fallback: "${bordInfo.makelaar}" → ${domeinMakelaar} (uit Supabase)`);
       }
+    }
+
+    // ── Nieuwe makelaar automatisch opslaan ───────────────────────
+    // Als de website van de makelaar bekend is (van het bord of via stap 1.5a)
+    // maar nog niet in de DB staat → opslaan + koop/huur-URLs ontdekken.
+    // Zo is de makelaar klaar voor de VOLGENDE scan, ook al helpt het deze scan niet.
+    if (!makelaarInDB && domeinMakelaar) {
+      console.log(`💾 Nieuwe makelaar ontdekt: "${bordInfo.makelaar}" (${domeinMakelaar}) — opslaan in Supabase`);
+      await voegMakelaarToeAanSupabase(domeinMakelaar, bordInfo.makelaar, null, null, bordInfo.telefoon || null);
+      // URL-ontdekking in de achtergrond — non-blocking, resultaat voor volgende scan
+      ontdekMakelaarUrls(domeinMakelaar)
+        .then(({ koopUrl, huurUrl }) => {
+          if (koopUrl || huurUrl) console.log(`✅ URLs ontdekt voor ${domeinMakelaar}: koop=${koopUrl}, huur=${huurUrl}`);
+        })
+        .catch(e => console.warn(`URL-ontdekking achtergrond fout voor ${domeinMakelaar}:`, e.message));
     }
 
     // ── Scenario bepalen ───────────────────────────────────────────
@@ -1597,9 +1625,11 @@ Geef het resultaat als JSON.`
           while ((m = urlRegex.exec(blockStr)) !== null) {
             const gevondenUrl = m[0].replace(/\\u[0-9a-f]{4}/gi, c =>
               String.fromCharCode(parseInt(c.slice(2), 16)));
+            // Zoekpagina's uitsluiten — enkel directe listing-URLs
+            const isZoekpagina = /\/search\/|\/zoeken\/|\/resultaten\/|\?q=|\?page=|\/buurt-|\/neighborhood/i.test(gevondenUrl);
             // Controleer of de URL straatnaam bevat (ruw check)
-            if (gevondenUrl.toLowerCase().includes(straatLower.split(' ')[0]) ||
-                (postcode && gevondenUrl.includes(postcode))) {
+            if (!isZoekpagina && (gevondenUrl.toLowerCase().includes(straatLower.split(' ')[0]) ||
+                (postcode && gevondenUrl.includes(postcode)))) {
               if (!gevondenUrls.has(agg.domein)) {
                 gevondenUrls.add(agg.domein);
                 result.url_alternatieven.push({ label: agg.label, url: gevondenUrl });
