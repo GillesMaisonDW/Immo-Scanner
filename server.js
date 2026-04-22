@@ -204,19 +204,13 @@ async function reverseGeocode(lat, lon) {
     if (!resp.ok) return null;
     const data = await resp.json();
     const addr = data.address || {};
-    console.log('📍 Nominatim addr velden:', JSON.stringify(addr));
     const postcode  = addr.postcode || null;
     const landcode  = addr.country_code?.toUpperCase() || 'BE';
     // Gebruik city/town als primaire gemeente (= officiële hoofdgemeente)
     // village/suburb kan een deelgemeente zijn
     const deelgemeente = addr.village || addr.suburb || null;
     const hoofdstad    = addr.city || addr.town || addr.municipality || null;
-
-    // Probeer alle gangbare Nominatim straattypes
-    const straat = addr.road || addr.pedestrian || addr.square || addr.path
-                || addr.footway || addr.cycleway || addr.residential
-                || addr.neighbourhood || addr.hamlet || null;
-    console.log(`📍 Straat gevonden: "${straat}" | display_name: "${data.display_name}"`);
+    const straat = addr.road || addr.pedestrian || addr.path || null;
 
     return {
       straat,
@@ -257,36 +251,6 @@ async function laadMakelaarsUitSupabase() {
   return _makelaarsCache;
 }
 
-// ── Verkocht-check ────────────────────────────────────────────────
-// Haalt de listing-pagina op en zoekt naar verkocht/sold/optie-signalen.
-// Retourneert true als het pand niet meer beschikbaar lijkt.
-async function isVerkocht(url) {
-  if (!url) return false;
-  try {
-    const resp = await fetch(url, {
-      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; ImmoScanner/1.0)' },
-      signal: AbortSignal.timeout(8000)
-    });
-    if (!resp.ok) return false;
-    const html = await resp.text();
-    const tekst = html.toLowerCase();
-    const verkochtSleutels = [
-      'verkocht', 'verkauft', 'sold', 'vendu',
-      'onder compromis', 'onder bod', 'onder optie',
-      'niet meer beschikbaar', 'already sold', 'déjà vendu',
-      'verhuurd', 'vermietet', 'rented', 'loué',
-      'class="sold"', 'class="verkocht"', 'badge-sold', 'label-sold',
-      'status-sold', 'status--sold', 'is-sold'
-    ];
-    const gevonden = verkochtSleutels.find(k => tekst.includes(k));
-    if (gevonden) console.log(`🔴 Verkocht-signaal gevonden op ${url}: "${gevonden}"`);
-    return !!gevonden;
-  } catch (e) {
-    console.log(`⚠️  Verkocht-check mislukt voor ${url}: ${e.message}`);
-    return false; // bij twijfel: niet blokkeren
-  }
-}
-
 function vulUrlIn(template, gemeente, postcode) {
   if (!template) return null;
   return template
@@ -306,9 +270,8 @@ async function voegMakelaarToeAanSupabase(domein, naam, koopUrl, huurUrl, telefo
   };
   if (telefoon) record.telefoon = telefoon;
   const { error } = await supabase.from('makelaars').upsert(record, { onConflict: 'domein', ignoreDuplicates: false });
-  if (error) {
-    console.error(`❌ Makelaar toevoegen MISLUKT voor "${naam || domein}" (${domein}): ${error.message} | code: ${error.code} | details: ${JSON.stringify(error.details)}`);
-  } else {
+  if (error) console.warn('Makelaar toevoegen mislukt:', error.message);
+  else {
     console.log(`✅ Makelaar "${naam || domein}" (${domein}) toegevoegd/bijgewerkt in Supabase`);
     _makelaarsCacheTs = 0; // cache invalideren
   }
@@ -1732,21 +1695,6 @@ Geef het resultaat als JSON.`
       }
     }
 
-    // ── Verkocht-check ────────────────────────────────────────────
-    // Als we een URL hebben, controleer of het pand al verkocht/verhuurd is.
-    // Zo ja: URL weggooien en status aanpassen zodat de gebruiker niet
-    // een niet-beschikbaar pand te zien krijgt.
-    if (result.url) {
-      const verkocht = await isVerkocht(result.url);
-      if (verkocht) {
-        console.log(`🔴 Pand op ${result.url} is verkocht/niet beschikbaar — URL gewist`);
-        result.url = null;
-        result.status = 'verkocht';
-        result.faal_categorie = 'PAND_VERKOCHT';
-        result.notitie = `Het gevonden pand is niet meer beschikbaar (verkocht/verhuurd). ` + (result.notitie || '');
-      }
-    }
-
     // ── Adres van detailpagina ook naar frontend sturen ──────────
     if (adresListing) result.adres = adresListing;
 
@@ -1768,7 +1716,6 @@ Geef het resultaat als JSON.`
         makelaar:                result.makelaar,
         makelaar_herkenning:     result.makelaar_herkenning,
         makelaar_betrouwbaarheid:(result.makelaar_betrouwbaarheid || '').toLowerCase() || null,
-        makelaar_in_db:          makelaarInDB,
         listing_type:            result.listing_type,
         pand_type:               result.pand_type,
         adres_foto:              adresFoto,
