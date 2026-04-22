@@ -212,16 +212,11 @@ async function reverseGeocode(lat, lon) {
     const deelgemeente = addr.village || addr.suburb || null;
     const hoofdstad    = addr.city || addr.town || addr.municipality || null;
 
-    // Probeer alle gangbare Nominatim straattypes — daarna fallback op display_name
-    const straatUitAddr = addr.road || addr.pedestrian || addr.square || addr.path
-                       || addr.footway || addr.cycleway || addr.residential
-                       || addr.neighbourhood || addr.hamlet || null;
-    // display_name begint altijd met de straat/plaatsnaam (voor de eerste komma)
-    const straatUitDisplay = data.display_name
-      ? data.display_name.split(',')[0].trim()
-      : null;
-    const straat = straatUitAddr || straatUitDisplay || null;
-    console.log(`📍 Straat gevonden: "${straat}" (uit addr: ${straatUitAddr}, uit display: ${straatUitDisplay})`);
+    // Probeer alle gangbare Nominatim straattypes
+    const straat = addr.road || addr.pedestrian || addr.square || addr.path
+                || addr.footway || addr.cycleway || addr.residential
+                || addr.neighbourhood || addr.hamlet || null;
+    console.log(`📍 Straat gevonden: "${straat}" | display_name: "${data.display_name}"`);
 
     return {
       straat,
@@ -260,6 +255,36 @@ async function laadMakelaarsUitSupabase() {
   _makelaarsCacheTs = nu;
   console.log(`📚 ${_makelaarsCache.length} makelaars geladen uit Supabase`);
   return _makelaarsCache;
+}
+
+// ── Verkocht-check ────────────────────────────────────────────────
+// Haalt de listing-pagina op en zoekt naar verkocht/sold/optie-signalen.
+// Retourneert true als het pand niet meer beschikbaar lijkt.
+async function isVerkocht(url) {
+  if (!url) return false;
+  try {
+    const resp = await fetch(url, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; ImmoScanner/1.0)' },
+      signal: AbortSignal.timeout(8000)
+    });
+    if (!resp.ok) return false;
+    const html = await resp.text();
+    const tekst = html.toLowerCase();
+    const verkochtSleutels = [
+      'verkocht', 'verkauft', 'sold', 'vendu',
+      'onder compromis', 'onder bod', 'onder optie',
+      'niet meer beschikbaar', 'already sold', 'déjà vendu',
+      'verhuurd', 'vermietet', 'rented', 'loué',
+      'class="sold"', 'class="verkocht"', 'badge-sold', 'label-sold',
+      'status-sold', 'status--sold', 'is-sold'
+    ];
+    const gevonden = verkochtSleutels.find(k => tekst.includes(k));
+    if (gevonden) console.log(`🔴 Verkocht-signaal gevonden op ${url}: "${gevonden}"`);
+    return !!gevonden;
+  } catch (e) {
+    console.log(`⚠️  Verkocht-check mislukt voor ${url}: ${e.message}`);
+    return false; // bij twijfel: niet blokkeren
+  }
 }
 
 function vulUrlIn(template, gemeente, postcode) {
@@ -1704,6 +1729,21 @@ Geef het resultaat als JSON.`
         result.faal_categorie = result.faal_categorie || 'ADRES_MISMATCH';
         result.notitie = `Gevonden URL leidt naar "${adresListing}" maar GPS-locatie is "${gpsStraat}${postcode ? ' / ' + postcode : ''}". Mogelijk een verkeerd pand gevonden. ` + (result.notitie || '');
         adresListing = null;
+      }
+    }
+
+    // ── Verkocht-check ────────────────────────────────────────────
+    // Als we een URL hebben, controleer of het pand al verkocht/verhuurd is.
+    // Zo ja: URL weggooien en status aanpassen zodat de gebruiker niet
+    // een niet-beschikbaar pand te zien krijgt.
+    if (result.url) {
+      const verkocht = await isVerkocht(result.url);
+      if (verkocht) {
+        console.log(`🔴 Pand op ${result.url} is verkocht/niet beschikbaar — URL gewist`);
+        result.url = null;
+        result.status = 'verkocht';
+        result.faal_categorie = 'PAND_VERKOCHT';
+        result.notitie = `Het gevonden pand is niet meer beschikbaar (verkocht/verhuurd). ` + (result.notitie || '');
       }
     }
 
