@@ -204,6 +204,7 @@ async function reverseGeocode(lat, lon) {
     if (!resp.ok) return null;
     const data = await resp.json();
     const addr = data.address || {};
+    console.log('📍 Nominatim addr velden:', JSON.stringify(addr));
     const postcode  = addr.postcode || null;
     const landcode  = addr.country_code?.toUpperCase() || 'BE';
     // Gebruik city/town als primaire gemeente (= officiële hoofdgemeente)
@@ -211,8 +212,19 @@ async function reverseGeocode(lat, lon) {
     const deelgemeente = addr.village || addr.suburb || null;
     const hoofdstad    = addr.city || addr.town || addr.municipality || null;
 
+    // Probeer alle gangbare Nominatim straattypes — daarna fallback op display_name
+    const straatUitAddr = addr.road || addr.pedestrian || addr.square || addr.path
+                       || addr.footway || addr.cycleway || addr.residential
+                       || addr.neighbourhood || addr.hamlet || null;
+    // display_name begint altijd met de straat/plaatsnaam (voor de eerste komma)
+    const straatUitDisplay = data.display_name
+      ? data.display_name.split(',')[0].trim()
+      : null;
+    const straat = straatUitAddr || straatUitDisplay || null;
+    console.log(`📍 Straat gevonden: "${straat}" (uit addr: ${straatUitAddr}, uit display: ${straatUitDisplay})`);
+
     return {
-      straat:      addr.road || addr.pedestrian || addr.square || addr.path || addr.footway || addr.cycleway || addr.residential || null,
+      straat,
       gemeente:    deelgemeente || hoofdstad,   // voor weergave
       hoofdgemeente: hoofdstad?.toLowerCase() || deelgemeente?.toLowerCase() || null,
       postcode,
