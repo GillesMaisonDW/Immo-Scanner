@@ -204,13 +204,15 @@ async function reverseGeocode(lat, lon) {
     if (!resp.ok) return null;
     const data = await resp.json();
     const addr = data.address || {};
+    // TIJDELIJKE DEBUG: log alle Nominatim-velden zodat we weten welk veld de straatnaam bevat
+    console.log(`🗺️  Nominatim [${lat},${lon}] → ${JSON.stringify(addr)}`);
     const postcode  = addr.postcode || null;
     const landcode  = addr.country_code?.toUpperCase() || 'BE';
     // Gebruik city/town als primaire gemeente (= officiële hoofdgemeente)
     // village/suburb kan een deelgemeente zijn
     const deelgemeente = addr.village || addr.suburb || null;
     const hoofdstad    = addr.city || addr.town || addr.municipality || null;
-    const straat = addr.road || addr.pedestrian || addr.path || null;
+    const straat = addr.road || addr.pedestrian || addr.square || addr.path || null;
 
     return {
       straat,
