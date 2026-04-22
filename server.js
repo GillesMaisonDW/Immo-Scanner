@@ -199,11 +199,11 @@ async function gemeenteViaPostcode(postcode, landcode) {
 // zodat hetzelfde pand niet twee keer opgezocht wordt.
 const _geocodeCache = new Map();
 
-// Photon (photon.komoot.io) — gebaseerd op OpenStreetMap, geen strikte rate limits,
-// geen API-sleutel nodig. Ideaal voor Belgische/Vlaamse adressen.
+// Photon (photon.komoot.io) — gebaseerd op OpenStreetMap, geen strikte rate limits.
+// Geen lang-parameter op de reverse endpoint (geeft 400 anders).
 async function _geocodeViaPhoton(lat, lon) {
   try {
-    const url = `https://photon.komoot.io/reverse?lat=${lat}&lon=${lon}&lang=nl`;
+    const url = `https://photon.komoot.io/reverse?lat=${lat}&lon=${lon}`;
     const resp = await fetch(url, {
       headers: { 'User-Agent': 'ImmoScannerApp/1.0 (gilles@maisondw.be)' },
       signal: AbortSignal.timeout(6000)
@@ -216,16 +216,44 @@ async function _geocodeViaPhoton(lat, lon) {
     const props = data?.features?.[0]?.properties;
     if (!props) return null;
 
-    const straat    = props.street || null;
-    const postcode  = props.postcode || null;
-    const landcode  = (props.countrycode || 'BE').toUpperCase();
-    // Photon geeft 'city' voor hoofdgemeente, 'name' of 'district' voor deelgemeente
-    const gemeente  = props.city || props.town || props.village || props.municipality || null;
+    const straat   = props.street || null;
+    const postcode = props.postcode || null;
+    const landcode = (props.countrycode || 'BE').toUpperCase();
+    const gemeente = props.city || props.town || props.village || props.municipality || null;
 
     console.log(`🗺️  Photon resultaat: straat=${straat}, postcode=${postcode}, gemeente=${gemeente}`);
     return { straat, gemeente, hoofdgemeente: gemeente?.toLowerCase() || null, postcode, landcode };
   } catch (e) {
     console.warn('🗺️  Photon fout:', e.message);
+    return null;
+  }
+}
+
+// BigDataCloud — volledig gratis, geen API-sleutel nodig, werkt server-side.
+// Tweede optie als Photon faalt.
+async function _geocodeViaBigDataCloud(lat, lon) {
+  try {
+    const url = `https://api.bigdatacloud.net/data/reverse-geocode-client?latitude=${lat}&longitude=${lon}&localityLanguage=nl`;
+    const resp = await fetch(url, {
+      headers: { 'User-Agent': 'ImmoScannerApp/1.0 (gilles@maisondw.be)' },
+      signal: AbortSignal.timeout(6000)
+    });
+    if (!resp.ok) {
+      console.warn(`🗺️  BigDataCloud HTTP fout: ${resp.status}`);
+      return null;
+    }
+    const data = await resp.json();
+    const postcode = data.postcode || null;
+    const landcode = (data.countryCode || 'BE').toUpperCase();
+    // BigDataCloud geeft 'city' voor de gemeente en 'locality' voor deelgemeente
+    const gemeente = data.city || data.locality || null;
+    // Straatnaam zit in localityInfo.place (als beschikbaar) of ontbreekt
+    const straat   = data.localityInfo?.place?.find(p => p.isoName?.toLowerCase().includes('road') || p.description?.toLowerCase().includes('street'))?.name || null;
+
+    console.log(`🗺️  BigDataCloud resultaat: straat=${straat}, postcode=${postcode}, gemeente=${gemeente}`);
+    return { straat, gemeente, hoofdgemeente: gemeente?.toLowerCase() || null, postcode, landcode };
+  } catch (e) {
+    console.warn('🗺️  BigDataCloud fout:', e.message);
     return null;
   }
 }
@@ -285,10 +313,16 @@ async function reverseGeocode(lat, lon) {
 
   console.log(`🗺️  Geocoding: lat=${lat}, lon=${lon}`);
 
-  // Probeer Photon eerst — bij fout valt Nominatim in
+  // 1. Photon — geen rate limits, beste optie
   let resultaat = await _geocodeViaPhoton(lat, lon);
+  // 2. BigDataCloud — gratis, geen API-sleutel, goede fallback
   if (!resultaat) {
-    console.warn('🗺️  Photon mislukt — probeer Nominatim als fallback...');
+    console.warn('🗺️  Photon mislukt — probeer BigDataCloud...');
+    resultaat = await _geocodeViaBigDataCloud(lat, lon);
+  }
+  // 3. Nominatim — laatste redmiddel, gevoelig voor 429 op gedeelde IPs
+  if (!resultaat) {
+    console.warn('🗺️  BigDataCloud mislukt — probeer Nominatim als laatste redmiddel...');
     resultaat = await _geocodeViaNominatim(lat, lon);
   }
 
