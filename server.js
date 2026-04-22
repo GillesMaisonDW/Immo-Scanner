@@ -251,6 +251,65 @@ async function laadMakelaarsUitSupabase() {
   return _makelaarsCache;
 }
 
+// ── Beschikbaarheidscheck ─────────────────────────────────────────
+// Haalt de listing-pagina op en zoekt naar signalen dat het pand
+// niet meer beschikbaar is (verkocht, verhuurd, onder optie...).
+// Retourneert true als het pand NIET meer beschikbaar is.
+async function isNietBeschikbaar(url) {
+  if (!url) return false;
+  try {
+    const resp = await fetch(url, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; ImmoScanner/1.0)' },
+      signal: AbortSignal.timeout(8000)
+    });
+    if (!resp.ok) return false;
+    const html = await resp.text();
+    const tekst = html.toLowerCase();
+
+    // Zoek naar expliciete tekst-signalen (case-insensitive via .toLowerCase())
+    const tekstSignalen = [
+      'verkocht', 'vendu', 'sold', 'verkauft',
+      'verhuurd', 'loué', 'rented', 'vermietet',
+      'onder compromis', 'sous compromis', 'under offer',
+      'onder bod', 'onder optie', 'sous option',
+      'niet meer beschikbaar', 'plus disponible', 'no longer available',
+      'reeds verkocht', 'déjà vendu', 'already sold',
+      'option', // voorzichtig: enkel als ook CSS-klasse hieronder matcht
+    ];
+
+    // Zoek naar CSS-klassen en HTML-attributen die makelaars gebruiken
+    const cssSignalen = [
+      'class="sold"', 'class="verkocht"', 'class="vendu"',
+      'class="status-sold"', 'class="badge-sold"', 'class="label-sold"',
+      'class="is-sold"', 'class="tag-sold"', 'class="sold-out"',
+      'status--sold', 'property-sold', 'listing-sold',
+      'data-status="sold"', 'data-status="verkocht"',
+      '"sold":true', '"is_sold":true', '"status":"sold"',
+    ];
+
+    // Expliciete tekst (zonder "option" — die is te breed)
+    const tekstTreffer = tekstSignalen
+      .filter(s => s !== 'option')
+      .find(s => tekst.includes(s));
+    if (tekstTreffer) {
+      console.log(`🔴 Niet beschikbaar (tekst: "${tekstTreffer}"): ${url}`);
+      return true;
+    }
+
+    // CSS/HTML-klassen
+    const cssTreffer = cssSignalen.find(s => tekst.includes(s));
+    if (cssTreffer) {
+      console.log(`🔴 Niet beschikbaar (CSS: "${cssTreffer}"): ${url}`);
+      return true;
+    }
+
+    return false;
+  } catch (e) {
+    console.log(`⚠️  Beschikbaarheidscheck mislukt voor ${url}: ${e.message}`);
+    return false; // bij twijfel: toon de URL gewoon
+  }
+}
+
 function vulUrlIn(template, gemeente, postcode) {
   if (!template) return null;
   return template
@@ -1664,6 +1723,31 @@ Geef het resultaat als JSON.`
       } else if (urlActief === null) {
         result.notitie = (result.notitie ? result.notitie + ' ' : '') +
           'Let op: de link kon niet automatisch gecontroleerd worden.';
+      }
+    }
+
+    // ── Beschikbaarheidscheck ─────────────────────────────────────
+    // Controleer of het pand nog beschikbaar is (niet verkocht/verhuurd/optie).
+    // Doe dit ook voor url_alternatieven zodat we geen dode links tonen.
+    if (result.url) {
+      const nietBeschikbaar = await isNietBeschikbaar(result.url);
+      if (nietBeschikbaar) {
+        console.log(`🔴 Pand niet meer beschikbaar op ${result.url} — URL gewist`);
+        result.url = null;
+        result.status = 'niet_gevonden';
+        result.faal_categorie = 'PAND_NIET_BESCHIKBAAR';
+        result.notitie = 'Dit pand is niet meer beschikbaar (verkocht, verhuurd of onder optie). ' + (result.notitie || '');
+      }
+    }
+
+    // Alternatieve URLs ook filteren op beschikbaarheid
+    if (Array.isArray(result.url_alternatieven) && result.url_alternatieven.length > 0) {
+      const beschikbaarChecks = await Promise.all(
+        result.url_alternatieven.map(alt => isNietBeschikbaar(alt.url))
+      );
+      result.url_alternatieven = result.url_alternatieven.filter((_, i) => !beschikbaarChecks[i]);
+      if (result.url_alternatieven.length === 0 && result.status === 'niet_gevonden') {
+        result.notitie = result.notitie || 'Alle gevonden links wijzen op een niet meer beschikbaar pand.';
       }
     }
 
