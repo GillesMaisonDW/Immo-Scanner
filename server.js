@@ -197,15 +197,18 @@ async function gemeenteViaPostcode(postcode, landcode) {
 // ── Nominatim reverse geocoding ───────────────────────────────────
 async function reverseGeocode(lat, lon) {
   try {
+    console.log(`🗺️  Nominatim aanroep: lat=${lat}, lon=${lon}`);
     const url = `https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lon}&format=json&addressdetails=1`;
     const resp = await fetch(url, {
       headers: { 'User-Agent': 'ImmoScannerApp/1.0 (gilles@maisondw.be)' }
     });
-    if (!resp.ok) return null;
+    if (!resp.ok) {
+      console.warn(`🗺️  Nominatim HTTP fout: ${resp.status} voor lat=${lat}, lon=${lon}`);
+      return null;
+    }
     const data = await resp.json();
     const addr = data.address || {};
-    // TIJDELIJKE DEBUG: log alle Nominatim-velden zodat we weten welk veld de straatnaam bevat
-    console.log(`🗺️  Nominatim [${lat},${lon}] → ${JSON.stringify(addr)}`);
+    console.log(`🗺️  Nominatim resultaat: ${JSON.stringify(addr)}`);
     const postcode  = addr.postcode || null;
     const landcode  = addr.country_code?.toUpperCase() || 'BE';
     // Gebruik city/town als primaire gemeente (= officiële hoofdgemeente)
@@ -1164,24 +1167,53 @@ Geef ENKEL de JSON terug, geen extra tekst.`;
 
 // ── /api/scan ─────────────────────────────────────────────────────
 app.post('/api/scan', async (req, res) => {
-  const { image, mime, gps, makelaar_override } = req.body;
+  const { image, mime, gps, makelaar_override, adres_manueel } = req.body;
 
   if (!image) return res.status(400).json({ error: 'Geen foto meegestuurd.' });
   if (!API_KEY) return res.status(500).json({ error: 'API key niet geconfigureerd.' });
 
   const startTime = Date.now();
 
-  // ── GPS → straatnaam via Nominatim ───────────────────────────
+  // ── Adres bepalen: manueel invoer heeft prioriteit over GPS ───
   let geocodeResultaat = null;
-  if (gps) {
-    const geocodeLat = gps.property_lat || gps.lat;
-    const geocodeLon = gps.property_lon || gps.lon;
-    geocodeResultaat = await reverseGeocode(geocodeLat, geocodeLon);
-  }
+  let adresFoto        = null;
 
-  const adresFoto = geocodeResultaat?.straat
-    ? `${geocodeResultaat.straat}, ${geocodeResultaat.gemeente || ''}`.trim().replace(/,$/, '')
-    : null;
+  if (adres_manueel && adres_manueel.trim().length > 3) {
+    // Gebruiker heeft zelf een adres ingevuld — dit is betrouwbaarder dan GPS
+    console.log(`📍 Manueel adres ontvangen: "${adres_manueel}"`);
+    // Parseer "Straatnaam Nummer, Postcode Gemeente" of varianten
+    const m = adres_manueel.trim().match(/^(.+?),\s*(\d{4})\s+(.+)$/);
+    if (m) {
+      geocodeResultaat = {
+        straat:         m[1].trim(),
+        postcode:       m[2].trim(),
+        gemeente:       m[3].trim(),
+        hoofdgemeente:  m[3].trim().toLowerCase(),
+        landcode:       'BE',
+        volledig:       adres_manueel.trim()
+      };
+    } else {
+      // Geen postcode in het adres — gebruik de tekst direct als straat
+      geocodeResultaat = {
+        straat:       adres_manueel.trim(),
+        gemeente:     null,
+        postcode:     null,
+        landcode:     'BE',
+        volledig:     adres_manueel.trim()
+      };
+    }
+    adresFoto = adres_manueel.trim();
+  } else {
+    // ── GPS → straatnaam via Nominatim ─────────────────────────
+    if (gps) {
+      const geocodeLat = gps.property_lat || gps.lat;
+      const geocodeLon = gps.property_lon || gps.lon;
+      geocodeResultaat = await reverseGeocode(geocodeLat, geocodeLon);
+    }
+    adresFoto = geocodeResultaat?.straat
+      ? `${geocodeResultaat.straat}, ${geocodeResultaat.gemeente || ''}`.trim().replace(/,$/, '')
+      : null;
+  }
 
   try {
     // ══════════════════════════════════════════════════════════════
