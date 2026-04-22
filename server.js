@@ -194,72 +194,109 @@ async function gemeenteViaPostcode(postcode, landcode) {
   }
 }
 
-// ── Nominatim reverse geocoding ───────────────────────────────────
-// Cache: sla resultaten op per afgerond coördinaat (3 decimalen ≈ 100m nauwkeurig)
-// zodat hetzelfde pand niet twee keer opgezocht wordt bij back-to-back scans.
-const _nominatimCache = new Map();
+// ── Reverse geocoding: Photon (primair) + Nominatim (fallback) ────
+// Cache: sla resultaten op per afgerond coördinaat (3 decimalen ≈ 100m)
+// zodat hetzelfde pand niet twee keer opgezocht wordt.
+const _geocodeCache = new Map();
 
-async function _nominatimFetch(url) {
-  const resp = await fetch(url, {
-    headers: { 'User-Agent': 'ImmoScannerApp/1.0 (gilles@maisondw.be)' }
-  });
-  // Bij rate limiting (429): wacht 1.5s en probeer eenmalig opnieuw
-  if (resp.status === 429) {
-    console.warn('🗺️  Nominatim rate limit (429) — wacht 1.5s en probeer opnieuw...');
-    await new Promise(r => setTimeout(r, 1500));
-    return fetch(url, {
-      headers: { 'User-Agent': 'ImmoScannerApp/1.0 (gilles@maisondw.be)' }
+// Photon (photon.komoot.io) — gebaseerd op OpenStreetMap, geen strikte rate limits,
+// geen API-sleutel nodig. Ideaal voor Belgische/Vlaamse adressen.
+async function _geocodeViaPhoton(lat, lon) {
+  try {
+    const url = `https://photon.komoot.io/reverse?lat=${lat}&lon=${lon}&lang=nl`;
+    const resp = await fetch(url, {
+      headers: { 'User-Agent': 'ImmoScannerApp/1.0 (gilles@maisondw.be)' },
+      signal: AbortSignal.timeout(6000)
     });
-  }
-  return resp;
-}
+    if (!resp.ok) {
+      console.warn(`🗺️  Photon HTTP fout: ${resp.status}`);
+      return null;
+    }
+    const data = await resp.json();
+    const props = data?.features?.[0]?.properties;
+    if (!props) return null;
 
-async function reverseGeocode(lat, lon) {
-  if (lat == null || lon == null || isNaN(lat) || isNaN(lon)) {
-    console.warn('🗺️  reverseGeocode: ongeldige coördinaten ontvangen:', lat, lon);
+    const straat    = props.street || null;
+    const postcode  = props.postcode || null;
+    const landcode  = (props.countrycode || 'BE').toUpperCase();
+    // Photon geeft 'city' voor hoofdgemeente, 'name' of 'district' voor deelgemeente
+    const gemeente  = props.city || props.town || props.village || props.municipality || null;
+
+    console.log(`🗺️  Photon resultaat: straat=${straat}, postcode=${postcode}, gemeente=${gemeente}`);
+    return { straat, gemeente, hoofdgemeente: gemeente?.toLowerCase() || null, postcode, landcode };
+  } catch (e) {
+    console.warn('🗺️  Photon fout:', e.message);
     return null;
   }
-  // Cache-sleutel op 3 decimalen (≈ 100m precisie — goed genoeg voor gemeente/straat)
-  const cacheKey = `${parseFloat(lat).toFixed(3)},${parseFloat(lon).toFixed(3)}`;
-  if (_nominatimCache.has(cacheKey)) {
-    console.log(`🗺️  Nominatim cache hit voor ${cacheKey}`);
-    return _nominatimCache.get(cacheKey);
-  }
+}
 
+// Nominatim (openstreetmap.org) — fallback als Photon faalt.
+// Gratis maar strikt gelimiteerd (1 req/s, gedeeld IP op Render → vaak 429).
+async function _geocodeViaNominatim(lat, lon) {
   try {
-    console.log(`🗺️  Nominatim aanroep: lat=${lat}, lon=${lon}`);
     const url = `https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lon}&format=json&addressdetails=1`;
-    const resp = await _nominatimFetch(url);
+    let resp = await fetch(url, {
+      headers: { 'User-Agent': 'ImmoScannerApp/1.0 (gilles@maisondw.be)' },
+      signal: AbortSignal.timeout(8000)
+    });
+    if (resp.status === 429) {
+      console.warn('🗺️  Nominatim 429 — wacht 2s...');
+      await new Promise(r => setTimeout(r, 2000));
+      resp = await fetch(url, {
+        headers: { 'User-Agent': 'ImmoScannerApp/1.0 (gilles@maisondw.be)' },
+        signal: AbortSignal.timeout(8000)
+      });
+    }
     if (!resp.ok) {
-      console.warn(`🗺️  Nominatim HTTP fout: ${resp.status} voor lat=${lat}, lon=${lon}`);
+      console.warn(`🗺️  Nominatim HTTP fout: ${resp.status}`);
       return null;
     }
     const data = await resp.json();
     const addr = data.address || {};
     console.log(`🗺️  Nominatim resultaat: ${JSON.stringify(addr)}`);
-    const postcode  = addr.postcode || null;
-    const landcode  = addr.country_code?.toUpperCase() || 'BE';
+    const postcode     = addr.postcode || null;
+    const landcode     = addr.country_code?.toUpperCase() || 'BE';
     const deelgemeente = addr.village || addr.suburb || null;
     const hoofdstad    = addr.city || addr.town || addr.municipality || null;
-    const straat = addr.road || addr.pedestrian || addr.square || addr.path || null;
-
-    const resultaat = {
+    const straat       = addr.road || addr.pedestrian || addr.square || addr.path || null;
+    return {
       straat,
       gemeente:      deelgemeente || hoofdstad,
       hoofdgemeente: hoofdstad?.toLowerCase() || deelgemeente?.toLowerCase() || null,
       postcode,
-      landcode,
-      volledig:      data.display_name
+      landcode
     };
-
-    // Sla op in cache (max 200 entries om geheugen te beperken)
-    if (_nominatimCache.size >= 200) _nominatimCache.delete(_nominatimCache.keys().next().value);
-    _nominatimCache.set(cacheKey, resultaat);
-    return resultaat;
   } catch (e) {
-    console.warn('Nominatim fout:', e.message);
+    console.warn('🗺️  Nominatim fout:', e.message);
     return null;
   }
+}
+
+async function reverseGeocode(lat, lon) {
+  if (lat == null || lon == null || isNaN(lat) || isNaN(lon)) {
+    console.warn('🗺️  reverseGeocode: ongeldige coördinaten:', lat, lon);
+    return null;
+  }
+  const cacheKey = `${parseFloat(lat).toFixed(3)},${parseFloat(lon).toFixed(3)}`;
+  if (_geocodeCache.has(cacheKey)) {
+    console.log(`🗺️  Geocode cache hit voor ${cacheKey}`);
+    return _geocodeCache.get(cacheKey);
+  }
+
+  console.log(`🗺️  Geocoding: lat=${lat}, lon=${lon}`);
+
+  // Probeer Photon eerst — bij fout valt Nominatim in
+  let resultaat = await _geocodeViaPhoton(lat, lon);
+  if (!resultaat) {
+    console.warn('🗺️  Photon mislukt — probeer Nominatim als fallback...');
+    resultaat = await _geocodeViaNominatim(lat, lon);
+  }
+
+  if (resultaat) {
+    if (_geocodeCache.size >= 200) _geocodeCache.delete(_geocodeCache.keys().next().value);
+    _geocodeCache.set(cacheKey, resultaat);
+  }
+  return resultaat;
 }
 
 // ── Makelaar database via Supabase ────────────────────────────────
