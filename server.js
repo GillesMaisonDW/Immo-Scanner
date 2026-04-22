@@ -212,7 +212,7 @@ async function reverseGeocode(lat, lon) {
     const hoofdstad    = addr.city || addr.town || addr.municipality || null;
 
     return {
-      straat:      addr.road || addr.pedestrian || addr.path || null,
+      straat:      addr.road || addr.pedestrian || addr.square || addr.path || addr.footway || addr.cycleway || addr.residential || null,
       gemeente:    deelgemeente || hoofdstad,   // voor weergave
       hoofdgemeente: hoofdstad?.toLowerCase() || deelgemeente?.toLowerCase() || null,
       postcode,
@@ -269,8 +269,9 @@ async function voegMakelaarToeAanSupabase(domein, naam, koopUrl, huurUrl, telefo
   };
   if (telefoon) record.telefoon = telefoon;
   const { error } = await supabase.from('makelaars').upsert(record, { onConflict: 'domein', ignoreDuplicates: false });
-  if (error) console.warn('Makelaar toevoegen mislukt:', error.message);
-  else {
+  if (error) {
+    console.error(`❌ Makelaar toevoegen MISLUKT voor "${naam || domein}" (${domein}): ${error.message} | code: ${error.code} | details: ${JSON.stringify(error.details)}`);
+  } else {
     console.log(`✅ Makelaar "${naam || domein}" (${domein}) toegevoegd/bijgewerkt in Supabase`);
     _makelaarsCacheTs = 0; // cache invalideren
   }
@@ -1715,6 +1716,7 @@ Geef het resultaat als JSON.`
         makelaar:                result.makelaar,
         makelaar_herkenning:     result.makelaar_herkenning,
         makelaar_betrouwbaarheid:(result.makelaar_betrouwbaarheid || '').toLowerCase() || null,
+        makelaar_in_db:          makelaarInDB,
         listing_type:            result.listing_type,
         pand_type:               result.pand_type,
         adres_foto:              adresFoto,
