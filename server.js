@@ -195,13 +195,41 @@ async function gemeenteViaPostcode(postcode, landcode) {
 }
 
 // ── Nominatim reverse geocoding ───────────────────────────────────
+// Cache: sla resultaten op per afgerond coördinaat (3 decimalen ≈ 100m nauwkeurig)
+// zodat hetzelfde pand niet twee keer opgezocht wordt bij back-to-back scans.
+const _nominatimCache = new Map();
+
+async function _nominatimFetch(url) {
+  const resp = await fetch(url, {
+    headers: { 'User-Agent': 'ImmoScannerApp/1.0 (gilles@maisondw.be)' }
+  });
+  // Bij rate limiting (429): wacht 1.5s en probeer eenmalig opnieuw
+  if (resp.status === 429) {
+    console.warn('🗺️  Nominatim rate limit (429) — wacht 1.5s en probeer opnieuw...');
+    await new Promise(r => setTimeout(r, 1500));
+    return fetch(url, {
+      headers: { 'User-Agent': 'ImmoScannerApp/1.0 (gilles@maisondw.be)' }
+    });
+  }
+  return resp;
+}
+
 async function reverseGeocode(lat, lon) {
+  if (lat == null || lon == null || isNaN(lat) || isNaN(lon)) {
+    console.warn('🗺️  reverseGeocode: ongeldige coördinaten ontvangen:', lat, lon);
+    return null;
+  }
+  // Cache-sleutel op 3 decimalen (≈ 100m precisie — goed genoeg voor gemeente/straat)
+  const cacheKey = `${parseFloat(lat).toFixed(3)},${parseFloat(lon).toFixed(3)}`;
+  if (_nominatimCache.has(cacheKey)) {
+    console.log(`🗺️  Nominatim cache hit voor ${cacheKey}`);
+    return _nominatimCache.get(cacheKey);
+  }
+
   try {
     console.log(`🗺️  Nominatim aanroep: lat=${lat}, lon=${lon}`);
     const url = `https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lon}&format=json&addressdetails=1`;
-    const resp = await fetch(url, {
-      headers: { 'User-Agent': 'ImmoScannerApp/1.0 (gilles@maisondw.be)' }
-    });
+    const resp = await _nominatimFetch(url);
     if (!resp.ok) {
       console.warn(`🗺️  Nominatim HTTP fout: ${resp.status} voor lat=${lat}, lon=${lon}`);
       return null;
@@ -211,20 +239,23 @@ async function reverseGeocode(lat, lon) {
     console.log(`🗺️  Nominatim resultaat: ${JSON.stringify(addr)}`);
     const postcode  = addr.postcode || null;
     const landcode  = addr.country_code?.toUpperCase() || 'BE';
-    // Gebruik city/town als primaire gemeente (= officiële hoofdgemeente)
-    // village/suburb kan een deelgemeente zijn
     const deelgemeente = addr.village || addr.suburb || null;
     const hoofdstad    = addr.city || addr.town || addr.municipality || null;
     const straat = addr.road || addr.pedestrian || addr.square || addr.path || null;
 
-    return {
+    const resultaat = {
       straat,
-      gemeente:    deelgemeente || hoofdstad,   // voor weergave
+      gemeente:      deelgemeente || hoofdstad,
       hoofdgemeente: hoofdstad?.toLowerCase() || deelgemeente?.toLowerCase() || null,
       postcode,
       landcode,
-      volledig:    data.display_name
+      volledig:      data.display_name
     };
+
+    // Sla op in cache (max 200 entries om geheugen te beperken)
+    if (_nominatimCache.size >= 200) _nominatimCache.delete(_nominatimCache.keys().next().value);
+    _nominatimCache.set(cacheKey, resultaat);
+    return resultaat;
   } catch (e) {
     console.warn('Nominatim fout:', e.message);
     return null;
@@ -573,28 +604,36 @@ async function ontdekMakelaarUrls(domein) {
 async function verrijkListingAdressen(listings, hoofdgemeente, postcode, straatGps) {
   if (!listings || listings.length === 0) return listings;
 
-  // Filter: enkel listings zonder adres die mogelijk in het juiste gebied liggen
-  const gem = (hoofdgemeente || '').toLowerCase();
+  const gem = (hoofdgemeente || '').toLowerCase().replace(/\s+/g, '-');
   const pc  = (postcode || '').toString();
 
-  // Verrijk alle listings zonder adres — we beperken ons niet langer tot listings
-  // waarvan gemeente/postcode in de URL staat. Sommige makelaars gebruiken
-  // generieke URL-structuren (bv. /detail/7514688) zonder locatieinfo in de slug.
-  // We pakken de eerste 5 listings zonder adres en halen die detail-pagina op.
-  const kandidaten = listings.filter(l => {
-    if (l.address) return false; // al een adres, niets te doen
-    if (!l.url)    return false;
-    return true; // verrijk alles wat een URL heeft maar geen adres
-  }).slice(0, 10); // max 10 detail-pagina's ophalen
+  // Listings zonder adres opsplitsen in twee groepen:
+  //   1. "lokaal" — URL bevat de postcode of gemeente → waarschijnlijk juiste buurt
+  //   2. "overig" — URL heeft geen locatieinfo (bv. Tenerife, andere steden)
+  // We verrijken max 10 listings, maar geven "lokaal" prioriteit.
+  // Zo halen we de meest relevante detail-pagina's op en niet de alfabetisch eerste.
+  const zonderAdres = listings.filter(l => !l.address && l.url);
+
+  const isLokaal = (l) => {
+    const urlLow = (l.url || '').toLowerCase();
+    return (pc  && urlLow.includes(pc)) ||
+           (gem && gem.length > 2 && urlLow.includes(gem));
+  };
+
+  const lokaal = zonderAdres.filter(isLokaal);
+  const overig = zonderAdres.filter(l => !isLokaal(l));
+
+  // Neem tot 10: eerst lokale matches, dan overige als buffer
+  const kandidaten = [...lokaal, ...overig].slice(0, 10);
 
   if (kandidaten.length === 0) {
     console.log('📍 Geen kandidaat-listings om te verrijken (alles heeft al een adres)');
     return listings;
   }
 
-  console.log(`📍 Adres ophalen voor ${kandidaten.length} kandidaat-listings (postcode ${pc})...`);
+  console.log(`📍 Adres ophalen voor ${kandidaten.length} kandidaat-listings (${lokaal.length} lokaal, ${Math.max(0, kandidaten.length - lokaal.length)} overig) — postcode ${pc}, gemeente ${gem}`);
 
-  // Sequentieel ophalen om geheugen te sparen (Puppeteer kan zwaar zijn)
+  // Sequentieel ophalen om Render-geheugen te sparen
   for (const listing of kandidaten) {
     try {
       const adres = await fetchAdresVanListing(listing.url);
