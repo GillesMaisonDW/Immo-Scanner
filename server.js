@@ -618,7 +618,8 @@ async function searchMakelaar(makelaarNaam, listingType, gemeente, postcode, mak
   let match = null;
 
   for (const m of makelaars) {
-    const siteNorm   = normaliseer(m.domein.replace(/\.(be|com|nl)$/, ''));
+    // Strip alle bekende TLDs incl. .immo — anders matcht "jo.immo" op het woord "immo"
+    const siteNorm   = normaliseer(m.domein.replace(/\.(be|com|nl|immo|eu|net|org)$/, ''));
     const domeinClean = m.domein.replace('www.', '');
 
     // Match 1: website van bord = domein in database
