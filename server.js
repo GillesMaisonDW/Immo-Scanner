@@ -2008,8 +2008,14 @@ Geef het resultaat als JSON.`
         zoekduur_seconden:       parseFloat(zoekduur)
       }).select('id').single();
 
-      if (error) console.error('Supabase schrijffout:', error.message);
-      else scanId = dbData?.id;
+      if (error) {
+        // Volledige fout loggen zodat de oorzaak zichtbaar is in Render logs
+        console.error('🔴 Supabase schrijffout:', JSON.stringify(error));
+        console.error('🔴 Supabase fout details — code:', error.code, '| hint:', error.hint, '| details:', error.details);
+      } else {
+        scanId = dbData?.id;
+        console.log('💾 Scan opgeslagen in Supabase, id:', scanId);
+      }
     }
 
     return res.json({ ...result, scan_id: scanId });
@@ -2017,6 +2023,31 @@ Geef het resultaat als JSON.`
   } catch (err) {
     console.error('Server fout:', err);
     return res.status(500).json({ error: 'Server fout: ' + err.message });
+  }
+});
+
+// ── /api/supabase-check ───────────────────────────────────────────
+// Snel diagnose-endpoint: controleer of Supabase verbonden is en een test-insert werkt.
+// Gebruik: open https://immo-scanner-7g6d.onrender.com/api/supabase-check in browser
+app.get('/api/supabase-check', async (req, res) => {
+  if (!supabase) return res.json({ ok: false, reden: 'SUPABASE_ANON_KEY niet ingesteld' });
+  try {
+    // Doe een leesopdracht op de scans tabel — als dit lukt is de verbinding ok
+    const { data, error } = await supabase.from('scans').select('id').limit(1);
+    if (error) return res.json({ ok: false, reden: 'Leestest mislukt', fout: error.message, code: error.code });
+    // Doe een test-insert met minimale data
+    const { data: ins, error: insErr } = await supabase.from('scans').insert({
+      makelaar: '_test_',
+      status:   'niet_gevonden',
+      gps_beschikbaar: false,
+      zoekduur_seconden: 0
+    }).select('id').single();
+    if (insErr) return res.json({ ok: false, reden: 'Test-insert mislukt', fout: insErr.message, code: insErr.code, hint: insErr.hint });
+    // Test-rij meteen verwijderen
+    await supabase.from('scans').delete().eq('id', ins.id);
+    return res.json({ ok: true, bericht: 'Supabase verbinding en insert werken correct ✅' });
+  } catch (e) {
+    return res.json({ ok: false, reden: 'Onverwachte fout', fout: e.message });
   }
 });
 
