@@ -608,6 +608,27 @@ function showResult(r) {
         </div>
         <div class="result-body">
           <div class="result-row"><span class="rr-icon">📍</span><div><div class="rr-label">Adres</div><div class="rr-value">${r.adres || 'Niet bepaald'}</div></div></div>
+          ${(function(){
+            const vm = r.visuele_match;
+            if (!vm || vm === 'niet_gecontroleerd') return '';
+            const cfg = {
+              bevestigd: { icon:'✅', kleur:'#1E7B4B', bg:'#D9F0E3', label:'Gebouw visueel bevestigd' },
+              onzeker:   { icon:'🔍', kleur:'#856404', bg:'#FFF9E6', label:'Gebouw onzeker (bord dekt gevel)' },
+              twijfel:   { icon:'⚠️', kleur:'#C0392B', bg:'#FDEDED', label:'Gebouw mogelijk verkeerd' }
+            }[vm] || { icon:'—', kleur:'#7F8C8D', bg:'#F4F6F9', label: vm };
+            return `<div class="result-row">
+              <span class="rr-icon">🖼️</span>
+              <div>
+                <div class="rr-label">Visuele check</div>
+                <div class="rr-value">
+                  <span style="display:inline-flex;align-items:center;gap:6px;background:${cfg.bg};color:${cfg.kleur};padding:4px 10px;border-radius:20px;font-weight:600;font-size:13px;">
+                    ${cfg.icon} ${cfg.label}
+                  </span>
+                  ${r.visuele_match_reden ? `<div style="margin-top:4px;font-size:12px;color:var(--mid-grey);font-style:italic;">${r.visuele_match_reden}</div>` : ''}
+                </div>
+              </div>
+            </div>`;
+          })()}
           ${r.slaapkamers ? `<div class="result-row"><span class="rr-icon">🛏</span><div><div class="rr-label">Slaapkamers</div><div class="rr-value">${r.slaapkamers}</div></div></div>` : ''}
           ${r.oppervlakte ? `<div class="result-row"><span class="rr-icon">📐</span><div><div class="rr-label">Oppervlakte</div><div class="rr-value">${r.oppervlakte}</div></div></div>` : ''}
           <div class="result-row"><span class="rr-icon">🔧</span><div><div class="rr-label">Staat</div><div class="rr-value">${r.staat || 'Onbekend'}</div></div></div>
