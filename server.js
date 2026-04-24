@@ -56,38 +56,65 @@ function _deepFind(obj, sleutel, maxDiepte = 8) {
   return undefined;
 }
 
-function _extractAdresUitHtml(html, urlLabel) {
+// Extraheert adres, prijs, slaapkamers en oppervlakte uit HTML van een detailpagina.
+// Retourneert { adres, prijs, slaapkamers, oppervlakte } — velden kunnen null zijn.
+// Probeert achtereenvolgens: JSON-LD → og:title → __NEXT_DATA__ → regex.
+function _extractDetailsUitHtml(html, urlLabel) {
+  let adres = null, prijs = null, slaapkamers = null, oppervlakte = null;
+
   // Methode 1: JSON-LD structured data — diepte-zoekactie
   // Werkt voor elke site die schema.org gebruikt, ongeacht nestniveau.
-  // Meeste professionele makelaarsites doen dit voor SEO (Google vereist het).
   const jsonldRegex = /<script[^>]*type="application\/ld\+json"[^>]*>([\s\S]*?)<\/script>/gi;
   let jm;
   while ((jm = jsonldRegex.exec(html)) !== null) {
     try {
       const ld = JSON.parse(jm[1]);
-      const straat   = _deepFind(ld, 'streetAddress');
-      const postcode = _deepFind(ld, 'postalCode');
-      const regio    = _deepFind(ld, 'addressRegion');
-      if (straat && typeof straat === 'string' && straat.length > 3) {
-        // Bouw adres: "Rechtstraat 65A, 9080 Lochristi"
-        const delen = [straat.trim()];
-        if (postcode || regio) delen.push([postcode, regio].filter(Boolean).join(' '));
-        const resultaat = delen.join(', ');
-        console.log(`📍 Adres via JSON-LD (${urlLabel}): ${resultaat}`);
-        return resultaat;
+      // Adres
+      if (!adres) {
+        const straat   = _deepFind(ld, 'streetAddress');
+        const postcode = _deepFind(ld, 'postalCode');
+        const regio    = _deepFind(ld, 'addressRegion');
+        if (straat && typeof straat === 'string' && straat.length > 3) {
+          const delen = [straat.trim()];
+          if (postcode || regio) delen.push([postcode, regio].filter(Boolean).join(' '));
+          adres = delen.join(', ');
+          console.log(`📍 Adres via JSON-LD (${urlLabel}): ${adres}`);
+        }
+      }
+      // Prijs
+      if (!prijs) {
+        const prijsRaw = _deepFind(ld, 'price');
+        if (prijsRaw != null) {
+          const p = parseFloat(String(prijsRaw).replace(/[^\d.,]/g, '').replace(',', '.'));
+          if (!isNaN(p) && p > 10000) prijs = `€ ${Math.round(p).toLocaleString('nl-BE')}`;
+        }
+      }
+      // Slaapkamers (numberOfBedrooms heeft voorkeur boven numberOfRooms)
+      if (!slaapkamers) {
+        const kamers = _deepFind(ld, 'numberOfBedrooms') || _deepFind(ld, 'numberOfRooms');
+        if (kamers != null) slaapkamers = parseInt(kamers) || null;
+      }
+      // Oppervlakte
+      if (!oppervlakte) {
+        const vloer = _deepFind(ld, 'floorSize');
+        if (vloer != null) {
+          const m2 = typeof vloer === 'object' ? (vloer.value ?? vloer) : vloer;
+          oppervlakte = parseFloat(m2) || null;
+        }
       }
     } catch {}
   }
 
   // Methode 2: meta og:title (bv. "Woning Te koop - Rechtstraat 65A, 9080 Lochristi")
-  const ogTitleMatch = html.match(/<meta[^>]*(?:name|property)="og:title"[^>]*content="([^"]+)"/i)
-    || html.match(/<meta[^>]*content="([^"]+)"[^>]*(?:name|property)="og:title"/i);
-  if (ogTitleMatch) {
-    // Patroon: "... - Straatnaam Huisnummer, Postcode Gemeente"
-    const adresMatch = ogTitleMatch[1].match(/[-–]\s*([A-Z][^,]{4,50},\s*\d{4}\s+\S[^"]{2,40})/);
-    if (adresMatch) {
-      console.log(`📍 Adres via og:title (${urlLabel}): ${adresMatch[1].trim()}`);
-      return adresMatch[1].trim();
+  if (!adres) {
+    const ogTitleMatch = html.match(/<meta[^>]*(?:name|property)="og:title"[^>]*content="([^"]+)"/i)
+      || html.match(/<meta[^>]*content="([^"]+)"[^>]*(?:name|property)="og:title"/i);
+    if (ogTitleMatch) {
+      const adresMatch = ogTitleMatch[1].match(/[-–]\s*([A-Z][^,]{4,50},\s*\d{4}\s+\S[^"]{2,40})/);
+      if (adresMatch) {
+        adres = adresMatch[1].trim();
+        console.log(`📍 Adres via og:title (${urlLabel}): ${adres}`);
+      }
     }
   }
 
@@ -95,44 +122,96 @@ function _extractAdresUitHtml(html, urlLabel) {
   const nextMatch = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
   if (nextMatch) {
     try {
-      const nd = JSON.parse(nextMatch[1]);
+      const nd   = JSON.parse(nextMatch[1]);
       const pp   = nd?.props?.pageProps || {};
       const prop = pp.property || pp.listing || pp.classified || pp.result || {};
-      const loc  = prop.location || prop.address || {};
-      const straat   = loc.street || loc.streetAddress || loc.straat || null;
-      const nr       = loc.number || loc.houseNumber || '';
-      const gemeente = loc.locality || loc.city || loc.gemeente || '';
-      if (straat) {
-        const adres = [straat, nr].filter(Boolean).join(' ').trim();
-        console.log(`📍 Adres via __NEXT_DATA__ (${urlLabel}): ${adres}, ${gemeente}`);
-        return gemeente ? `${adres}, ${gemeente}` : adres;
+      // Adres
+      if (!adres) {
+        const loc      = prop.location || prop.address || {};
+        const straat   = loc.street || loc.streetAddress || loc.straat || null;
+        const nr       = loc.number || loc.houseNumber || '';
+        const gemeente = loc.locality || loc.city || loc.gemeente || '';
+        if (straat) {
+          const a = [straat, nr].filter(Boolean).join(' ').trim();
+          adres = gemeente ? `${a}, ${gemeente}` : a;
+          console.log(`📍 Adres via __NEXT_DATA__ (${urlLabel}): ${adres}`);
+        }
+      }
+      // Prijs
+      if (!prijs) {
+        const p = prop.price?.value ?? prop.price ?? prop.asking_price ?? null;
+        if (p != null) {
+          const val = parseFloat(String(p).replace(/[^\d.,]/g, '').replace(',', '.'));
+          if (!isNaN(val) && val > 10000) prijs = `€ ${Math.round(val).toLocaleString('nl-BE')}`;
+        }
+      }
+      // Slaapkamers
+      if (!slaapkamers) {
+        slaapkamers = parseInt(prop.bedroomCount || prop.bedrooms || prop.slaapkamers) || null;
+      }
+      // Oppervlakte
+      if (!oppervlakte) {
+        oppervlakte = parseFloat(prop.surface || prop.area || prop.floorSize?.value) || null;
       }
     } catch {}
   }
 
-  // Methode 4: Regex patronen
-  const adresPatterns = [
-    /"streetAddress"\s*:\s*"([^"]{5,80})"/i,
-    /"adres"\s*:\s*"([^"]{5,80})"/i,
-    /"address"\s*:\s*"([^"]{5,80})"/i,
-    /<[^>]*class="[^"]*(?:adres|address|location|locatie)[^"]*"[^>]*>\s*([A-Z][^<]{4,60})</i,
-  ];
-  for (const pattern of adresPatterns) {
-    const match = html.match(pattern);
-    if (match) {
-      console.log(`📍 Adres via regex (${urlLabel}): ${match[1].trim()}`);
-      return match[1].trim();
+  // Methode 4: Adres via regex
+  if (!adres) {
+    const adresPatterns = [
+      /"streetAddress"\s*:\s*"([^"]{5,80})"/i,
+      /"adres"\s*:\s*"([^"]{5,80})"/i,
+      /"address"\s*:\s*"([^"]{5,80})"/i,
+      /<[^>]*class="[^"]*(?:adres|address|location|locatie)[^"]*"[^>]*>\s*([A-Z][^<]{4,60})</i,
+    ];
+    for (const pattern of adresPatterns) {
+      const match = html.match(pattern);
+      if (match) {
+        adres = match[1].trim();
+        console.log(`📍 Adres via regex (${urlLabel}): ${adres}`);
+        break;
+      }
     }
   }
 
-  return null;
+  // Methode 5: Prijs via regex (als nog niet gevonden via JSON-LD / __NEXT_DATA__)
+  if (!prijs) {
+    // Zoek naar patronen zoals "price":295000 of € 295.000 of "prijs":295000
+    const prijsPatterns = [
+      /"price"\s*:\s*(\d{5,7})/i,
+      /"prijs"\s*:\s*(\d{5,7})/i,
+      /"asking_price"\s*:\s*(\d{5,7})/i,
+      /"amount"\s*:\s*(\d{5,7})/i,
+    ];
+    for (const p of prijsPatterns) {
+      const m = html.match(p);
+      if (m) {
+        const val = parseInt(m[1]);
+        if (val > 10000) { prijs = `€ ${val.toLocaleString('nl-BE')}`; break; }
+      }
+    }
+  }
+
+  if (prijs)       console.log(`💰 Prijs via detailpagina (${urlLabel}): ${prijs}`);
+  if (slaapkamers) console.log(`🛏️  Slaapkamers (${urlLabel}): ${slaapkamers}`);
+  if (oppervlakte) console.log(`📐 Oppervlakte (${urlLabel}): ${oppervlakte}m²`);
+
+  return { adres, prijs, slaapkamers, oppervlakte };
 }
 
-async function fetchAdresVanListing(url) {
-  if (!url) return null;
+// Wrapper voor backward-compat: retourneert enkel het adres (string of null).
+function _extractAdresUitHtml(html, urlLabel) {
+  return _extractDetailsUitHtml(html, urlLabel).adres;
+}
+
+// Haalt volledige details op van een listing detailpagina:
+// adres, prijs, slaapkamers en oppervlakte uit JSON-LD / __NEXT_DATA__ / regex.
+// Retourneert { adres, prijs, slaapkamers, oppervlakte } — velden kunnen null zijn.
+async function fetchDetailVanListing(url) {
+  if (!url) return { adres: null, prijs: null, slaapkamers: null, oppervlakte: null };
   try {
+    const label = url.split('/').slice(-2).join('/');
     // Eerste poging: directe fetch — JSON-LD is server-side rendered op de meeste sites.
-    // Puppeteer is hier NIET nodig voor structuurdata; dat spaart geheugen op Render.
     const directResp = await fetch(url, {
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
@@ -143,21 +222,27 @@ async function fetchAdresVanListing(url) {
     });
     if (directResp.ok) {
       const html = await directResp.text();
-      const adres = _extractAdresUitHtml(html, url.split('/').slice(-2).join('/'));
-      if (adres) return adres;
+      const detail = _extractDetailsUitHtml(html, label);
+      if (detail.adres) return detail; // adres gevonden — prijs enz. meegestuurd
       console.log(`⚠️  Geen adres via directe fetch voor ${url} — Puppeteer proberen`);
     }
 
     // Tweede poging: Puppeteer (voor volledig client-side rendered detail pagina's)
     const renderedHtml = await fetchWithPuppeteer(url, 15000);
-    if (!renderedHtml) return null;
-    const adres = _extractAdresUitHtml(renderedHtml, url.split('/').slice(-2).join('/') + ' (Puppeteer)');
-    if (!adres) console.log('⚠️ Geen adres gevonden op detailpagina:', url);
-    return adres;
+    if (!renderedHtml) return { adres: null, prijs: null, slaapkamers: null, oppervlakte: null };
+    const detail = _extractDetailsUitHtml(renderedHtml, label + ' (Puppeteer)');
+    if (!detail.adres) console.log('⚠️ Geen adres gevonden op detailpagina:', url);
+    return detail;
   } catch (e) {
-    console.warn('fetchAdresVanListing fout:', e.message);
-    return null;
+    console.warn('fetchDetailVanListing fout:', e.message);
+    return { adres: null, prijs: null, slaapkamers: null, oppervlakte: null };
   }
+}
+
+// Backward-compat wrapper: retourneert enkel het adres als string (of null).
+async function fetchAdresVanListing(url) {
+  const detail = await fetchDetailVanListing(url);
+  return detail.adres;
 }
 
 // ── Visuele gebouwbevestiging ─────────────────────────────────────
@@ -2107,11 +2192,30 @@ Geef het resultaat als JSON.`
       }
     }
 
-    // ── Adres ophalen van de listing detailpagina ────────────────
+    // ── Details ophalen van de listing detailpagina ──────────────
+    // Haalt adres, prijs, slaapkamers en oppervlakte rechtstreeks op van
+    // de makelaarsite — betrouwbaarder dan Claude's web_search (die soms
+    // Realo of andere aggregators vindt met verouderde/foute prijzen).
     let adresListing = null;
     if (result.url && result.status !== 'niet_gevonden') {
-      adresListing = await fetchAdresVanListing(result.url);
+      const detail = await fetchDetailVanListing(result.url);
+      adresListing = detail.adres || null;
       if (adresListing) console.log('📍 Adres van detailpagina:', adresListing);
+
+      // Overschrijf prijs/kamers/oppervlakte met data van makelaarsite zelf
+      // (enkel als de detailpagina een waarde geeft — anders Claude's resultaat behouden)
+      if (detail.prijs) {
+        console.log(`💰 Prijs overschreven: "${result.prijs}" → "${detail.prijs}" (bron: detailpagina)`);
+        result.prijs = detail.prijs;
+      }
+      if (detail.slaapkamers) {
+        console.log(`🛏️  Slaapkamers overschreven: ${result.slaapkamers} → ${detail.slaapkamers}`);
+        result.slaapkamers = detail.slaapkamers;
+      }
+      if (detail.oppervlakte) {
+        console.log(`📐 Oppervlakte overschreven: ${result.oppervlakte} → ${detail.oppervlakte}m²`);
+        result.oppervlakte = detail.oppervlakte;
+      }
     }
 
     // ── URL verificatie ──────────────────────────────────────────
