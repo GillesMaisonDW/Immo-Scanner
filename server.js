@@ -216,13 +216,14 @@ async function _geocodeViaPhoton(lat, lon) {
     const props = data?.features?.[0]?.properties;
     if (!props) return null;
 
-    const straat   = props.street || null;
-    const postcode = props.postcode || null;
-    const landcode = (props.countrycode || 'BE').toUpperCase();
-    const gemeente = props.city || props.town || props.village || props.municipality || null;
+    const straat      = props.street || null;
+    const huisnummer  = props.housenumber ? String(props.housenumber).trim() : null;
+    const postcode    = props.postcode || null;
+    const landcode    = (props.countrycode || 'BE').toUpperCase();
+    const gemeente    = props.city || props.town || props.village || props.municipality || null;
 
-    console.log(`🗺️  Photon resultaat: straat=${straat}, postcode=${postcode}, gemeente=${gemeente}`);
-    return { straat, gemeente, hoofdgemeente: gemeente?.toLowerCase() || null, postcode, landcode };
+    console.log(`🗺️  Photon resultaat: straat=${straat}, huisnummer=${huisnummer}, postcode=${postcode}, gemeente=${gemeente}`);
+    return { straat, huisnummer, gemeente, hoofdgemeente: gemeente?.toLowerCase() || null, postcode, landcode };
   } catch (e) {
     console.warn('🗺️  Photon fout:', e.message);
     return null;
@@ -287,8 +288,10 @@ async function _geocodeViaNominatim(lat, lon) {
     const deelgemeente = addr.village || addr.suburb || null;
     const hoofdstad    = addr.city || addr.town || addr.municipality || null;
     const straat       = addr.road || addr.pedestrian || addr.square || addr.path || null;
+    const huisnummer   = addr.house_number ? String(addr.house_number).trim() : null;
     return {
       straat,
+      huisnummer,
       gemeente:      deelgemeente || hoofdstad,
       hoofdgemeente: hoofdstad?.toLowerCase() || deelgemeente?.toLowerCase() || null,
       postcode,
@@ -298,6 +301,13 @@ async function _geocodeViaNominatim(lat, lon) {
     console.warn('🗺️  Nominatim fout:', e.message);
     return null;
   }
+}
+
+// Normaliseert huisnummers voor vergelijking: "65/A", "65 A", "65A" → "65a"
+// Zo matchen we ook als listing "Rechtstraat 65A" en GPS "65/A" teruggeeft.
+function _normaliseHuisnummer(tekst) {
+  if (!tekst) return '';
+  return String(tekst).toLowerCase().replace(/[\s\/\-]/g, '');
 }
 
 async function reverseGeocode(lat, lon) {
@@ -1320,8 +1330,13 @@ app.post('/api/scan', async (req, res) => {
       const geocodeLon = gps.property_lon || gps.lon;
       geocodeResultaat = await reverseGeocode(geocodeLat, geocodeLon);
     }
-    adresFoto = geocodeResultaat?.straat
-      ? `${geocodeResultaat.straat}, ${geocodeResultaat.gemeente || ''}`.trim().replace(/,$/, '')
+    // Bouw adresFoto: straat + huisnummer (indien bekend) + gemeente
+    // Bv. "Rechtstraat 65A, Lochristi" — huisnummer maakt het preciezer
+    const _straatMet = geocodeResultaat?.straat
+      ? [geocodeResultaat.straat, geocodeResultaat.huisnummer].filter(Boolean).join(' ')
+      : null;
+    adresFoto = _straatMet
+      ? `${_straatMet}, ${geocodeResultaat.gemeente || ''}`.trim().replace(/,$/, '')
       : null;
   }
 
@@ -1576,13 +1591,18 @@ Als je het niet kan vinden: RESULTAAT: {"naam": null, "website": null}`,
     // 1. Makelaar in DB  → altijd scrapen + verrijken, GPS helpt bij matching
     // 2. Niet in DB + GPS → web_search (Claude Sonnet zoekt zelf)
     // 3. Niet in DB + geen GPS → Immoweb fallback
-    const gpsStraat = geocodeResultaat?.straat || null;
+    const gpsStraat  = geocodeResultaat?.straat || null;
+    // gpsVolledigAdres = straat + huisnummer voor weergave aan Claude en web_search
+    // Als GPS geen huisnummer heeft, is dit gelijk aan gpsStraat
+    const gpsVolledigAdres = gpsStraat && geocodeResultaat?.huisnummer
+      ? `${gpsStraat} ${geocodeResultaat.huisnummer}`
+      : gpsStraat;
     let listings = [];
     let listingsBron = 'geen';
 
     if (makelaarInDB) {
       // Scraping is betrouwbaarder dan Google voor kleine makelaars
-      console.log(`🏢 SCRAPING: ${domeinMakelaar} in DB → scrapen${gpsStraat ? ` (GPS: "${gpsStraat}")` : ''}`);
+      console.log(`🏢 SCRAPING: ${domeinMakelaar} in DB → scrapen${gpsVolledigAdres ? ` (GPS: "${gpsVolledigAdres}")` : ''}`);
       listings = await searchMakelaar(
         bordInfo.makelaar,
         bordInfo.listing_type,
@@ -1601,13 +1621,34 @@ Als je het niet kan vinden: RESULTAAT: {"naam": null, "website": null}`,
         // teruggegeven als de gebruiker aan de Rechtstraat staat.
         // Claude wordt dan gedwongen web_search te gebruiken (ook op aggregators).
         if (gpsStraat) {
-          const straatLow = gpsStraat.toLowerCase();
+          const straatLow    = gpsStraat.toLowerCase();
+          const gpsNummer    = geocodeResultaat?.huisnummer || null;
+          const nummerNorm   = _normaliseHuisnummer(gpsNummer);
+
+          // Stap A: filter op straatnaam
           const straatMatches = listings.filter(l =>
             (l.address || '').toLowerCase().includes(straatLow)
           );
+
           if (straatMatches.length > 0) {
-            console.log(`✅ ${straatMatches.length} listing(s) matchen GPS-straat "${gpsStraat}" → alleen die doorgeven`);
-            listings = straatMatches;
+            if (gpsNummer && nummerNorm) {
+              // Stap B: als GPS ook een huisnummer geeft → exact filteren op nummer
+              const nummerMatches = straatMatches.filter(l =>
+                _normaliseHuisnummer(l.address || '').includes(nummerNorm)
+              );
+              if (nummerMatches.length > 0) {
+                console.log(`✅ ${nummerMatches.length} listing(s) matchen GPS-adres "${gpsStraat} ${gpsNummer}" (exact) → alleen die doorgeven`);
+                listings = nummerMatches;
+              } else {
+                // Nummer niet gevonden in listings → val terug op straat-only match
+                // (listings zijn al verrijkt maar nummer staat misschien anders geschreven)
+                console.log(`⚠️  Huisnummer "${gpsNummer}" niet exact gevonden → ${straatMatches.length} straat-match(es) doorgeven aan Claude`);
+                listings = straatMatches;
+              }
+            } else {
+              console.log(`✅ ${straatMatches.length} listing(s) matchen GPS-straat "${gpsStraat}" → alleen die doorgeven`);
+              listings = straatMatches;
+            }
           } else {
             console.log(`⚠️  Geen listing met straat "${gpsStraat}" na verrijking → listings leeggemaakt, web_search in stap 3`);
             listings = [];
@@ -1654,24 +1695,24 @@ Als je het niet kan vinden: RESULTAAT: {"naam": null, "website": null}`,
         'straat_geen_match':  `Scraping vond listings, maar geen enkele had adres "${gpsStraat}". Listing staat mogelijk niet op de overzichtspagina.`
       }[listingsBron] || '';
       listingsContext = `\n\n## WEB SEARCH VEREIST
-${gpsStraat ? `GPS-straatnaam: "${gpsStraat}"` : 'Geen GPS beschikbaar.'}
+${gpsVolledigAdres ? `GPS-adres: "${gpsVolledigAdres}"` : 'Geen GPS beschikbaar.'}
 Postcode: ${postcode} (dekt ${hoofdgemeente}${heeftDeelgemeente ? ` + ${deelgemeente}` : ''} en deelgemeentes)
 Makelaar: ${bordInfo.makelaar} (${domeinHint})
 Reden: ${waarom}
 
-Zoek via web_search — gebruik het STRAATNAAM + POSTCODE als primaire zoekopdracht:
-1. web_search: "${gpsStraat || postcode}" site:${domeinHint}
-2. Niets op makelaarssite? web_search: "${gpsStraat || postcode}" "${postcode}" ${bordInfo.listing_type}
+Zoek via web_search — gebruik het VOLLEDIG ADRES als primaire zoekopdracht:
+1. web_search: "${gpsVolledigAdres || postcode}" site:${domeinHint}
+2. Niets op makelaarssite? web_search: "${gpsVolledigAdres || postcode}" "${postcode}" ${bordInfo.listing_type}
 3. Controleer ALTIJD: het adres in de gevonden listing moet "${gpsStraat || postcode}" bevatten.
    Komt het adres niet overeen → gooi die URL weg en zoek verder.
 
 URL-prioriteit: makelaar-URL (${domeinHint}) > Immoscoop/Realo/Spotto > Immoweb.
-Aggregator-URL is beter dan geen URL — maar enkel als het adres klopt met de GPS-straat.\n`;
+Aggregator-URL is beter dan geen URL — maar enkel als het adres klopt met het GPS-adres.\n`;
     } else if (listings.length > 0) {
       // Listings beschikbaar via scraping of Immoweb
       listingsContext = `\n\n## LISTINGS (${listings.length} resultaten — bron: ${listingsBron})\n`;
-      if (gpsStraat) {
-        listingsContext += `GPS-straatnaam: "${gpsStraat}" — kies de listing met dit adres.\n\n`;
+      if (gpsVolledigAdres) {
+        listingsContext += `GPS-adres: "${gpsVolledigAdres}" — kies de listing met dit adres.\n\n`;
       } else {
         listingsContext += '\n';
       }
@@ -1692,7 +1733,7 @@ Aggregator-URL is beter dan geen URL — maar enkel als het adres klopt met de G
       // Geen listings gevonden via welk pad dan ook
       listingsContext = `\n\n## GEEN LISTINGS GEVONDEN
 Scraping én Immoweb leverden niets op.
-${gpsStraat ? `Probeer alsnog web_search: "${gpsStraat}" site:${domeinHint}` : 'Geen GPS beschikbaar.'}
+${gpsVolledigAdres ? `Probeer alsnog web_search: "${gpsVolledigAdres}" site:${domeinHint}` : 'Geen GPS beschikbaar.'}
 Als web_search ook niets oplevert: status "niet_gevonden", faal_categorie "SCRAPING_MISLUKT".\n`;
     }
 
