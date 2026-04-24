@@ -166,9 +166,11 @@ async function fetchAdresVanListing(url) {
 // Wordt alleen uitgevoerd als status "gevonden" is en er een listing-URL
 // beschikbaar is. Resultaat: "bevestigd" | "twijfel" | "niet_gecontroleerd"
 
-// Stap A: haal de hoofd-foto URL op van de listingpagina.
-// Probeert eerst og:image (meest betrouwbaar), dan JSON-LD image array.
-async function haalGevelFotoUrl(listingUrl) {
+// Stap A: haal meerdere foto-URLs op van de listingpagina (max 3).
+// Meer foto's = betere kans op een duidelijke gevelfoto.
+// Volgorde: og:image eerst (meestal hoofd-foto), daarna JSON-LD image array.
+async function haalListingFotos(listingUrl) {
+  const fotos = [];
   try {
     const resp = await fetch(listingUrl, {
       headers: {
@@ -178,36 +180,37 @@ async function haalGevelFotoUrl(listingUrl) {
       },
       signal: AbortSignal.timeout(8000)
     });
-    if (!resp.ok) return null;
+    if (!resp.ok) return fotos;
     const html = await resp.text();
 
-    // Methode 1: og:image — vrijwel altijd de hoofd-foto
+    // Methode 1: og:image — vrijwel altijd de hoofd/gevelfoto
     const ogMatch = html.match(/<meta[^>]*(?:property|name)="og:image"[^>]*content="([^"]+)"/i)
       || html.match(/<meta[^>]*content="([^"]+)"[^>]*(?:property|name)="og:image"/i);
-    if (ogMatch?.[1]) {
-      console.log(`🖼️  Gevelfoto via og:image: ${ogMatch[1].substring(0, 80)}...`);
-      return ogMatch[1];
-    }
+    if (ogMatch?.[1] && ogMatch[1].startsWith('http')) fotos.push(ogMatch[1]);
 
-    // Methode 2: JSON-LD image array
+    // Methode 2: JSON-LD image array — kan meerdere foto's bevatten
     const jsonldRegex = /<script[^>]*type="application\/ld\+json"[^>]*>([\s\S]*?)<\/script>/gi;
     let m;
-    while ((m = jsonldRegex.exec(html)) !== null) {
+    while ((m = jsonldRegex.exec(html)) !== null && fotos.length < 4) {
       try {
         const ld = JSON.parse(m[1]);
-        const img = ld.image || ld.photo;
-        if (typeof img === 'string' && img.startsWith('http')) return img;
-        if (Array.isArray(img) && img[0]) {
-          const eerste = typeof img[0] === 'string' ? img[0] : (img[0].url || img[0].contentUrl);
-          if (eerste?.startsWith('http')) return eerste;
+        const imgs = ld.image || ld.photo || [];
+        const lijst = Array.isArray(imgs) ? imgs : [imgs];
+        for (const img of lijst) {
+          const url = typeof img === 'string' ? img : (img?.url || img?.contentUrl);
+          if (url?.startsWith('http') && !fotos.includes(url)) fotos.push(url);
+          if (fotos.length >= 4) break;
         }
       } catch {}
     }
-    console.log('🖼️  Geen gevelfoto URL gevonden op', listingUrl);
-    return null;
+
+    // Dedupliceer en beperk tot 3
+    const uniek = [...new Set(fotos)].slice(0, 3);
+    console.log(`🖼️  ${uniek.length} listing-foto(s) gevonden voor visuele check`);
+    return uniek;
   } catch (e) {
-    console.warn('🖼️  haalGevelFotoUrl fout:', e.message);
-    return null;
+    console.warn('🖼️  haalListingFotos fout:', e.message);
+    return fotos;
   }
 }
 
@@ -235,63 +238,100 @@ async function haalAfbeeldingAlsBase64(url) {
   }
 }
 
-// Stap C: Claude vergelijkt het gebouw in beide foto's.
-// Gebruikt claude-haiku (snel + goedkoop) voor deze binaire ja/nee vraag.
+// Stap C: vergelijk bordenfoto met één listing-foto via Claude Haiku.
+// Geeft { match: "JA"|"NEE"|"ONZEKER", reden: string } terug.
+async function _eenFotoVergelijking(bordBase64, bordMime, listingFoto, pogingNr) {
+  const systeemPrompt = pogingNr === 1
+    // Eerste poging: focus op zichtbare delen ondanks bord op voorgrond
+    ? `Je vergelijkt twee foto's om te bepalen of ze hetzelfde gebouw tonen.
+Foto 1 = gsm-foto van een makelaarsbord. Het bord staat op de voorgrond maar het gebouw is (deels) zichtbaar op de achtergrond.
+Foto 2 = professionele listing-foto van het pand (gevelfoto).
+WERKWIJZE: kijk naar de zichtbare delen van het gebouw OP EN NAAST het bord in foto 1:
+  - Dakrand of dak boven het bord
+  - Zijgevels naast het bord
+  - Ramen boven of naast het bord
+  - Gevelbekleding (baksteen/bepleistering/hout) die zichtbaar is
+  - Gebouwvorm en verdiepingen
+Negeer: seizoen, lichtomstandigheden, auto's, beplanting.
+Antwoord ONZEKER enkel als het gebouw VOLLEDIG achter het bord verdwijnt en er NIETS te zien is.
+Antwoord ENKEL met deze JSON: {"match": "JA"|"NEE"|"ONZEKER", "reden": "max 12 woorden"}`
+    // Tweede poging (andere listing-foto): wat ruimere instructie
+    : `Je vergelijkt twee foto's om te bepalen of ze hetzelfde gebouw tonen.
+Foto 1 = gsm-foto van een makelaarsbord, gebouw op achtergrond.
+Foto 2 = een andere foto van hetzelfde pand.
+Let op: gevelkleur, gevelmateriaal, raamverdeling, daktype, gebouwvorm.
+Kijk ook naar details die gedeeltelijk zichtbaar zijn naast of boven het bord.
+Negeer: seizoen, lichtomstandigheden, beplanting, auto's.
+Antwoord ENKEL met deze JSON: {"match": "JA"|"NEE"|"ONZEKER", "reden": "max 12 woorden"}`;
+
+  const resp = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'Content-Type':      'application/json',
+      'x-api-key':         API_KEY,
+      'anthropic-version': '2023-06-01'
+    },
+    body: JSON.stringify({
+      model:       'claude-sonnet-4-6',
+      max_tokens:  150,
+      temperature: 0,
+      system:      systeemPrompt,
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'image', source: { type: 'base64', media_type: bordMime || 'image/jpeg', data: bordBase64 } },
+          { type: 'image', source: { type: 'base64', media_type: listingFoto.mime, data: listingFoto.data } },
+          { type: 'text', text: 'Zijn dit hetzelfde gebouw? Geef JSON.' }
+        ]
+      }]
+    }),
+    signal: AbortSignal.timeout(15000)
+  });
+
+  if (!resp.ok) throw new Error(`API fout ${resp.status}`);
+  const data = await resp.json();
+  const text = data.content?.find(b => b.type === 'text')?.text || '';
+  const jsonMatch = text.match(/\{[\s\S]*?\}/);
+  if (!jsonMatch) throw new Error('Geen JSON in response');
+  return JSON.parse(jsonMatch[0]);
+}
+
+// Stap C (hoofd): haalt listing-foto's op en vergelijkt met bordenfoto.
+// Als eerste foto ONZEKER geeft → automatisch tweede foto proberen.
 async function vergelijkGebouwen(bordBase64, bordMime, listingUrl) {
   try {
-    const fotoUrl = await haalGevelFotoUrl(listingUrl);
-    if (!fotoUrl) return { resultaat: 'niet_gecontroleerd', reden: 'Geen foto beschikbaar op listingpagina' };
-
-    const listingFoto = await haalAfbeeldingAlsBase64(fotoUrl);
-    if (!listingFoto) return { resultaat: 'niet_gecontroleerd', reden: 'Foto niet bereikbaar' };
-
-    const resp = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type':      'application/json',
-        'x-api-key':         API_KEY,
-        'anthropic-version': '2023-06-01'
-      },
-      body: JSON.stringify({
-        model:       'claude-haiku-4-5-20251001',
-        max_tokens:  100,
-        temperature: 0,
-        system: `Je vergelijkt twee foto's om te bepalen of ze hetzelfde gebouw tonen.
-Foto 1 = makelaarsbord in de straat (gsm-foto, bord op voorgrond, gebouw op achtergrond).
-Foto 2 = professionele listing-foto van het pand.
-Let ALLEEN op: gevelkleur, gevelmateriaal (baksteen/bepleistering/...), raamverdeling, daktype, gebouwvorm.
-Negeer: seizoen, lichtomstandigheden, camerahoek, beplanting, auto's.
-Als het gebouw op foto 1 slecht zichtbaar is (bord dekt gevel): antwoord "ONZEKER".
-Antwoord ENKEL met deze JSON, niets anders: {"match": "JA"|"NEE"|"ONZEKER", "reden": "max 12 woorden"}`,
-        messages: [{
-          role: 'user',
-          content: [
-            { type: 'image', source: { type: 'base64', media_type: bordMime || 'image/jpeg', data: bordBase64 } },
-            { type: 'image', source: { type: 'base64', media_type: listingFoto.mime, data: listingFoto.data } },
-            { type: 'text', text: 'Zijn dit hetzelfde gebouw? Geef JSON.' }
-          ]
-        }]
-      }),
-      signal: AbortSignal.timeout(15000)
-    });
-
-    if (!resp.ok) {
-      console.warn('🖼️  Visuele check API fout:', resp.status);
-      return { resultaat: 'niet_gecontroleerd', reden: 'API fout' };
+    const fotoUrls = await haalListingFotos(listingUrl);
+    if (fotoUrls.length === 0) {
+      return { resultaat: 'niet_gecontroleerd', reden: 'Geen foto beschikbaar op listingpagina' };
     }
 
-    const data = await resp.json();
-    const text = data.content?.find(b => b.type === 'text')?.text || '';
-    const jsonMatch = text.match(/\{[\s\S]*?\}/);
-    if (!jsonMatch) return { resultaat: 'niet_gecontroleerd', reden: 'Geen JSON in response' };
+    for (let i = 0; i < Math.min(fotoUrls.length, 3); i++) {
+      const listingFoto = await haalAfbeeldingAlsBase64(fotoUrls[i]);
+      if (!listingFoto) {
+        console.log(`🖼️  Foto ${i + 1} niet bereikbaar, volgende proberen...`);
+        continue;
+      }
 
-    const vgl = JSON.parse(jsonMatch[0]);
-    const resultaat = vgl.match === 'JA'     ? 'bevestigd'
-                    : vgl.match === 'NEE'    ? 'twijfel'
-                    : 'onzeker';
+      const vgl = await _eenFotoVergelijking(bordBase64, bordMime, listingFoto, i + 1);
+      const resultaat = vgl.match === 'JA'  ? 'bevestigd'
+                      : vgl.match === 'NEE' ? 'twijfel'
+                      : 'onzeker';
 
-    console.log(`🖼️  Visuele check: ${resultaat.toUpperCase()} — "${vgl.reden}"`);
-    return { resultaat, reden: vgl.reden, fotoUrl };
+      console.log(`🖼️  Visuele check (foto ${i + 1}/${fotoUrls.length}): ${resultaat.toUpperCase()} — "${vgl.reden}"`);
+
+      // Conclusief resultaat → meteen teruggeven
+      if (resultaat === 'bevestigd' || resultaat === 'twijfel') {
+        return { resultaat, reden: vgl.reden, fotoUrl: fotoUrls[i] };
+      }
+
+      // ONZEKER → volgende foto proberen als die beschikbaar is
+      if (i + 1 < fotoUrls.length) {
+        console.log(`🖼️  ONZEKER op foto ${i + 1} — volgende listing-foto proberen...`);
+      }
+    }
+
+    // Na alle foto's nog steeds ONZEKER
+    return { resultaat: 'onzeker', reden: 'Gebouw niet duidelijk zichtbaar op beschikbare foto\'s' };
 
   } catch (e) {
     console.warn('🖼️  vergelijkGebouwen fout:', e.message);
@@ -1711,17 +1751,41 @@ Als je het niet kan vinden: RESULTAAT: {"naam": null, "website": null}`,
       if (dbMatch) makelaarInDB = true;
     }
 
-    // Geen domein op bord → zoek via herkende naam
+    // Geen domein op bord → zoek via herkende naam (gescoorde matching)
+    // Zelfde TLD-stripping als searchMakelaar: .immo/.eu/.net etc. ook meenemen.
+    // Gescoord om false positives te vermijden (bv. "jo.immo" mag nooit matchen op "Immo-Home").
     if (!makelaarInDB && bordInfo.makelaar) {
       const naamLow = (bordInfo.makelaar || '').toLowerCase().replace(/[-\s]+/g, ' ').trim();
-      const gevondenM = allesMakelaars.find(m => {
-        const siteBase = m.domein.replace(/\.(be|com|nl)$/, '').replace('www.', '').toLowerCase();
-        return naamLow.includes(siteBase) || siteBase.includes(naamLow.split(' ')[0]);
-      });
-      if (gevondenM) {
-        domeinMakelaar = gevondenM.domein.replace('www.', '');
+      const naamCompact = naamLow.replace(/\s/g, ''); // "immo home" → "immohome"
+
+      let besteMatch = null;
+      let besteScore = 0;
+
+      for (const m of allesMakelaars) {
+        // Strip alle TLDs inclusief .immo — anders matcht "jo.immo" op het woord "immo"
+        const siteBase = m.domein
+          .replace(/\.(be|com|nl|immo|eu|net|org|vlaanderen)$/, '')
+          .replace('www.', '')
+          .toLowerCase()
+          .replace(/[-_]/g, ' ')
+          .trim();
+
+        if (siteBase.length < 3) continue; // te kort voor betekenisvolle match
+
+        const siteCompact = siteBase.replace(/\s/g, '');
+        let score = 0;
+        if (naamLow === siteBase)                                  score = 10; // exacte match
+        else if (naamCompact === siteCompact)                      score = 9;  // exact zonder spaties/koppeltekens
+        else if (naamLow.includes(siteBase) && siteBase.length >= 5) score = 7; // naam bevat siteBase (min 5 tekens)
+        else if (siteBase.includes(naamLow) && naamLow.length >= 5)  score = 7; // siteBase bevat naam
+
+        if (score > besteScore) { besteScore = score; besteMatch = m; }
+      }
+
+      if (besteMatch && besteScore >= 7) {
+        domeinMakelaar = besteMatch.domein.replace('www.', '');
         makelaarInDB = true;
-        console.log(`🔗 Domein-fallback: "${bordInfo.makelaar}" → ${domeinMakelaar} (uit Supabase)`);
+        console.log(`🔗 Domein-fallback: "${bordInfo.makelaar}" → ${domeinMakelaar} (score: ${besteScore})`);
       }
     }
 
