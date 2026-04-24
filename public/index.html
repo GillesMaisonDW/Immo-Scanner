@@ -280,16 +280,16 @@
 
       <input type="file" id="camera-input"  accept="image/*" capture="environment" onchange="photoSelected(this)">
       <input type="file" id="upload-input" accept="image/*" onchange="photoSelected(this)">
-      <button class="btn btn-orange" onclick="startKompas(); startGPS(); document.getElementById('camera-input').click()">
+      <button class="btn btn-orange" onclick="document.getElementById('camera-input').click(); startKompas(); ensureGPS();">
         📷 Foto nemen
       </button>
-      <button class="btn btn-outline" style="margin-top:10px;" onclick="startGPS(); document.getElementById('upload-input').click()">
+      <button class="btn btn-outline" style="margin-top:10px;" onclick="document.getElementById('upload-input').click(); ensureGPS();">
         🖼️ Foto uploaden uit galerij
       </button>
 
       <div id="gps-pill" class="gps-pill waiting">
         <div class="gps-dot"></div>
-        <span id="gps-text">Tik op foto nemen voor GPS</span>
+        <span id="gps-text">GPS wordt opgehaald...</span>
       </div>
 
       <div id="gps-warning" style="display:none; margin-top:12px; background:#FFF3CD; border:1px solid #F0C040; border-radius:10px; padding:10px 14px; font-size:12px; color:#856404; text-align:left; line-height:1.5;">
@@ -445,6 +445,16 @@ function startKompas() {
 }
 
 // ── GPS ──────────────────────────────────
+// ensureGPS: start GPS slechts één keer op — veilig vanuit knop-onclick.
+// De file-input .click() staat altijd VOOR ensureGPS() zodat de browser
+// de file-picker nooit kan blokkeren vanwege een GPS-dialoog.
+let _gpsStarted = false;
+function ensureGPS() {
+  if (_gpsStarted) return;
+  _gpsStarted = true;
+  startGPS();
+}
+
 function startGPS() {
   const pill = document.getElementById('gps-pill');
   const text = document.getElementById('gps-text');
@@ -478,12 +488,24 @@ function startGPS() {
       text.textContent = `GPS actief · ±${currentGPS.accuracy}m${kompasInfo}`;
       warn.style.display = 'none';
     },
-    () => {
-      pill.className = 'gps-pill error';
-      text.textContent = 'GPS geweigerd';
-      warn.style.display = 'block';
+    (err) => {
+      // Onderscheid tussen bewuste weigering (code 1) en tijdelijke fout (code 2/3)
+      // Code 3 = TIMEOUT — dit gebeurt wanneer de camera of galerij open staat,
+      // de pagina verliest focus en de GPS-request loopt af. Dat is geen echte weigering.
+      if (err.code === 1) {
+        // Echte weigering door gebruiker
+        pill.className = 'gps-pill error';
+        text.textContent = 'GPS geweigerd';
+        warn.style.display = 'block';
+      } else {
+        // Timeout of tijdelijk niet beschikbaar — stil falen, app werkt gewoon verder
+        pill.className = 'gps-pill waiting';
+        text.textContent = 'GPS niet beschikbaar';
+        // Geen warning tonen — gebruiker hoeft dit niet te zien, kan manueel adres invullen
+        _gpsStarted = false; // toestaan om opnieuw te proberen
+      }
     },
-    { enableHighAccuracy: true, timeout: 10000 }
+    { enableHighAccuracy: true, timeout: 10000, maximumAge: 60000 }
   );
 }
 
@@ -738,8 +760,9 @@ function newScan() {
   const pill = document.getElementById('gps-pill');
   const text = document.getElementById('gps-text');
   pill.className = 'gps-pill waiting';
-  text.textContent = 'Tik op foto nemen voor GPS';
+  text.textContent = 'GPS wordt opgehaald...';
   currentGPS = null;
+  _gpsStarted = false; // zodat GPS opnieuw start bij volgende foto
   // Reset adres input
   const adresInput = document.getElementById('adres-input');
   if (adresInput) { adresInput.value = ''; adresInput.style.borderColor = '#D0D8E4'; }
