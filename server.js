@@ -160,6 +160,145 @@ async function fetchAdresVanListing(url) {
   }
 }
 
+// ── Visuele gebouwbevestiging ─────────────────────────────────────
+// Vergelijkt de bordenfoto (van de gebruiker) met de hoofd-foto van de
+// gevonden listing om te bevestigen dat het om hetzelfde gebouw gaat.
+// Wordt alleen uitgevoerd als status "gevonden" is en er een listing-URL
+// beschikbaar is. Resultaat: "bevestigd" | "twijfel" | "niet_gecontroleerd"
+
+// Stap A: haal de hoofd-foto URL op van de listingpagina.
+// Probeert eerst og:image (meest betrouwbaar), dan JSON-LD image array.
+async function haalGevelFotoUrl(listingUrl) {
+  try {
+    const resp = await fetch(listingUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'nl-BE,nl;q=0.9,en;q=0.8'
+      },
+      signal: AbortSignal.timeout(8000)
+    });
+    if (!resp.ok) return null;
+    const html = await resp.text();
+
+    // Methode 1: og:image — vrijwel altijd de hoofd-foto
+    const ogMatch = html.match(/<meta[^>]*(?:property|name)="og:image"[^>]*content="([^"]+)"/i)
+      || html.match(/<meta[^>]*content="([^"]+)"[^>]*(?:property|name)="og:image"/i);
+    if (ogMatch?.[1]) {
+      console.log(`🖼️  Gevelfoto via og:image: ${ogMatch[1].substring(0, 80)}...`);
+      return ogMatch[1];
+    }
+
+    // Methode 2: JSON-LD image array
+    const jsonldRegex = /<script[^>]*type="application\/ld\+json"[^>]*>([\s\S]*?)<\/script>/gi;
+    let m;
+    while ((m = jsonldRegex.exec(html)) !== null) {
+      try {
+        const ld = JSON.parse(m[1]);
+        const img = ld.image || ld.photo;
+        if (typeof img === 'string' && img.startsWith('http')) return img;
+        if (Array.isArray(img) && img[0]) {
+          const eerste = typeof img[0] === 'string' ? img[0] : (img[0].url || img[0].contentUrl);
+          if (eerste?.startsWith('http')) return eerste;
+        }
+      } catch {}
+    }
+    console.log('🖼️  Geen gevelfoto URL gevonden op', listingUrl);
+    return null;
+  } catch (e) {
+    console.warn('🖼️  haalGevelFotoUrl fout:', e.message);
+    return null;
+  }
+}
+
+// Stap B: foto ophalen als base64 voor de Claude API.
+async function haalAfbeeldingAlsBase64(url) {
+  try {
+    const resp = await fetch(url, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' },
+      signal: AbortSignal.timeout(7000)
+    });
+    if (!resp.ok) return null;
+    const contentType = resp.headers.get('content-type') || 'image/jpeg';
+    const mime = contentType.split(';')[0].trim();
+    if (!mime.startsWith('image/')) return null;
+    const buffer = await resp.arrayBuffer();
+    // Max ~4MB — grotere afbeeldingen afwijzen om Render-geheugen te sparen
+    if (buffer.byteLength > 4 * 1024 * 1024) {
+      console.warn('🖼️  Afbeelding te groot voor visuele check:', buffer.byteLength, 'bytes');
+      return null;
+    }
+    return { data: Buffer.from(buffer).toString('base64'), mime };
+  } catch (e) {
+    console.warn('🖼️  haalAfbeeldingAlsBase64 fout:', e.message);
+    return null;
+  }
+}
+
+// Stap C: Claude vergelijkt het gebouw in beide foto's.
+// Gebruikt claude-haiku (snel + goedkoop) voor deze binaire ja/nee vraag.
+async function vergelijkGebouwen(bordBase64, bordMime, listingUrl) {
+  try {
+    const fotoUrl = await haalGevelFotoUrl(listingUrl);
+    if (!fotoUrl) return { resultaat: 'niet_gecontroleerd', reden: 'Geen foto beschikbaar op listingpagina' };
+
+    const listingFoto = await haalAfbeeldingAlsBase64(fotoUrl);
+    if (!listingFoto) return { resultaat: 'niet_gecontroleerd', reden: 'Foto niet bereikbaar' };
+
+    const resp = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type':      'application/json',
+        'x-api-key':         API_KEY,
+        'anthropic-version': '2023-06-01'
+      },
+      body: JSON.stringify({
+        model:       'claude-haiku-4-5-20251001',
+        max_tokens:  100,
+        temperature: 0,
+        system: `Je vergelijkt twee foto's om te bepalen of ze hetzelfde gebouw tonen.
+Foto 1 = makelaarsbord in de straat (gsm-foto, bord op voorgrond, gebouw op achtergrond).
+Foto 2 = professionele listing-foto van het pand.
+Let ALLEEN op: gevelkleur, gevelmateriaal (baksteen/bepleistering/...), raamverdeling, daktype, gebouwvorm.
+Negeer: seizoen, lichtomstandigheden, camerahoek, beplanting, auto's.
+Als het gebouw op foto 1 slecht zichtbaar is (bord dekt gevel): antwoord "ONZEKER".
+Antwoord ENKEL met deze JSON, niets anders: {"match": "JA"|"NEE"|"ONZEKER", "reden": "max 12 woorden"}`,
+        messages: [{
+          role: 'user',
+          content: [
+            { type: 'image', source: { type: 'base64', media_type: bordMime || 'image/jpeg', data: bordBase64 } },
+            { type: 'image', source: { type: 'base64', media_type: listingFoto.mime, data: listingFoto.data } },
+            { type: 'text', text: 'Zijn dit hetzelfde gebouw? Geef JSON.' }
+          ]
+        }]
+      }),
+      signal: AbortSignal.timeout(15000)
+    });
+
+    if (!resp.ok) {
+      console.warn('🖼️  Visuele check API fout:', resp.status);
+      return { resultaat: 'niet_gecontroleerd', reden: 'API fout' };
+    }
+
+    const data = await resp.json();
+    const text = data.content?.find(b => b.type === 'text')?.text || '';
+    const jsonMatch = text.match(/\{[\s\S]*?\}/);
+    if (!jsonMatch) return { resultaat: 'niet_gecontroleerd', reden: 'Geen JSON in response' };
+
+    const vgl = JSON.parse(jsonMatch[0]);
+    const resultaat = vgl.match === 'JA'     ? 'bevestigd'
+                    : vgl.match === 'NEE'    ? 'twijfel'
+                    : 'onzeker';
+
+    console.log(`🖼️  Visuele check: ${resultaat.toUpperCase()} — "${vgl.reden}"`);
+    return { resultaat, reden: vgl.reden, fotoUrl };
+
+  } catch (e) {
+    console.warn('🖼️  vergelijkGebouwen fout:', e.message);
+    return { resultaat: 'niet_gecontroleerd', reden: e.message };
+  }
+}
+
 // ── Postcode → officiële hoofdgemeente via Nominatim ─────────────
 // Werkt voor BE, NL, DE, FR, ... — geen hardcoded mapping nodig.
 // Cache om herhaalde lookups te vermijden.
@@ -679,20 +818,20 @@ async function ontdekMakelaarUrls(domein) {
 // ── Adres-verrijking van kandidaat-listings ───────────────────────
 // Listings van makelaarssites bevatten vaak enkel een URL — geen
 // straatnaam. Zonder straatnaam kan Claude niet matchen op GPS-locatie.
-// Deze functie haalt de detailpagina op van kandidaat-listings die
-// in het juiste postcode-gebied liggen, en vult het adres aan.
-// Zo kan Claude "Rechtstraat" koppelen aan de juiste listing.
+// Deze functie haalt de detailpagina op van kandidaat-listings en vult
+// het adres aan. Strategie:
+//   1. Sorteer lokale listings op NIEUWSTE EERST (hoogste listing-ID).
+//      Een pand met een bord is waarschijnlijk recent gepubliceerd.
+//   2. Verrijk één voor één — stop zodra de GPS-straat gevonden is
+//      (early exit). Zo wordt nooit meer dan nodig opgehaald.
+//   3. Als er geen GPS-straat is: verrijk max 10 als vanouds.
 async function verrijkListingAdressen(listings, hoofdgemeente, postcode, straatGps) {
   if (!listings || listings.length === 0) return listings;
 
-  const gem = (hoofdgemeente || '').toLowerCase().replace(/\s+/g, '-');
-  const pc  = (postcode || '').toString();
+  const gem      = (hoofdgemeente || '').toLowerCase().replace(/\s+/g, '-');
+  const pc       = (postcode || '').toString();
+  const straatLw = (straatGps || '').toLowerCase();
 
-  // Listings zonder adres opsplitsen in twee groepen:
-  //   1. "lokaal" — URL bevat de postcode of gemeente → waarschijnlijk juiste buurt
-  //   2. "overig" — URL heeft geen locatieinfo (bv. Tenerife, andere steden)
-  // We verrijken max 10 listings, maar geven "lokaal" prioriteit.
-  // Zo halen we de meest relevante detail-pagina's op en niet de alfabetisch eerste.
   const zonderAdres = listings.filter(l => !l.address && l.url);
 
   const isLokaal = (l) => {
@@ -704,23 +843,37 @@ async function verrijkListingAdressen(listings, hoofdgemeente, postcode, straatG
   const lokaal = zonderAdres.filter(isLokaal);
   const overig = zonderAdres.filter(l => !isLokaal(l));
 
-  // Neem tot 10: eerst lokale matches, dan overige als buffer
-  const kandidaten = [...lokaal, ...overig].slice(0, 10);
+  // Sorteer lokale listings op nieuwste eerst:
+  // Haal het numeriek listing-ID op uit het laatste URL-segment.
+  // Hogere ID = recenter gepubliceerd = meer kans dat er een bord voor staat.
+  const extractId = (l) => parseInt((l.url || '').split('/').pop()) || 0;
+  lokaal.sort((a, b) => extractId(b) - extractId(a));
+
+  // Cap: als GPS-straat bekend → verrijk alle lokale listings (early exit zorgt
+  // voor snelheid). Zonder GPS-straat: max 10 zoals vroeger.
+  const maxKandidaten = straatLw ? Math.min(lokaal.length + overig.length, 30) : 10;
+  const kandidaten = [...lokaal, ...overig].slice(0, maxKandidaten);
 
   if (kandidaten.length === 0) {
     console.log('📍 Geen kandidaat-listings om te verrijken (alles heeft al een adres)');
     return listings;
   }
 
-  console.log(`📍 Adres ophalen voor ${kandidaten.length} kandidaat-listings (${lokaal.length} lokaal, ${Math.max(0, kandidaten.length - lokaal.length)} overig) — postcode ${pc}, gemeente ${gem}`);
+  console.log(`📍 Adres ophalen voor max ${kandidaten.length} kandidaat-listings (${lokaal.length} lokaal, nieuwste eerst${straatLw ? `, early exit op "${straatGps}"` : ''}) — postcode ${pc}, gemeente ${gem}`);
 
-  // Sequentieel ophalen om Render-geheugen te sparen
+  // Sequentieel ophalen — stop zodra GPS-straat gevonden is
   for (const listing of kandidaten) {
     try {
       const adres = await fetchAdresVanListing(listing.url);
       if (adres) {
         listing.address = adres;
         console.log(`  ✅ ${listing.url.split('/').slice(-2).join('/')} → ${adres}`);
+
+        // Early exit: GPS-straat gevonden → geen verdere requests nodig
+        if (straatLw && adres.toLowerCase().includes(straatLw)) {
+          console.log(`  🎯 GPS-straat "${straatGps}" gevonden — verrijking gestopt`);
+          break;
+        }
       }
     } catch (e) {
       console.warn(`  ⚠️  Adres ophalen mislukt voor ${listing.url}: ${e.message}`);
@@ -1967,6 +2120,26 @@ Geef het resultaat als JSON.`
 
     // ── Adres van detailpagina ook naar frontend sturen ──────────
     if (adresListing) result.adres = adresListing;
+
+    // ── Visuele gebouwbevestiging ─────────────────────────────────
+    // Vergelijkt de bordenfoto met de gevelfoto van de gevonden listing.
+    // Alleen uitgevoerd als er een geldige listing-URL is (status gevonden).
+    // Niet-blokkerend: als het mislukt wordt de scan gewoon doorgegeven.
+    result.visuele_match = 'niet_gecontroleerd';
+    result.visuele_match_reden = null;
+    if (result.url && result.status === 'gevonden') {
+      console.log('🖼️  Visuele gebouwcheck starten voor', result.url);
+      const vCheck = await vergelijkGebouwen(image, mime || 'image/jpeg', result.url);
+      result.visuele_match        = vCheck.resultaat;
+      result.visuele_match_reden  = vCheck.reden || null;
+      // Bij twijfel: status terugzetten naar "gedeeltelijk" en notitie updaten
+      if (vCheck.resultaat === 'twijfel') {
+        result.status       = 'gedeeltelijk';
+        result.faal_categorie = result.faal_categorie || 'VISUELE_MISMATCH';
+        result.notitie = `Visuele check: gebouw op bordenfoto lijkt NIET overeen te komen met listing-foto (${vCheck.reden || 'zie foto'}). ` + (result.notitie || '');
+        console.log('⚠️  Visuele mismatch — status teruggeschroefd naar gedeeltelijk');
+      }
+    }
 
     console.log('📊 SCAN KLAAR:', {
       ts:        new Date().toISOString(),
