@@ -172,12 +172,9 @@ async function fetchDetailVanListing(url) {
     if (directResp.ok) {
       const html = await directResp.text();
       const detail = _extractDetailsUitHtml(html, label);
-      if (detail.adres) return detail;
-      console.log(`Geen adres via directe fetch voor ${url} -- Puppeteer proberen`);
+      if (!detail.adres) console.log(`Geen adres via directe fetch voor ${url} -- geen Puppeteer fallback`);
+      return detail;
     }
-    const renderedHtml = await fetchWithPuppeteer(url, 15000);
-    if (!renderedHtml) return { adres: null, prijs: null, slaapkamers: null, oppervlakte: null };
-    return _extractDetailsUitHtml(renderedHtml, label + ' (Puppeteer)');
   } catch (e) {
     console.warn('fetchDetailVanListing fout:', e.message);
     return { adres: null, prijs: null, slaapkamers: null, oppervlakte: null };
@@ -357,8 +354,14 @@ async function reverseGeocode(lat, lon) {
   const cacheKey = `${parseFloat(lat).toFixed(3)},${parseFloat(lon).toFixed(3)}`;
   if (_geocodeCache.has(cacheKey)) return _geocodeCache.get(cacheKey);
   let resultaat = await _geocodeViaPhoton(lat, lon);
-  if (!resultaat) resultaat = await _geocodeViaBigDataCloud(lat, lon);
-  if (!resultaat) resultaat = await _geocodeViaNominatim(lat, lon);
+  if (!resultaat?.straat) {
+    const fallback = await _geocodeViaBigDataCloud(lat, lon);
+    if (fallback?.straat) resultaat = fallback;
+  }
+  if (!resultaat?.straat) {
+    const fallback = await _geocodeViaNominatim(lat, lon);
+    if (fallback?.straat) resultaat = fallback;
+  }
   if (resultaat) {
     if (_geocodeCache.size >= 200) _geocodeCache.delete(_geocodeCache.keys().next().value);
     _geocodeCache.set(cacheKey, resultaat);
