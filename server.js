@@ -61,7 +61,7 @@ function _extractDetailsUitHtml(html, urlLabel) {
           const delen = [straat.trim()];
           if (postcode || regio) delen.push([postcode, regio].filter(Boolean).join(' '));
           adres = delen.join(', ');
-          console.log(`Adres via JSON-LD (${urlLabel}): ${adres}`);
+          console.log(`📍 Adres via JSON-LD (${urlLabel}): ${adres}`);
         }
       }
       if (!prijs) {
@@ -92,7 +92,7 @@ function _extractDetailsUitHtml(html, urlLabel) {
       const adresMatch = ogTitleMatch[1].match(/[-\u2013]\s*([A-Z][^,]{4,50},\s*\d{4}\s+\S[^"]{2,40})/);
       if (adresMatch) {
         adres = adresMatch[1].trim();
-        console.log(`Adres via og:title (${urlLabel}): ${adres}`);
+        console.log(`📍 Adres via og:title (${urlLabel}): ${adres}`);
       }
     }
   }
@@ -111,7 +111,7 @@ function _extractDetailsUitHtml(html, urlLabel) {
         if (straat) {
           const a = [straat, nr].filter(Boolean).join(' ').trim();
           adres = gemeente ? `${a}, ${gemeente}` : a;
-          console.log(`Adres via __NEXT_DATA__ (${urlLabel}): ${adres}`);
+          console.log(`📍 Adres via __NEXT_DATA__ (${urlLabel}): ${adres}`);
         }
       }
       if (!prijs) {
@@ -148,9 +148,9 @@ function _extractDetailsUitHtml(html, urlLabel) {
       }
     }
   }
-  if (prijs)       console.log(`Prijs via detailpagina (${urlLabel}): ${prijs}`);
-  if (slaapkamers) console.log(`Slaapkamers (${urlLabel}): ${slaapkamers}`);
-  if (oppervlakte) console.log(`Oppervlakte (${urlLabel}): ${oppervlakte}m2`);
+  if (prijs)       console.log(`💰 Prijs via detailpagina (${urlLabel}): ${prijs}`);
+  if (slaapkamers) console.log(`🛏️  Slaapkamers (${urlLabel}): ${slaapkamers}`);
+  if (oppervlakte) console.log(`📐 Oppervlakte (${urlLabel}): ${oppervlakte}m2`);
   return { adres, prijs, slaapkamers, oppervlakte };
 }
 function _extractAdresUitHtml(html, urlLabel) {
@@ -268,7 +268,7 @@ async function vergelijkGebouwen(bordBase64, bordMime, listingUrl) {
       if (!listingFoto) continue;
       const vgl = await _eenFotoVergelijking(bordBase64, bordMime, listingFoto, i + 1);
       const resultaat = vgl.match === 'JA' ? 'bevestigd' : vgl.match === 'NEE' ? 'twijfel' : 'onzeker';
-      console.log(`Visuele check (foto ${i + 1}/${fotoUrls.length}): ${resultaat} -- "${vgl.reden}"`);
+      console.log(`📷 Visuele check (foto ${i + 1}/${fotoUrls.length}): ${resultaat} -- "${vgl.reden}"`);
       if (resultaat === 'bevestigd' || resultaat === 'twijfel') return { resultaat, reden: vgl.reden };
     }
     return { resultaat: 'onzeker', reden: 'Gebouw niet duidelijk zichtbaar' };
@@ -310,7 +310,7 @@ async function _geocodeViaPhoton(lat, lon) {
     const postcode   = props.postcode || null;
     const landcode   = (props.countrycode || 'BE').toUpperCase();
     const gemeente   = props.city || props.town || props.village || props.municipality || null;
-    console.log(`Photon: straat=${straat}, huisnummer=${huisnummer}, postcode=${postcode}, gemeente=${gemeente}`);
+    console.log(`🗺️  Photon: straat=${straat}, huisnummer=${huisnummer}, postcode=${postcode}, gemeente=${gemeente}`);
     return { straat, huisnummer, gemeente, hoofdgemeente: gemeente?.toLowerCase() || null, postcode, landcode };
   } catch (e) { console.warn('Photon fout:', e.message); return null; }
 }
@@ -324,7 +324,7 @@ async function _geocodeViaBigDataCloud(lat, lon) {
     const landcode = (data.countryCode || 'BE').toUpperCase();
     const gemeente = data.city || data.locality || null;
     const straat   = data.localityInfo?.place?.find(p => p.isoName?.toLowerCase().includes('road') || p.description?.toLowerCase().includes('street'))?.name || null;
-    console.log(`BigDataCloud: straat=${straat}, postcode=${postcode}, gemeente=${gemeente}`);
+    console.log(`🗺️  BigDataCloud: straat=${straat}, postcode=${postcode}, gemeente=${gemeente}`);
     return { straat, gemeente, hoofdgemeente: gemeente?.toLowerCase() || null, postcode, landcode };
   } catch (e) { console.warn('BigDataCloud fout:', e.message); return null; }
 }
@@ -377,7 +377,7 @@ async function laadMakelaarsUitSupabase() {
   if (error) { console.warn('Makelaars laden mislukt:', error.message); return []; }
   _makelaarsCache   = data || [];
   _makelaarsCacheTs = nu;
-  console.log(`${_makelaarsCache.length} makelaars geladen uit Supabase`);
+  console.log(`🏢 ${_makelaarsCache.length} makelaars geladen uit Supabase`);
   return _makelaarsCache;
 }
 // ── Beschikbaarheidscheck ─────────────────────────────────────────
@@ -446,7 +446,7 @@ async function fetchWithPuppeteer(url, timeout = 20000) {
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36');
     await page.setRequestInterception(true);
     page.on('request', req => { const t = req.resourceType(); if (['image','font','media'].includes(t)) req.abort(); else req.continue(); });
-    await page.goto(url, { waitUntil: 'networkidle2', timeout });
+    await page.goto(url, { waitUntil: 'load', timeout });
     await page.evaluate(() => { window.scrollTo(0, document.body.scrollHeight / 2); });
     await new Promise(r => setTimeout(r, 800));
     await page.evaluate(() => { window.scrollTo(0, document.body.scrollHeight); });
@@ -490,7 +490,7 @@ async function ontdekMakelaarUrls(domein) {
   const kiesBesteUrl = (kandidaten) => { for (const url of kandidaten) { const pad = url.replace(/https?:\/\/[^/]+/,''); if (pad.split('/').filter(Boolean).length <= 3) return url; } return kandidaten[0] || null; };
   const koopUrl = kiesBesteUrl(koopKandidaten);
   const huurUrl = kiesBesteUrl(huurKandidaten);
-  console.log(`Ontdekte URLs voor ${domein}: koop=${koopUrl}, huur=${huurUrl}`);
+  console.log(`🔍 Ontdekte URLs voor ${domein}: koop=${koopUrl}, huur=${huurUrl}`);
   if (supabase && (koopUrl || huurUrl)) {
     const { error } = await supabase.from('makelaars').update({ koop_url: koopUrl || null, huur_url: huurUrl || null, updated_at: new Date().toISOString() }).eq('domein', domein);
     if (!error) { _makelaarsCacheTs = 0; }
@@ -512,13 +512,13 @@ async function verrijkListingAdressen(listings, hoofdgemeente, postcode, straatG
   const maxKandidaten = straatLw ? Math.min(lokaal.length + overig.length, 30) : 10;
   const kandidaten = [...lokaal, ...overig].slice(0, maxKandidaten);
   if (kandidaten.length === 0) return listings;
-  console.log(`Adres ophalen voor max ${kandidaten.length} listings (${lokaal.length} lokaal${straatLw ? `, early exit op "${straatGps}"` : ''})`);
+  console.log(`📍 Adres ophalen voor max ${kandidaten.length} listings (${lokaal.length} lokaal${straatLw ? `, early exit op "${straatGps}"` : ''})`);
   for (const listing of kandidaten) {
     try {
       const adres = await fetchAdresVanListing(listing.url);
       if (adres) {
         listing.address = adres;
-        if (straatLw && adres.toLowerCase().includes(straatLw)) { console.log(`  GPS-straat "${straatGps}" gevonden -- stop`); break; }
+        if (straatLw && adres.toLowerCase().includes(straatLw)) { console.log(`✅  GPS-straat "${straatGps}" gevonden -- stop`); break; }
       }
     } catch (e) { console.warn(`  Adres ophalen mislukt voor ${listing.url}: ${e.message}`); }
   }
@@ -540,7 +540,7 @@ async function searchMakelaar(makelaarNaam, listingType, gemeente, postcode, mak
     const woorden = naamLower.split(' ').filter(w => w.length > 2);
     if (woorden.length > 0 && woorden.every(w => siteNorm.includes(w))) { match = m; break; }
   }
-  if (!match) { console.log(`Makelaar "${makelaarNaam}" niet in database`); return []; }
+  if (!match) { console.log(`❓ Makelaar "${makelaarNaam}" niet in database`); return []; }
   const domein = match.domein;
   const isHuur = listingType === 'Te huur';
   let urlTemplate = isHuur ? match.huur_url : match.koop_url;
@@ -553,11 +553,11 @@ async function searchMakelaar(makelaarNaam, listingType, gemeente, postcode, mak
   }
   const url = vulUrlIn(urlTemplate, gem, pc);
   if (!url) return [];
-  console.log(`Makelaar ${domein} rechtstreeks ophalen:`, url);
+  console.log(`🔍 Makelaar ${domein} rechtstreeks ophalen:`, url);
   try {
     const html = await slimFetchHtml(url);
     if (!html) { console.warn(`Makelaarsite ophalen mislukt voor ${url}`); return []; }
-    console.log(`${domein} HTML: ${html.length} bytes`);
+    console.log(`📄 ${domein} HTML: ${html.length} bytes`);
     const listings = [];
     // Methode 1: __NEXT_DATA__
     const nextMatch = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
@@ -604,7 +604,7 @@ async function searchMakelaar(makelaarNaam, listingType, gemeente, postcode, mak
         listings.push({ url: hrefZonderQuery, title: beschrijvend.replace(/-/g,' '), bron: `${domein}_regex` });
       }
     }
-    console.log(`${domein}: ${listings.length} listings gevonden`);
+    console.log(`🏠 ${domein}: ${listings.length} listings gevonden`);
     return listings;
   } catch (e) { console.warn(`Makelaarsite fetch fout voor ${domein}:`, e.message); return []; }
 }
@@ -821,7 +821,7 @@ app.post('/api/scan', async (req, res) => {
   let adresFoto        = null;
 
   if (adres_manueel && adres_manueel.trim().length > 3) {
-    console.log(`Manueel adres: "${adres_manueel}"`);
+    console.log(`📍 Manueel adres: "${adres_manueel}"`);
     const m = adres_manueel.trim().match(/^(.+?),\s*(\d{4})\s+(.+)$/);
     if (m) {
       geocodeResultaat = { straat: m[1].trim(), postcode: m[2].trim(), gemeente: m[3].trim(), hoofdgemeente: m[3].trim().toLowerCase(), landcode: 'BE', volledig: adres_manueel.trim() };
@@ -834,6 +834,7 @@ app.post('/api/scan', async (req, res) => {
       const geocodeLat = gps.property_lat || gps.lat;
       const geocodeLon = gps.property_lon || gps.lon;
       geocodeResultaat = await reverseGeocode(geocodeLat, geocodeLon);
+    if (geocodeResultaat) console.log(`🗺️  GPS: lat=${gps.lat}, lon=${gps.lon} → ${geocodeResultaat.straat || '?'}, ${geocodeResultaat.gemeente || '?'}`);
     }
     const _straatMet = geocodeResultaat?.straat
       ? [geocodeResultaat.straat, geocodeResultaat.huisnummer].filter(Boolean).join(' ')
@@ -843,7 +844,7 @@ app.post('/api/scan', async (req, res) => {
 
   try {
     // ── STAP 1: Foto-analyse ──────────────────────────────────────
-    console.log('STAP 1: Foto-analyse starten...');
+    console.log('📸 STAP 1: Foto-analyse starten...');
     const stap1Resp = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-api-key': API_KEY, 'anthropic-version': '2023-06-01' },
@@ -861,7 +862,7 @@ app.post('/api/scan', async (req, res) => {
       bordInfo.makelaar_herkenning = `Gecorrigeerd door gebruiker: ${makelaar_override}`;
       bordInfo.makelaar_betrouwbaarheid = 'HOOG';
     }
-    console.log('STAP 1 klaar:', bordInfo.makelaar, bordInfo.makelaar_betrouwbaarheid, bordInfo.listing_type);
+    console.log('✅ STAP 1 klaar:', bordInfo.makelaar, bordInfo.makelaar_betrouwbaarheid, bordInfo.listing_type);
 
     const gemeente = geocodeResultaat?.gemeente || 'Gent';
     const postcode = geocodeResultaat?.postcode || '9000';
@@ -871,7 +872,7 @@ app.post('/api/scan', async (req, res) => {
 
     // ── STAP 1.5a: Telefoonnummer ─────────────────────────────────
     if (!makelaar_override && bordInfo.telefoon) {
-      console.log(`Stap 1.5a: Telefoonnummer "${bordInfo.telefoon}" opzoeken...`);
+      console.log(`📞 Stap 1.5a: Telefoonnummer "${bordInfo.telefoon}" opzoeken...`);
       try {
         const telResp = await fetch('https://api.anthropic.com/v1/messages', {
           method: 'POST',
@@ -947,13 +948,13 @@ app.post('/api/scan', async (req, res) => {
     }
 
     if (!makelaarInDB && domeinMakelaar) {
-      console.log(`URL-ontdekking starten voor ${domeinMakelaar}...`);
+      console.log(`🔍 URL-ontdekking starten voor ${domeinMakelaar}...`);
       const ontdekt = await ontdekMakelaarUrls(domeinMakelaar);
       const koopUrl = ontdekt?.koopUrl || null;
       const huurUrl = ontdekt?.huurUrl || null;
       await voegMakelaarToeAanSupabase(domeinMakelaar, bordInfo.makelaar, koopUrl, huurUrl, bordInfo.telefoon || null);
       if (koopUrl || huurUrl) {
-        console.log(`URL ontdekt voor ${domeinMakelaar} → direct zoeken`);
+        console.log(`✅ URL ontdekt voor ${domeinMakelaar} → direct zoeken`);
         makelaarInDB = true; // URL bekend, direct doorzoeken
       }
     }
@@ -964,7 +965,7 @@ app.post('/api/scan', async (req, res) => {
     let listingsBron = 'geen';
 
     if (makelaarInDB) {
-      console.log(`SCRAPING: ${domeinMakelaar} in DB`);
+      console.log(`🔍 SCRAPING: ${domeinMakelaar} in DB`);
       listings = await searchMakelaar(bordInfo.makelaar, bordInfo.listing_type, hoofdgemeente, postcode, bordInfo.makelaar_website);
       listingsBron = 'makelaar_direct';
       if (listings.length > 0) {
@@ -983,10 +984,10 @@ app.post('/api/scan', async (req, res) => {
         }
       } else { listingsBron = 'scraping_leeg'; }
     } else if (gpsStraat) {
-      console.log(`WEB SEARCH: "${bordInfo.makelaar}" niet in DB`);
+      console.log(`🔍 WEB SEARCH: "${bordInfo.makelaar}" niet in DB`);
       listingsBron = 'web_search_direct';
     } else {
-      console.log('IMMOWEB: fallback');
+      console.log('🔍 IMMOWEB: fallback');
       listings = await searchImmoweb(bordInfo.pand_type_slug, bordInfo.listing_type, hoofdgemeente, postcode);
       listingsBron = 'immoweb_fallback';
     }
@@ -994,7 +995,7 @@ app.post('/api/scan', async (req, res) => {
     // ── Co-makelaar: ook extra makelaar doorzoeken ────────────────
     const makelaarExtra = bordInfo.makelaar_extra || null;
     if (makelaarExtra?.naam && listings.length === 0) {
-      console.log(`Co-makelaar "${makelaarExtra.naam}" ook doorzoeken...`);
+      console.log(`🏢 Co-makelaar "${makelaarExtra.naam}" ook doorzoeken...`);
       const domeinExtra = makelaarExtra.website
         ? makelaarExtra.website.replace(/^https?:\/\//,'').replace(/^www\./,'').split('/')[0]
         : null;
@@ -1019,21 +1020,21 @@ app.post('/api/scan', async (req, res) => {
           if (straatMatchesExtra.length > 0) {
             listings = straatMatchesExtra;
             listingsBron = `co_makelaar_${makelaarExtra.naam.toLowerCase().replace(/\s+/g,'_')}`;
-            console.log(`Co-makelaar "${makelaarExtra.naam}": ${listings.length} listing(s) met straat "${gpsStraat}"`);
+            console.log(`🏢 Co-makelaar "${makelaarExtra.naam}": ${listings.length} listing(s) met straat "${gpsStraat}"`);
           } else {
-            console.log(`Co-makelaar "${makelaarExtra.naam}": geen straat-match`);
+            console.log(`🏢 Co-makelaar "${makelaarExtra.naam}": geen straat-match`);
           }
         } else {
           listings = verrijktExtra;
           listingsBron = `co_makelaar_${makelaarExtra.naam.toLowerCase().replace(/\s+/g,'_')}`;
-          console.log(`Co-makelaar "${makelaarExtra.naam}": ${listings.length} listing(s)`);
+          console.log(`🏢 Co-makelaar "${makelaarExtra.naam}": ${listings.length} listing(s)`);
         }
       } else {
-        console.log(`Co-makelaar "${makelaarExtra.naam}": ook geen listings`);
+        console.log(`🏢 Co-makelaar "${makelaarExtra.naam}": ook geen listings`);
       }
     }
 
-    console.log(`STAP 2 klaar: ${listings.length} listings via ${listingsBron}${makelaarExtra ? ` | Co-makelaar: ${makelaarExtra.naam}` : ''}`);
+    console.log(`✅ STAP 2 klaar: ${listings.length} listings via ${listingsBron}${makelaarExtra ? ` | Co-makelaar: ${makelaarExtra.naam}` : ''}`);
 
     // ── Context voor Claude ───────────────────────────────────────
     let listingsContext = '';
@@ -1072,7 +1073,7 @@ app.post('/api/scan', async (req, res) => {
     }
 
     // ── STAP 3: Claude matcht listing ────────────────────────────
-    console.log('STAP 3: Claude matcht listing uit', listings.length, 'kandidaten...');
+    console.log('🎯 STAP 3: Claude matcht listing uit', listings.length, 'kandidaten...');
     const stap3Resp = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-api-key': API_KEY, 'anthropic-version': '2023-06-01', 'anthropic-beta': 'web-search-2025-03-05' },
@@ -1130,8 +1131,8 @@ app.post('/api/scan', async (req, res) => {
     if (result.url && result.status !== 'niet_gevonden') {
       const detail = await fetchDetailVanListing(result.url);
       adresListing = detail.adres || null;
-      if (adresListing) console.log('Adres van detailpagina:', adresListing);
-      if (detail.prijs)      { console.log(`Prijs overschreven: "${result.prijs}" -> "${detail.prijs}"`); result.prijs = detail.prijs; }
+      if (adresListing) console.log('📍 Adres van detailpagina:', adresListing);
+      if (detail.prijs)      { console.log(`💰 Prijs overschreven: "${result.prijs}" -> "${detail.prijs}"`); result.prijs = detail.prijs; }
       if (detail.slaapkamers) result.slaapkamers = detail.slaapkamers;
       if (detail.oppervlakte) result.oppervlakte = detail.oppervlakte;
     }
@@ -1174,7 +1175,7 @@ app.post('/api/scan', async (req, res) => {
       const postcodeOk = !postcode || adresListing.includes(postcode);
       if (!straatOk || !postcodeOk) {
         const reden = !straatOk ? `straat "${gpsStraat}" niet in "${adresListing}"` : `postcode mismatch`;
-        console.log(`Adres-mismatch (${reden}) -> URL gewist`);
+        console.log(`🔴 Adres-mismatch (${reden}) -> URL gewist`);
         result.url = null; result.status = 'niet_gevonden';
         result.faal_categorie = result.faal_categorie || 'ADRES_MISMATCH';
         result.notitie = `Gevonden listing staat op "${adresListing}" maar GPS-locatie is "${gpsStraat}". ` + (result.notitie || '');
@@ -1199,7 +1200,7 @@ app.post('/api/scan', async (req, res) => {
       }
     }
 
-    console.log('SCAN KLAAR:', { makelaar: result.makelaar, status: result.status, adres: result.adres, duur: `${zoekduur}s` });
+    console.log('✅ SCAN KLAAR:', { makelaar: result.makelaar, status: result.status, adres: result.adres, duur: `${zoekduur}s` });
 
     // ── Supabase opslaan ──────────────────────────────────────────
     let scanId = null;
