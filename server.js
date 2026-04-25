@@ -535,7 +535,8 @@ async function searchMakelaar(makelaarNaam, listingType, gemeente, postcode, mak
     const siteNorm    = normaliseer(m.domein.replace(/\.(be|com|nl|immo|eu|net|org)$/,''));
     const domeinClean = m.domein.replace('www.','');
     if (websiteLower && (websiteLower === domeinClean || websiteLower.includes(domeinClean) || domeinClean.includes(websiteLower))) { match = m; break; }
-    if (naamLower.includes(siteNorm) || siteNorm.includes(naamLower.split(' ')[0])) { match = m; break; }
+    const eersteWoord = naamLower.split(' ')[0];
+    if (naamLower.includes(siteNorm) || (eersteWoord.length >= 5 && siteNorm.includes(eersteWoord))) { match = m; break; }
     const woorden = naamLower.split(' ').filter(w => w.length > 2);
     if (woorden.length > 0 && woorden.every(w => siteNorm.includes(w))) { match = m; break; }
   }
@@ -946,8 +947,15 @@ app.post('/api/scan', async (req, res) => {
     }
 
     if (!makelaarInDB && domeinMakelaar) {
-      await voegMakelaarToeAanSupabase(domeinMakelaar, bordInfo.makelaar, null, null, bordInfo.telefoon || null);
-      ontdekMakelaarUrls(domeinMakelaar).catch(e => console.warn('URL-ontdekking achtergrond fout:', e.message));
+      console.log(`URL-ontdekking starten voor ${domeinMakelaar}...`);
+      const ontdekt = await ontdekMakelaarUrls(domeinMakelaar);
+      const koopUrl = ontdekt?.koopUrl || null;
+      const huurUrl = ontdekt?.huurUrl || null;
+      await voegMakelaarToeAanSupabase(domeinMakelaar, bordInfo.makelaar, koopUrl, huurUrl, bordInfo.telefoon || null);
+      if (koopUrl || huurUrl) {
+        console.log(`URL ontdekt voor ${domeinMakelaar} → direct zoeken`);
+        makelaarInDB = true; // URL bekend, direct doorzoeken
+      }
     }
 
     const gpsStraat = geocodeResultaat?.straat || null;
@@ -1174,6 +1182,8 @@ app.post('/api/scan', async (req, res) => {
       }
     }
     if (adresListing) result.adres = adresListing;
+    // GPS-adres als fallback als er geen listing-adres is
+    if (!result.adres && adresFoto) result.adres = adresFoto;
 
     // ── Visuele gebouwbevestiging ─────────────────────────────────
     result.visuele_match = 'niet_gecontroleerd';
