@@ -601,6 +601,8 @@ async function searchMakelaar(makelaarNaam, listingType, gemeente, postcode, mak
       let href = lm[1];
       if (!href.startsWith('http')) href = `https://${domein}${href}`;
       const hrefZonderQuery = href.split('?')[0];
+      // Sla statische bestanden over — nooit een listing-URL
+      if (/\.(css|js|jpg|jpeg|png|gif|svg|ico|woff|woff2|ttf|eot|pdf|map)$/i.test(hrefZonderQuery)) continue;
       if (!seenUrls.has(hrefZonderQuery) && hrefZonderQuery.split('/').length > 3) {
         seenUrls.add(hrefZonderQuery);
         const urlSegmenten = hrefZonderQuery.split('/').filter(Boolean);
@@ -805,6 +807,9 @@ URL-REGELS:
 - "url": ENKEL de URL op de website van de makelaar zelf. Null als niet gevonden.
 - "url_alternatieven": directe detail-pagina URLs van aggregators.
   Gebruik NOOIT een zoekresultatenpagina (herkenbaar aan /search/, /zoeken/, ?q=, ?page=).
+- Aggregator detail-URLs (Spotto, Realo, Immoscoop) bevatten ALTIJD een numeriek ID of unieke slug.
+  VERBODEN: spotto.be/te-huur/lochristi/woonhuis → dit is een zoekpagina, geen listing.
+  TOEGESTAAN: spotto.be/te-huur/lochristi/woonhuis/straatnaam-27/123456 → dit is een detail-pagina.
 
 ## WANNEER JE EEN LIJST VAN LISTINGS KRIJGT
 Kies de listing die het beste overeenkomt op basis van GPS-straatnaam, pand-type en transactie. Huisnummerverschil ≤ 2 is geen reden voor "gedeeltelijk" — tel dat als "gevonden".
@@ -1178,7 +1183,10 @@ app.post('/api/scan', async (req, res) => {
           while ((m = urlRegex.exec(blockStr)) !== null) {
             const gevondenUrl = m[0].replace(/\\u[0-9a-f]{4}/gi, c => String.fromCharCode(parseInt(c.slice(2),16)));
             const isZoekpagina = /\/search\/|\/zoeken\/|\/resultaten\/|\?q=|\?page=/i.test(gevondenUrl);
-            if (!isZoekpagina && !gevondenUrls.has(agg.domein) && (gevondenUrl.toLowerCase().includes(straatLower.split(' ')[0]) || (postcode && gevondenUrl.includes(postcode)))) {
+            // Aggregator detail-URLs hebben altijd een numeriek ID of ≥4 pad-segmenten
+            const padSegmenten = gevondenUrl.replace(/https?:\/\/[^/]+/, '').split('/').filter(Boolean).length;
+            const heeftDetailId = /\/\d{4,}/.test(gevondenUrl) || padSegmenten >= 4;
+            if (!isZoekpagina && heeftDetailId && !gevondenUrls.has(agg.domein) && (gevondenUrl.toLowerCase().includes(straatLower.split(' ')[0]) || (postcode && gevondenUrl.includes(postcode)))) {
               gevondenUrls.add(agg.domein);
               result.url_alternatieven.push({ label: agg.label, url: gevondenUrl });
             }
