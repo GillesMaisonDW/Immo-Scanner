@@ -342,6 +342,7 @@ async function _geocodeViaNominatim(lat, lon) {
     const hoofdstad    = addr.city || addr.town || addr.municipality || null;
     const straat       = addr.road || addr.pedestrian || addr.square || addr.path || null;
     const huisnummer   = addr.house_number ? String(addr.house_number).trim() : null;
+    console.log(`🗺️  Nominatim: straat=${straat}, huisnummer=${huisnummer}, postcode=${postcode}, gemeente=${deelgemeente || hoofdstad}`);
     return { straat, huisnummer, gemeente: deelgemeente || hoofdstad, hoofdgemeente: hoofdstad?.toLowerCase() || deelgemeente?.toLowerCase() || null, postcode, landcode };
   } catch (e) { console.warn('Nominatim fout:', e.message); return null; }
 }
@@ -1209,6 +1210,20 @@ app.post('/api/scan', async (req, res) => {
     if (adresListing) result.adres = adresListing;
     // GPS-adres als fallback als er geen listing-adres is
     if (!result.adres && adresFoto) result.adres = adresFoto;
+
+    // ── Gedeeltelijk → gevonden upgrade ──────────────────────────
+    // Als makelaar HOOG betrouwbaar is, URL van eigen makelaarsite komt,
+    // en het adres van de listing de GPS-straat bevat → zeker het juiste pand
+    if (result.status === 'gedeeltelijk' && gpsStraat && result.adres && result.url && domeinMakelaar) {
+      const betrouwbaar = (bordInfo.makelaar_betrouwbaarheid || '').toUpperCase() === 'HOOG';
+      const urlVanMakelaar = result.url.toLowerCase().includes(domeinMakelaar.toLowerCase());
+      const straatInAdres  = result.adres.toLowerCase().includes(gpsStraat.toLowerCase());
+      if (betrouwbaar && urlVanMakelaar && straatInAdres) {
+        result.status = 'gevonden';
+        result.faal_categorie = null;
+        console.log(`✅ Upgrade gedeeltelijk→gevonden: makelaar HOOG + ${domeinMakelaar} + straat "${gpsStraat}" in adres "${result.adres}"`);
+      }
+    }
 
     // ── Visuele gebouwbevestiging ─────────────────────────────────
     result.visuele_match = 'niet_gecontroleerd';
