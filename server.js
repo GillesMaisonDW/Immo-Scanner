@@ -709,7 +709,7 @@ async function laadMakelaarCorrecties() {
 // ── Nabijgelegen straten via Overpass (fallback hoekpanden) ───────
 async function straatNamenInBuurt(lat, lon, straal = 120) {
   try {
-    const query = `[out:json][timeout:5];way(around:${straal},${lat},${lon})["highway"]["name"];out tags;`;
+    const query = `[out:json][timeout:5];(way(around:${straal},${lat},${lon})["highway"]["name"];node(around:${straal},${lat},${lon})["place"="square"]["name"];way(around:${straal},${lat},${lon})["place"="square"]["name"];relation(around:${straal},${lat},${lon})["place"="square"]["name"];);out tags;`;
     const url = `https://overpass-api.de/api/interpreter?data=${encodeURIComponent(query)}`;
     const resp = await fetch(url, { headers: { 'User-Agent': 'ImmoScannerApp/1.0 (gilles@maisondw.be)' }, signal: AbortSignal.timeout(7000) });
     if (!resp.ok) { console.warn(`Overpass HTTP fout: ${resp.status}`); return []; }
@@ -966,12 +966,20 @@ app.post('/api/scan', async (req, res) => {
       let besteMatch = null, besteScore = 0;
       for (const m of allesMakelaars) {
         const siteBase = m.domein.replace(/\.(be|com|nl|immo|eu|net|org|vlaanderen)$/,'').replace('www.','').toLowerCase().replace(/[-_]/g,' ').trim();
-        if (siteBase.length < 3) continue;
+        const dbNaam   = (m.naam || '').toLowerCase().replace(/[-\s]+/g,' ').trim();
         let score = 0;
-        if (naamLow === siteBase)                                    score = 10;
-        else if (naamLow.replace(/\s/g,'') === siteBase.replace(/\s/g,'')) score = 9;
-        else if (naamLow.includes(siteBase) && siteBase.length >= 5) score = 7;
-        else if (siteBase.includes(naamLow) && naamLow.length >= 5)  score = 7;
+        // Eerst: directe DB-naam matching (vangt ook makelaars met kort domein zoals jo.immo)
+        if (naamLow === dbNaam)                                            score = 10;
+        else if (naamLow.replace(/\s/g,'') === dbNaam.replace(/\s/g,''))  score = 9;
+        else if (naamLow.includes(dbNaam) && dbNaam.length >= 4)          score = 8;
+        else if (dbNaam.includes(naamLow) && naamLow.length >= 4)         score = 8;
+        // Dan: domein-gebaseerde matching (sla over als domein te kort)
+        if (score === 0 && siteBase.length >= 3) {
+          if (naamLow === siteBase)                                    score = 10;
+          else if (naamLow.replace(/\s/g,'') === siteBase.replace(/\s/g,'')) score = 9;
+          else if (naamLow.includes(siteBase) && siteBase.length >= 5) score = 7;
+          else if (siteBase.includes(naamLow) && naamLow.length >= 5)  score = 7;
+        }
         if (score > besteScore) { besteScore = score; besteMatch = m; }
       }
       if (besteMatch && besteScore >= 7) { domeinMakelaar = besteMatch.domein.replace('www.',''); makelaarInDB = true; }
@@ -1092,9 +1100,9 @@ app.post('/api/scan', async (req, res) => {
     if (listingsBron === 'web_search_direct' || listingsBron === 'scraping_leeg' || listingsBron === 'straat_geen_match') {
       const waarom = { 'web_search_direct': 'Makelaar staat niet in onze database.', 'scraping_leeg': 'Directe scraping leverde geen listings op.', 'straat_geen_match': `Scraping vond listings, maar geen enkele had adres "${gpsStraat}".` }[listingsBron] || '';
       const refHint = bordInfo.referentienummer ? `\nReferentienummer: ${bordInfo.referentienummer} → Zoek dit EERST: "${bordInfo.referentienummer}" site:${domeinHint}` : '';
-      // Overpass: nabijgelegen straten als fallback voor hoekpanden (enkel bij straat_geen_match)
+      // Overpass: nabijgelegen straten als fallback voor hoekpanden én web_search_direct
       let nabijStratenHint = '';
-      if (listingsBron === 'straat_geen_match' && gps?.lat && gps?.lon) {
+      if ((listingsBron === 'straat_geen_match' || listingsBron === 'web_search_direct') && gps?.lat && gps?.lon) {
         const nabijStraten = await straatNamenInBuurt(gps.lat, gps.lon);
         const andereStraten = nabijStraten.filter(s => s.toLowerCase() !== (gpsStraat || '').toLowerCase());
         if (andereStraten.length > 0) {
