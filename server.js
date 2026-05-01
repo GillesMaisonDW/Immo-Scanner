@@ -1094,6 +1094,7 @@ app.post('/api/scan', async (req, res) => {
 
     // ── Context voor Claude ───────────────────────────────────────
     let listingsContext = '';
+    let effectiefZoekladres = gpsVolledigAdres; // kan bijgesteld worden door plein-detectie
     const domeinHint = domeinMakelaar || (bordInfo.makelaar || '').toLowerCase().replace(/\s+/g,'') + '.be';
     const deelgemeente = geocodeResultaat?.gemeente || null;
     const heeftDeelgemeente = deelgemeente && hoofdgemeente && deelgemeente.toLowerCase() !== hoofdgemeente.toLowerCase();
@@ -1103,7 +1104,6 @@ app.post('/api/scan', async (req, res) => {
       const refHint = bordInfo.referentienummer ? `\nReferentienummer: ${bordInfo.referentienummer} → Zoek dit EERST: "${bordInfo.referentienummer}" site:${domeinHint}` : '';
       // Overpass: nabijgelegen straten + pleinen als fallback (ook bij scraping_leeg)
       let nabijStratenHint = '';
-      let effectiefZoekladres = gpsVolledigAdres; // kan overschreven worden bij plein-detectie
       if ((listingsBron === 'straat_geen_match' || listingsBron === 'web_search_direct' || listingsBron === 'scraping_leeg') && gps?.lat && gps?.lon) {
         const { straten: nabijStraten, pleinen: nabijPleinen } = await straatNamenInBuurt(gps.lat, gps.lon);
         // Plein-detectie: geocoder geeft aangrenzende straat, maar we staan OP een plein
@@ -1121,7 +1121,7 @@ app.post('/api/scan', async (req, res) => {
           nabijStratenHint += `\nNabijgelegen locaties (${andereNamen.length} binnen 120m): ${andereNamen.join(', ')}\nHoekpand mogelijk? Zoek ook op deze locaties op ${domeinHint}.\n`;
         }
       }
-      listingsContext = `\n\n## WEB SEARCH VEREIST\n${effectiefZoekladres ? `GPS-adres: "${effectiefZoekladres}"` : 'Geen GPS beschikbaar.'}\nPostcode: ${postcode}\nMakelaar: ${bordInfo.makelaar} (${domeinHint})\nReden: ${waarom}${refHint}${nabijStratenHint}\n\nZoek: "${effectiefZoekladres || postcode}" "${postcode}" site:${domeinHint}\nFallback: "${effectiefZoekladres || postcode}" "${postcode}" ${bordInfo.listing_type}\nURL-prioriteit: makelaar > Immoscoop/Realo/Spotto > Immoweb.\n`;
+      listingsContext = `\n\n## WEB SEARCH VEREIST\n${effectiefZoekladres ? `GPS-adres: "${effectiefZoekladres}"` : 'Geen GPS beschikbaar.'}\nPostcode: ${postcode}\nMakelaar: ${bordInfo.makelaar} (${domeinHint})\nReden: ${waarom}${refHint}${nabijStratenHint}\n\nZoek: "${effectiefZoekladres || postcode}" "${postcode}" site:${domeinHint}\nFallback: "${effectiefZoekladres || postcode}" "${postcode}" ${bordInfo.listing_type}\nMakelaarszoekopdracht op aggregators: "${bordInfo.makelaar}" "${effectiefZoekladres || postcode}" — aggregators vermelden soms de makelaarsnaam in de listing, gebruik dit als extra zoeksleutel.\nURL-prioriteit: makelaar > Immoscoop/Realo/Spotto > Immoweb.\n`;
     } else if (listings.length > 0) {
       listingsContext = `\n\n## LISTINGS (${listings.length} resultaten via ${listingsBron})\n`;
       if (gpsVolledigAdres) listingsContext += `GPS-adres: "${gpsVolledigAdres}" -- kies de listing met dit adres.\n\n`;
@@ -1181,6 +1181,18 @@ app.post('/api/scan', async (req, res) => {
     result.makelaar_betrouwbaarheid = result.makelaar_betrouwbaarheid || bordInfo.makelaar_betrouwbaarheid;
     result.telefoon             = result.telefoon             || bordInfo.telefoon;
     if (!Array.isArray(result.url_alternatieven)) result.url_alternatieven = [];
+    // Aggregator-domeinen horen NIET in result.url (dat is voor de makelaar's eigen website)
+    const _aggDomains = ['realo.be', 'immoscoop.be', 'spotto.be', 'zimmo.be', 'immoweb.be'];
+    if (result.url && _aggDomains.some(d => (result.url || '').includes(d))) {
+      console.log(`⚠️ Aggregator URL in result.url: ${result.url} → verplaatst naar alternatieven`);
+      const _isDetailPage = /\/\d{5,}/.test(result.url) && !/\/search\/|\/zoeken\/|\/resultaten\//i.test(result.url);
+      if (_isDetailPage && !result.url_alternatieven.some(a => a.url === result.url)) {
+        const _domLabel = _aggDomains.find(d => result.url.includes(d))?.split('.')[0] || 'aggregator';
+        result.url_alternatieven.push({ label: _domLabel.charAt(0).toUpperCase() + _domLabel.slice(1), url: result.url });
+        console.log(`✅ URL verplaatst naar url_alternatieven: ${result.url}`);
+      }
+      result.url = null;
+    }
     // Normaliseer gevonden_via — Claude plaatst soms lange tekst ipv enum-waarde
     const _validGevondenVia = ['web_search', 'makelaar_direct', 'immoweb_fallback', 'niet_gevonden'];
     if (!_validGevondenVia.includes(result.gevonden_via)) {
@@ -1191,8 +1203,9 @@ app.post('/api/scan', async (req, res) => {
     }
 
     // ── Fallback: URLs uit web_search tool-results ────────────────
-    if (result.url_alternatieven.length === 0 && gpsStraat) {
-      const straatLower = gpsStraat.toLowerCase();
+    if (result.url_alternatieven.length === 0 && (gpsStraat || effectiefZoekladres)) {
+      const straatLower = (gpsStraat || '').toLowerCase();
+      const effectiefLower = (effectiefZoekladres || '').toLowerCase();
       const aggregators = [{ domein: 'realo.be', label: 'Realo' }, { domein: 'immoscoop.be', label: 'Immoscoop' }, { domein: 'spotto.be', label: 'Spotto' }];
       const gevondenUrls = new Set();
       for (const block of stap3Data.content) {
@@ -1206,7 +1219,11 @@ app.post('/api/scan', async (req, res) => {
             // Aggregator detail-URLs hebben altijd een numeriek ID of ≥4 pad-segmenten
             const padSegmenten = gevondenUrl.replace(/https?:\/\/[^/]+/, '').split('/').filter(Boolean).length;
             const heeftDetailId = /\/\d{4,}/.test(gevondenUrl) || padSegmenten >= 4;
-            if (!isZoekpagina && heeftDetailId && !gevondenUrls.has(agg.domein) && (gevondenUrl.toLowerCase().includes(straatLower.split(' ')[0]) || (postcode && gevondenUrl.includes(postcode)))) {
+            const urlLower = gevondenUrl.toLowerCase();
+            const straatMatch = (straatLower && urlLower.includes(straatLower.split(' ')[0])) ||
+                                (effectiefLower && urlLower.includes(effectiefLower.split(' ')[0])) ||
+                                (postcode && gevondenUrl.includes(postcode));
+            if (!isZoekpagina && heeftDetailId && !gevondenUrls.has(agg.domein) && straatMatch) {
               gevondenUrls.add(agg.domein);
               result.url_alternatieven.push({ label: agg.label, url: gevondenUrl });
             }
