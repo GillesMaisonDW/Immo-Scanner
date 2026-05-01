@@ -392,7 +392,7 @@ async function isNietBeschikbaar(url) {
     if (!resp.ok) return false;
     const html = await resp.text();
     const tekst = html.toLowerCase();
-    const tekstSignalen = ['verkocht','vendu','sold','verkauft','verhuurd','loue','rented','vermietet','onder compromis','sous compromis','under offer','onder bod','onder optie','sous option','niet meer beschikbaar','plus disponible','no longer available'];
+    const tekstSignalen = ['verkocht','vendu','sold','verkauft','verhuurd','loue','rented','vermietet','onder compromis','sous compromis','under offer','onder bod','onder optie','sous option','niet meer beschikbaar','plus disponible','no longer available','reeds verhuurd','reeds verkocht','al verhuurd','al verkocht','helaas niet meer','dit pand is niet meer','deze woning is niet meer','pand is al','woning is al','dit object is'];
     const cssSignalen = ['class="sold"','class="verkocht"','class="vendu"','status--sold','property-sold','listing-sold','data-status="sold"','"sold":true','"is_sold":true','"status":"sold"'];
     const tekstTreffer = tekstSignalen.find(s => tekst.includes(s));
     if (tekstTreffer) { console.log(`Niet beschikbaar (tekst: "${tekstTreffer}"): ${url}`); return true; }
@@ -714,10 +714,11 @@ async function straatNamenInBuurt(lat, lon, straal = 120) {
     const resp = await fetch(url, { headers: { 'User-Agent': 'ImmoScannerApp/1.0 (gilles@maisondw.be)' }, signal: AbortSignal.timeout(7000) });
     if (!resp.ok) { console.warn(`Overpass HTTP fout: ${resp.status}`); return []; }
     const data = await resp.json();
-    const straten = [...new Set((data.elements || []).map(e => e.tags?.name).filter(Boolean))];
-    console.log(`🗺️  Overpass: ${straten.length} straten binnen ${straal}m: ${straten.join(', ')}`);
-    return straten;
-  } catch (e) { console.warn('Overpass API fout:', e.message); return []; }
+    const straten = [...new Set((data.elements || []).filter(e => e.tags?.highway && e.tags?.name).map(e => e.tags.name).filter(Boolean))];
+    const pleinen = [...new Set((data.elements || []).filter(e => e.tags?.place === 'square' && e.tags?.name).map(e => e.tags.name).filter(Boolean))];
+    console.log(`🗺️  Overpass: ${straten.length} straten, ${pleinen.length} pleinen binnen ${straal}m: ${[...straten, ...pleinen].join(', ')}`);
+    return { straten, pleinen };
+  } catch (e) { console.warn('Overpass API fout:', e.message); return { straten: [], pleinen: [] }; }
 }
 // ================================================================
 //  SYSTEM PROMPTS
@@ -1100,16 +1101,27 @@ app.post('/api/scan', async (req, res) => {
     if (listingsBron === 'web_search_direct' || listingsBron === 'scraping_leeg' || listingsBron === 'straat_geen_match') {
       const waarom = { 'web_search_direct': 'Makelaar staat niet in onze database.', 'scraping_leeg': 'Directe scraping leverde geen listings op.', 'straat_geen_match': `Scraping vond listings, maar geen enkele had adres "${gpsStraat}".` }[listingsBron] || '';
       const refHint = bordInfo.referentienummer ? `\nReferentienummer: ${bordInfo.referentienummer} → Zoek dit EERST: "${bordInfo.referentienummer}" site:${domeinHint}` : '';
-      // Overpass: nabijgelegen straten als fallback voor hoekpanden én web_search_direct
+      // Overpass: nabijgelegen straten + pleinen als fallback (ook bij scraping_leeg)
       let nabijStratenHint = '';
-      if ((listingsBron === 'straat_geen_match' || listingsBron === 'web_search_direct') && gps?.lat && gps?.lon) {
-        const nabijStraten = await straatNamenInBuurt(gps.lat, gps.lon);
-        const andereStraten = nabijStraten.filter(s => s.toLowerCase() !== (gpsStraat || '').toLowerCase());
-        if (andereStraten.length > 0) {
-          nabijStratenHint = `\nNabijgelegen straten (${andereStraten.length} straten binnen 120m): ${andereStraten.join(', ')}\nHoekpand mogelijk? Zoek ook op deze straten op ${domeinHint}.\n`;
+      let effectiefZoekladres = gpsVolledigAdres; // kan overschreven worden bij plein-detectie
+      if ((listingsBron === 'straat_geen_match' || listingsBron === 'web_search_direct' || listingsBron === 'scraping_leeg') && gps?.lat && gps?.lon) {
+        const { straten: nabijStraten, pleinen: nabijPleinen } = await straatNamenInBuurt(gps.lat, gps.lon);
+        // Plein-detectie: geocoder geeft aangrenzende straat, maar we staan OP een plein
+        if (nabijPleinen.length > 0 && gpsStraat && !nabijPleinen.some(p => p.toLowerCase() === gpsStraat.toLowerCase())) {
+          const pleinNaam = nabijPleinen[0];
+          effectiefZoekladres = pleinNaam + (postcode ? ` ${postcode}` : '');
+          nabijStratenHint += `\n⚠️ GPS geocoder gaf "${gpsStraat}" maar er is een plein gedetecteerd: "${pleinNaam}". Zoek EERST op "${pleinNaam}" — geocoders pakken vaak een aangrenzende straat i.p.v. het plein zelf.\n`;
+          console.log(`🟡 Plein gedetecteerd nabij GPS: "${pleinNaam}" (geocoder gaf "${gpsStraat}")`);
+        }
+        // Overige namen als hint voor hoekpanden
+        const geprioriseerd = nabijPleinen[0] || '';
+        const andereNamen = [...nabijPleinen.slice(geprioriseerd ? 1 : 0), ...nabijStraten]
+          .filter(s => s.toLowerCase() !== (gpsStraat || '').toLowerCase() && s.toLowerCase() !== geprioriseerd.toLowerCase());
+        if (andereNamen.length > 0) {
+          nabijStratenHint += `\nNabijgelegen locaties (${andereNamen.length} binnen 120m): ${andereNamen.join(', ')}\nHoekpand mogelijk? Zoek ook op deze locaties op ${domeinHint}.\n`;
         }
       }
-      listingsContext = `\n\n## WEB SEARCH VEREIST\n${gpsVolledigAdres ? `GPS-adres: "${gpsVolledigAdres}"` : 'Geen GPS beschikbaar.'}\nPostcode: ${postcode}\nMakelaar: ${bordInfo.makelaar} (${domeinHint})\nReden: ${waarom}${refHint}${nabijStratenHint}\n\nZoek: "${gpsVolledigAdres || postcode}" "${postcode}" site:${domeinHint}\nFallback: "${gpsVolledigAdres || postcode}" "${postcode}" ${bordInfo.listing_type}\nURL-prioriteit: makelaar > Immoscoop/Realo/Spotto > Immoweb.\n`;
+      listingsContext = `\n\n## WEB SEARCH VEREIST\n${effectiefZoekladres ? `GPS-adres: "${effectiefZoekladres}"` : 'Geen GPS beschikbaar.'}\nPostcode: ${postcode}\nMakelaar: ${bordInfo.makelaar} (${domeinHint})\nReden: ${waarom}${refHint}${nabijStratenHint}\n\nZoek: "${effectiefZoekladres || postcode}" "${postcode}" site:${domeinHint}\nFallback: "${effectiefZoekladres || postcode}" "${postcode}" ${bordInfo.listing_type}\nURL-prioriteit: makelaar > Immoscoop/Realo/Spotto > Immoweb.\n`;
     } else if (listings.length > 0) {
       listingsContext = `\n\n## LISTINGS (${listings.length} resultaten via ${listingsBron})\n`;
       if (gpsVolledigAdres) listingsContext += `GPS-adres: "${gpsVolledigAdres}" -- kies de listing met dit adres.\n\n`;
