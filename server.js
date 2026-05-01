@@ -767,16 +767,24 @@ const PROMPT_STAP2 = `Je bent de Immo Scanner. Je analyseert een foto van een ma
 3. Kies nooit raak. "niet_gevonden" of "gedeeltelijk" is eerlijker dan een verkeerde match.
 4. Een URL van Realo of Immoscoop is BETER dan geen URL.
 5. Kies een prijs van de meest betrouwbare bron. Vermeld geen prijsverschillen tussen aggregators.
+6. "gevonden_via": gebruik UITSLUITEND één van deze exacte waarden: "web_search" | "makelaar_direct" | "immoweb_fallback" | "niet_gevonden". Geen andere tekst.
+
+## STATUS-REGELS (volg exact)
+- "gevonden": straatnaam matcht EN (huisnummer exact ÓF verschil ≤ 2) EN transactie klopt.
+  → GPS geeft soms 1-2 nummers naast het pand. Rechtstraat 64 vs 65A = GEVONDEN.
+- "gedeeltelijk": straatnaam matcht maar huisnummer onbekend of twijfelachtig. Óf: listing gevonden maar adres niet volledig bevestigd.
+- "niet_gevonden": straatnaam matcht niet, of echt niets gevonden.
 
 ## WANNEER JE WEB SEARCH GEBRUIKT
 Zoek in deze volgorde:
-1. "[GPS-straatnaam]" "[gemeente]" site:[makelaarsdomein]
-2. "[GPS-straatnaam]" "[gemeente]" site:realo.be
+0. Als referentienummer beschikbaar: "[referentienummer]" site:[makelaarsdomein]
+1. "[GPS-straatnaam]" "[postcode]" site:[makelaarsdomein]
+2. "[GPS-straatnaam]" "[postcode]" site:realo.be
 3. "[GPS-straatnaam]" "[gemeente]" site:immoscoop.be
 4. "[GPS-straatnaam]" "[gemeente]" site:spotto.be
 5. "[Makelaar naam]" "[GPS-straatnaam]" "[gemeente]" te koop
 
-ADRESREGEL: match ALTIJD op straatnaam.
+ADRESREGEL: match ALTIJD op straatnaam. Huisnummerverschil ≤ 2 is acceptabel (GPS-drift).
 BRONREGEL: prijs, oppervlakte en slaapkamers moeten van DEZELFDE pagina komen als de URL.
 
 URL-REGELS:
@@ -785,7 +793,7 @@ URL-REGELS:
   Gebruik NOOIT een zoekresultatenpagina (herkenbaar aan /search/, /zoeken/, ?q=, ?page=).
 
 ## WANNEER JE EEN LIJST VAN LISTINGS KRIJGT
-Kies de listing die het beste overeenkomt op basis van GPS-straatnaam, pand-type en transactie.
+Kies de listing die het beste overeenkomt op basis van GPS-straatnaam, pand-type en transactie. Huisnummerverschil ≤ 2 is geen reden voor "gedeeltelijk" — tel dat als "gevonden".
 
 ## OUTPUT
 {
@@ -1047,7 +1055,8 @@ app.post('/api/scan', async (req, res) => {
 
     if (listingsBron === 'web_search_direct' || listingsBron === 'scraping_leeg' || listingsBron === 'straat_geen_match') {
       const waarom = { 'web_search_direct': 'Makelaar staat niet in onze database.', 'scraping_leeg': 'Directe scraping leverde geen listings op.', 'straat_geen_match': `Scraping vond listings, maar geen enkele had adres "${gpsStraat}".` }[listingsBron] || '';
-      listingsContext = `\n\n## WEB SEARCH VEREIST\n${gpsVolledigAdres ? `GPS-adres: "${gpsVolledigAdres}"` : 'Geen GPS beschikbaar.'}\nPostcode: ${postcode}\nMakelaar: ${bordInfo.makelaar} (${domeinHint})\nReden: ${waarom}\n\nZoek: "${gpsVolledigAdres || postcode}" site:${domeinHint}\nFallback: "${gpsVolledigAdres || postcode}" "${postcode}" ${bordInfo.listing_type}\nURL-prioriteit: makelaar > Immoscoop/Realo/Spotto > Immoweb.\n`;
+      const refHint = bordInfo.referentienummer ? `\nReferentienummer: ${bordInfo.referentienummer} → Zoek dit EERST: "${bordInfo.referentienummer}" site:${domeinHint}` : '';
+      listingsContext = `\n\n## WEB SEARCH VEREIST\n${gpsVolledigAdres ? `GPS-adres: "${gpsVolledigAdres}"` : 'Geen GPS beschikbaar.'}\nPostcode: ${postcode}\nMakelaar: ${bordInfo.makelaar} (${domeinHint})\nReden: ${waarom}${refHint}\n\nZoek: "${gpsVolledigAdres || postcode}" "${postcode}" site:${domeinHint}\nFallback: "${gpsVolledigAdres || postcode}" "${postcode}" ${bordInfo.listing_type}\nURL-prioriteit: makelaar > Immoscoop/Realo/Spotto > Immoweb.\n`;
     } else if (listings.length > 0) {
       listingsContext = `\n\n## LISTINGS (${listings.length} resultaten via ${listingsBron})\n`;
       if (gpsVolledigAdres) listingsContext += `GPS-adres: "${gpsVolledigAdres}" -- kies de listing met dit adres.\n\n`;
@@ -1061,7 +1070,8 @@ app.post('/api/scan', async (req, res) => {
         listingsContext += '\n';
       }
     } else {
-      listingsContext = `\n\n## GEEN LISTINGS GEVONDEN\n${gpsVolledigAdres ? `Probeer web_search: "${gpsVolledigAdres}" site:${domeinHint}` : 'Geen GPS beschikbaar.'}\n`;
+      const refFallback = bordInfo.referentienummer ? ` OF "${bordInfo.referentienummer}" site:${domeinHint}` : '';
+      listingsContext = `\n\n## GEEN LISTINGS GEVONDEN\n${gpsVolledigAdres ? `Probeer web_search: "${gpsVolledigAdres}" "${postcode}" site:${domeinHint}${refFallback}` : 'Geen GPS beschikbaar.'}\n`;
     }
 
     // Locatie info
@@ -1106,6 +1116,14 @@ app.post('/api/scan', async (req, res) => {
     result.makelaar_betrouwbaarheid = result.makelaar_betrouwbaarheid || bordInfo.makelaar_betrouwbaarheid;
     result.telefoon             = result.telefoon             || bordInfo.telefoon;
     if (!Array.isArray(result.url_alternatieven)) result.url_alternatieven = [];
+    // Normaliseer gevonden_via — Claude plaatst soms lange tekst ipv enum-waarde
+    const _validGevondenVia = ['web_search', 'makelaar_direct', 'immoweb_fallback', 'niet_gevonden'];
+    if (!_validGevondenVia.includes(result.gevonden_via)) {
+      if (listingsBron === 'makelaar_direct')    result.gevonden_via = 'makelaar_direct';
+      else if (listingsBron === 'immoweb_fallback') result.gevonden_via = 'immoweb_fallback';
+      else if (result.status === 'niet_gevonden')  result.gevonden_via = 'niet_gevonden';
+      else result.gevonden_via = 'web_search';
+    }
 
     // ── Fallback: URLs uit web_search tool-results ────────────────
     if (result.url_alternatieven.length === 0 && gpsStraat) {
@@ -1144,9 +1162,12 @@ app.post('/api/scan', async (req, res) => {
     if (result.url) {
       const urlActief = await checkUrlActief(result.url);
       if (urlActief === false) {
-        result.url = null; result.status = 'niet_gevonden';
+        const hadAlternatieven = Array.isArray(result.url_alternatieven) && result.url_alternatieven.length > 0;
+        result.url = null;
+        // Downgrade naar gedeeltelijk (niet niet_gevonden) — info en alternatieven blijven bruikbaar
+        if (result.status === 'gevonden') result.status = 'gedeeltelijk';
         result.faal_categorie = result.faal_categorie || 'LISTING_NIET_ONLINE';
-        result.notitie = 'De listing bestaat niet meer (404). ' + (result.notitie || '');
+        result.notitie = 'Directe link niet meer beschikbaar (404).' + (hadAlternatieven ? ' Zie alternatieven hieronder.' : '') + (result.notitie ? ' ' + result.notitie : '');
       } else if (urlActief === null) {
         result.notitie = (result.notitie ? result.notitie + ' ' : '') + 'Let op: de link kon niet automatisch gecontroleerd worden.';
       }
