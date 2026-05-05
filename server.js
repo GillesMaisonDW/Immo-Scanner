@@ -1193,6 +1193,18 @@ app.post('/api/scan', async (req, res) => {
       }
       result.url = null;
     }
+    // Overzichtspagina's horen NIET in result.url — Claude geeft soms de listings-lijst als URL
+    // Een detail-URL heeft een numeriek ID (bv. /4343363/) of ≥ 4 padsegmenten
+    if (result.url) {
+      const _pad = result.url.replace(/https?:\/\/[^/]+/, '').replace(/\?.*$/, '');
+      const _segmenten = _pad.split('/').filter(Boolean).length;
+      const _heeftNumId = /\/\d{4,}(\/|$)/.test(_pad);
+      if (_segmenten <= 3 && !_heeftNumId) {
+        console.log(`⚠️ Overzichtspagina in result.url (${_segmenten} segmenten, geen ID): ${result.url} → gewist`);
+        result.url = null;
+        if (result.status === 'gevonden') result.status = 'gedeeltelijk';
+      }
+    }
     // Normaliseer gevonden_via — Claude plaatst soms lange tekst ipv enum-waarde
     const _validGevondenVia = ['web_search', 'makelaar_direct', 'immoweb_fallback', 'niet_gevonden'];
     if (!_validGevondenVia.includes(result.gevonden_via)) {
@@ -1277,16 +1289,20 @@ app.post('/api/scan', async (req, res) => {
 
     // ── GPS-straat validatie ──────────────────────────────────────
     if (gpsStraat && adresListing) {
-      const straatLow  = gpsStraat.toLowerCase();
       const adresLow   = adresListing.toLowerCase();
-      const straatOk   = adresLow.includes(straatLow);
+      // Accepteer: GPS-straat, het gecorrigeerde plein-adres, of postcode als match
+      const straatOk   = adresLow.includes(gpsStraat.toLowerCase()) ||
+                         (effectiefZoekladres && effectiefZoekladres !== gpsVolledigAdres &&
+                          adresLow.includes(effectiefZoekladres.toLowerCase().split(' ')[0]));
       const postcodeOk = !postcode || adresListing.includes(postcode);
       if (!straatOk || !postcodeOk) {
-        const reden = !straatOk ? `straat "${gpsStraat}" niet in "${adresListing}"` : `postcode mismatch`;
+        const referentieStraat = (effectiefZoekladres && effectiefZoekladres !== gpsVolledigAdres)
+          ? `${gpsStraat} / ${effectiefZoekladres.split(' ')[0]}` : gpsStraat;
+        const reden = !straatOk ? `straat "${referentieStraat}" niet in "${adresListing}"` : `postcode mismatch`;
         console.log(`🔴 Adres-mismatch (${reden}) -> URL gewist`);
         result.url = null; result.status = 'niet_gevonden';
         result.faal_categorie = result.faal_categorie || 'ADRES_MISMATCH';
-        result.notitie = `Gevonden listing staat op "${adresListing}" maar GPS-locatie is "${gpsStraat}". ` + (result.notitie || '');
+        result.notitie = `Gevonden listing staat op "${adresListing}" maar GPS-locatie is "${referentieStraat}". ` + (result.notitie || '');
         adresListing = null;
       }
     }
