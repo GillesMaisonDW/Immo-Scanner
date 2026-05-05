@@ -517,14 +517,29 @@ async function verrijkListingAdressen(listings, hoofdgemeente, postcode, straatG
   const kandidaten = [...lokaal, ...overig].slice(0, maxKandidaten);
   if (kandidaten.length === 0) return listings;
   console.log(`📍 Adres ophalen voor max ${kandidaten.length} listings (${lokaal.length} lokaal${straatLw ? `, early exit op "${straatGps}"` : ''})`);
+  let opeenvolgendeMislukkingen = 0;
   for (const listing of kandidaten) {
     try {
       const adres = await fetchAdresVanListing(listing.url);
       if (adres) {
+        opeenvolgendeMislukkingen = 0;
         listing.address = adres;
         if (straatLw && adres.toLowerCase().includes(straatLw)) { console.log(`✅  GPS-straat "${straatGps}" gevonden -- stop`); break; }
+      } else {
+        opeenvolgendeMislukkingen++;
+        if (opeenvolgendeMislukkingen >= 5) {
+          console.log(`⏭️  5 opeenvolgende mislukkingen — JS-site waarschijnlijk, stop adres ophalen (STAP 3 zoekt verder)`);
+          break;
+        }
       }
-    } catch (e) { console.warn(`  Adres ophalen mislukt voor ${listing.url}: ${e.message}`); }
+    } catch (e) {
+      opeenvolgendeMislukkingen++;
+      console.warn(`  Adres ophalen mislukt voor ${listing.url}: ${e.message}`);
+      if (opeenvolgendeMislukkingen >= 5) {
+        console.log(`⏭️  5 opeenvolgende mislukkingen — JS-site waarschijnlijk, stop adres ophalen`);
+        break;
+      }
+    }
   }
   return listings;
 }
@@ -1198,6 +1213,7 @@ app.post('/api/scan', async (req, res) => {
     const jsonMatch = rawText.match(/\{[\s\S]*\}/);
     if (!jsonMatch) return res.status(500).json({ error: 'Matching mislukt.' });
     const result = JSON.parse(jsonMatch[0]);
+    console.log(`🔍 STAP 3 ruwe output — url: ${result.url || 'null'} | alternatieven: ${JSON.stringify(result.url_alternatieven || [])} | status: ${result.status}`);
 
     result.makelaar             = result.makelaar             || bordInfo.makelaar;
     result.makelaar_herkenning  = result.makelaar_herkenning  || bordInfo.makelaar_herkenning;
