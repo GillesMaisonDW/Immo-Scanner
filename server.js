@@ -884,12 +884,16 @@ app.post('/api/scan', async (req, res) => {
   try {
     // ── STAP 1: Foto-analyse ──────────────────────────────────────
     console.log('📸 STAP 1: Foto-analyse starten...');
-    const stap1Resp = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-api-key': API_KEY, 'anthropic-version': '2023-06-01' },
-      body: JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: 600, temperature: 0, system: PROMPT_STAP1, messages: [{ role: 'user', content: [{ type: 'image', source: { type: 'base64', media_type: mime || 'image/jpeg', data: image } }, { type: 'text', text: 'Analyseer dit makelaarsbord. Geef de JSON.' }] }] })
-    });
-    if (!stap1Resp.ok) { const err = await stap1Resp.text(); return res.status(502).json({ error: `Claude API fout stap 1 (${stap1Resp.status}).` }); }
+    const stap1ReqBody = JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: 600, temperature: 0, system: PROMPT_STAP1, messages: [{ role: 'user', content: [{ type: 'image', source: { type: 'base64', media_type: mime || 'image/jpeg', data: image } }, { type: 'text', text: 'Analyseer dit makelaarsbord. Geef de JSON.' }] }] });
+    const stap1ReqHeaders = { 'Content-Type': 'application/json', 'x-api-key': API_KEY, 'anthropic-version': '2023-06-01' };
+    let stap1Resp = await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', headers: stap1ReqHeaders, body: stap1ReqBody });
+    if (!stap1Resp.ok && [500, 529].includes(stap1Resp.status)) {
+      const errBody = await stap1Resp.text();
+      console.warn(`⚠️ STAP 1 fout ${stap1Resp.status} — retry over 8s. Detail: ${errBody.slice(0, 200)}`);
+      await new Promise(r => setTimeout(r, 8000));
+      stap1Resp = await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', headers: stap1ReqHeaders, body: stap1ReqBody });
+    }
+    if (!stap1Resp.ok) { const err = await stap1Resp.text(); console.error(`❌ STAP 1 mislukt (${stap1Resp.status}): ${err.slice(0, 400)}`); return res.status(502).json({ error: `Claude API fout stap 1 (${stap1Resp.status}).` }); }
     const stap1Data  = await stap1Resp.json();
     const stap1Text  = stap1Data.content?.find(b => b.type === 'text')?.text || '';
     const stap1Match = stap1Text.match(/\{[\s\S]*\}/);
