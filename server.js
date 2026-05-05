@@ -806,7 +806,7 @@ Voer ALLE stappen hieronder uit — ook als je al een URL gevonden hebt. Doel: m
 6. Breed vangnet (enkel als alle bovenstaande leeg): "[Makelaar naam]" "[GPS-straatnaam]" "[postcode]" te koop
 
 Zet de makelaar eigen detail-URL in "url". Zet MAX 1 URL per portaal in "url_alternatieven", in volgorde: Immoscoop, Immoweb, Realo, Zimmo.
-BELANGRIJK: enkel toevoegen als de URL het exacte adres bevat (straatnaam of huisnummer in de URL of op de pagina). Geen willekeurige listings uit dezelfde stad of postcode.
+BELANGRIJK: voeg een aggregator-URL enkel toe als de listing-pagina zelf het juiste adres (straatnaam) bevestigt. De straatnaam hoeft NIET in de URL-slug te staan — Zimmo en Immoweb gebruiken numerieke IDs. Controleer de inhoud van de pagina, niet de URL-structuur.
 
 ADRESREGEL: match ALTIJD op straatnaam. Huisnummerverschil ≤ 2 is acceptabel (GPS-drift).
 BRONREGEL: prijs, oppervlakte en slaapkamers moeten van DEZELFDE pagina komen als de URL.
@@ -1135,7 +1135,7 @@ app.post('/api/scan', async (req, res) => {
       }
       const zoekAdres = effectiefZoekladres || postcode || '';
       const makelaarNaam = bordInfo.makelaar || '';
-      listingsContext = `\n\n## WEB SEARCH VEREIST\n${effectiefZoekladres ? `GPS-adres: "${effectiefZoekladres}"` : 'Geen GPS beschikbaar.'}\nPostcode: ${postcode}\nMakelaar: ${makelaarNaam} (${domeinHint})\nReden: ${waarom}${refHint}${nabijStratenHint}\n\nVOER ALLE STAPPEN UIT (ook als je al een URL hebt — verzamel zoveel mogelijk links):\n1. "${zoekAdres}" "${postcode}" site:${domeinHint}\n2. "${zoekAdres}" "${postcode}" site:immoscoop.be\n3. "${zoekAdres}" "${postcode}" site:immoweb.be\n4. "${makelaarNaam}" "${zoekAdres}" "${postcode}" site:realo.be\n5. "${zoekAdres}" "${postcode}" site:zimmo.be\n\nTIP stap 4: Realo vermeldt de makelaarsnaam in elke listing. "${makelaarNaam}" + adres op realo.be is het krachtigste vangnet als de officiële site niets geeft.\nZet makelaar eigen URL in "url", alle aggregator-URLs in "url_alternatieven" in volgorde: Immoscoop, Immoweb, Realo, Zimmo.\n`;
+      listingsContext = `\n\n## WEB SEARCH VEREIST\n${effectiefZoekladres ? `GPS-adres: "${effectiefZoekladres}"` : 'Geen GPS beschikbaar.'}\nPostcode: ${postcode}\nMakelaar: ${makelaarNaam} (${domeinHint})\nReden: ${waarom}${refHint}${nabijStratenHint}\n\nVOER ALLE STAPPEN UIT (ook als je al een URL hebt — verzamel zoveel mogelijk links):\n1. "${zoekAdres}" "${postcode}" site:${domeinHint}\n2. "${makelaarNaam}" "${zoekAdres}" site:immoscoop.be\n3. "${makelaarNaam}" "${zoekAdres}" site:immoweb.be\n4. "${makelaarNaam}" "${zoekAdres}" "${postcode}" site:realo.be\n5. "${makelaarNaam}" "${zoekAdres}" site:zimmo.be\n\nLET OP: Zimmo en Immoweb gebruiken numerieke IDs in hun URL, niet de straatnaam. Controleer de paginainhoud (niet de URL) om het adres te bevestigen.\nTIP stap 4: Realo vermeldt de makelaarsnaam in elke listing — sterkste vangnet.\nZet makelaar eigen URL in "url", alle aggregator-URLs in "url_alternatieven" in volgorde: Immoscoop, Immoweb, Realo, Zimmo.\n`;
     } else if (listings.length > 0) {
       listingsContext = `\n\n## LISTINGS (${listings.length} resultaten via ${listingsBron})\n`;
       if (gpsVolledigAdres) listingsContext += `GPS-adres: "${gpsVolledigAdres}" -- kies de listing met dit adres.\n\n`;
@@ -1168,7 +1168,7 @@ app.post('/api/scan', async (req, res) => {
     console.log('🎯 STAP 3: Claude matcht listing uit', listings.length, 'kandidaten...');
     const stap3Body = JSON.stringify({
       model: 'claude-sonnet-4-6', max_tokens: 4000,
-      tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: 8 }],
+      tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: 7 }],
       system: PROMPT_STAP2,
       messages: [{ role: 'user', content: [
         { type: 'image', source: { type: 'base64', media_type: mime || 'image/jpeg', data: image } },
@@ -1269,9 +1269,10 @@ app.post('/api/scan', async (req, res) => {
             const padSegmenten = gevondenUrl.replace(/https?:\/\/[^/]+/, '').split('/').filter(Boolean).length;
             const heeftDetailId = /\/\d{4,}/.test(gevondenUrl) || padSegmenten >= 4;
             const urlLower = gevondenUrl.toLowerCase();
-            // Postcode-only match bewust NIET gebruikt — te vaag (matcht alle listings in stad)
+            // Straatnaam in URL (Realo) OF postcode + numeriek ID (Zimmo/Immoweb gebruiken geen straatnaam in URL)
             const straatMatch = (straatLower && urlLower.includes(straatLower.split(' ')[0])) ||
-                                (effectiefLower && urlLower.includes(effectiefLower.split(' ')[0].toLowerCase()));
+                                (effectiefLower && urlLower.includes(effectiefLower.split(' ')[0].toLowerCase())) ||
+                                (heeftDetailId && postcode && gevondenUrl.includes(postcode));
             if (!isZoekpagina && heeftDetailId && straatMatch) {
               bestaandeUrls.add(gevondenUrl);
               gevondenDomeinen.add(agg.domein);
@@ -1376,7 +1377,8 @@ app.post('/api/scan', async (req, res) => {
       }
     }
 
-    console.log('✅ SCAN KLAAR:', { makelaar: result.makelaar, status: result.status, adres: result.adres, duur: `${zoekduur}s` });
+    const altLog = (result.url_alternatieven || []).map(a => `${a.label}: ${a.url}`).join(' | ') || 'geen';
+    console.log('✅ SCAN KLAAR:', { makelaar: result.makelaar, status: result.status, adres: result.adres, url: result.url || 'geen', alternatieven: altLog, duur: `${zoekduur}s` });
 
     // ── Supabase opslaan ──────────────────────────────────────────
     let scanId = null;
