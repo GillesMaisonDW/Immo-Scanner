@@ -1167,8 +1167,6 @@ app.post('/api/scan', async (req, res) => {
       messages: [{ role: 'user', content: [
         { type: 'image', source: { type: 'base64', media_type: mime || 'image/jpeg', data: image } },
         { type: 'text', text: `## BORDANALYSE (stap 1)\nMakelaar: ${bordInfo.makelaar} (${bordInfo.makelaar_herkenning})\nBetrouwbaarheid: ${bordInfo.makelaar_betrouwbaarheid}\nType: ${bordInfo.listing_type}\nPand: ${bordInfo.pand_type_slug}\nReferentienummer: ${bordInfo.referentienummer || 'niet zichtbaar'}\nTelefoon: ${bordInfo.telefoon || 'niet zichtbaar'}\nMakelaar website: ${domeinMakelaar || bordInfo.makelaar_website || 'onbekend'}\n${makelaarExtra ? `Co-makelaar: ${makelaarExtra.naam} (${makelaarExtra.website || 'onbekend'})\n` : ''}\n## LOCATIE\n${locatieInfo}\n${listingsContext}\nGeef het resultaat als JSON.` }
-        ]}]
-      })
       ]}]
     });
     const stap3Headers = { 'Content-Type': 'application/json', 'x-api-key': API_KEY, 'anthropic-version': '2023-06-01', 'anthropic-beta': 'web-search-2025-03-05' };
