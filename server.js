@@ -793,18 +793,19 @@ const PROMPT_STAP2 = `Je bent de Immo Scanner. Je analyseert een foto van een ma
 - "niet_gevonden": straatnaam matcht niet, of echt niets gevonden.
 
 ## WANNEER JE WEB SEARCH GEBRUIKT
-Volg deze zoekvolgorde STRIKT — voer elke stap uit totdat je een directe detail-URL vindt:
+Voer ALLE stappen hieronder uit — ook als je al een URL gevonden hebt. Doel: maximaal aantal betrouwbare links verzamelen voor de gebruiker.
 
 0. Referentienummer (als beschikbaar): "[referentienummer]" site:[makelaarsdomein]
 1. Officiële makelaarsite: "[GPS-straatnaam]" "[postcode]" site:[makelaarsdomein]
-2. Realo MET makelaarsnaam: "[Makelaar naam]" "[GPS-straatnaam]" "[postcode]" site:realo.be
+2. Immoscoop: "[GPS-straatnaam]" "[postcode]" site:immoscoop.be
+3. Immoweb: "[GPS-straatnaam]" "[postcode]" site:immoweb.be
+4. Realo MET makelaarsnaam: "[Makelaar naam]" "[GPS-straatnaam]" "[postcode]" site:realo.be
    → Realo vermeldt de makelaarsnaam in elke listing — dit is het krachtigste vangnet.
    → Gebruik de volledige makelaarsnaam zoals op het bord (bv. "Immo Jo", "ERA", "Heylen").
-3. Immoscoop: "[GPS-straatnaam]" "[postcode]" site:immoscoop.be
-4. Breed vangnet: "[Makelaar naam]" "[GPS-straatnaam]" "[postcode]" te koop
+5. Zimmo: "[GPS-straatnaam]" "[postcode]" site:zimmo.be
+6. Breed vangnet (enkel als alle bovenstaande leeg): "[Makelaar naam]" "[GPS-straatnaam]" "[postcode]" te koop
 
-STOP zodra je een directe detail-URL hebt (met numeriek ID of specifiek adres in de URL).
-Zet die URL in "url" (als het de makelaarsite is) of in "url_alternatieven" (als het Realo/Immoscoop is).
+Zet de makelaar eigen detail-URL in "url". Zet ALLE gevonden aggregator-URLs in "url_alternatieven" in deze volgorde: Immoscoop, Immoweb, Realo, Zimmo.
 
 ADRESREGEL: match ALTIJD op straatnaam. Huisnummerverschil ≤ 2 is acceptabel (GPS-drift).
 BRONREGEL: prijs, oppervlakte en slaapkamers moeten van DEZELFDE pagina komen als de URL.
@@ -812,7 +813,7 @@ BRONREGEL: prijs, oppervlakte en slaapkamers moeten van DEZELFDE pagina komen al
 URL-REGELS:
 - "url": ENKEL de URL op de website van de makelaar zelf. Null als niet gevonden.
   NOOIT een overzichtspagina (bv. /nl/te-koop, /te-koop/gent) — enkel detail-pagina's.
-- "url_alternatieven": directe detail-pagina URLs van aggregators (Realo, Immoscoop, Spotto).
+- "url_alternatieven": directe detail-pagina URLs van aggregators (Realo, Immoscoop, Spotto, Zimmo, Immoweb).
   Gebruik NOOIT een zoekresultatenpagina (herkenbaar aan /search/, /zoeken/, ?q=, ?page=).
 - Aggregator detail-URLs bevatten ALTIJD een numeriek ID of unieke slug met adres.
   VERBODEN: realo.be/nl/search/... of spotto.be/te-huur/lochristi/woonhuis → zoekpagina's.
@@ -1129,7 +1130,7 @@ app.post('/api/scan', async (req, res) => {
       }
       const zoekAdres = effectiefZoekladres || postcode || '';
       const makelaarNaam = bordInfo.makelaar || '';
-      listingsContext = `\n\n## WEB SEARCH VEREIST\n${effectiefZoekladres ? `GPS-adres: "${effectiefZoekladres}"` : 'Geen GPS beschikbaar.'}\nPostcode: ${postcode}\nMakelaar: ${makelaarNaam} (${domeinHint})\nReden: ${waarom}${refHint}${nabijStratenHint}\n\nVOLG DEZE ZOEKVOLGORDE (stop bij eerste directe detail-URL):\n1. "${zoekAdres}" "${postcode}" site:${domeinHint}\n2. "${makelaarNaam}" "${zoekAdres}" "${postcode}" site:realo.be\n3. "${zoekAdres}" "${postcode}" site:immoscoop.be\n4. "${makelaarNaam}" "${zoekAdres}" "${postcode}" te koop\n\nTIP stap 2: Realo vermeldt de makelaarsnaam in elke listing. "${makelaarNaam}" + adres op realo.be is het krachtigste vangnet als de officiële site niets geeft.\nURL-prioriteit: makelaar eigen site > Realo/Immoscoop/Spotto > Immoweb.\n`;
+      listingsContext = `\n\n## WEB SEARCH VEREIST\n${effectiefZoekladres ? `GPS-adres: "${effectiefZoekladres}"` : 'Geen GPS beschikbaar.'}\nPostcode: ${postcode}\nMakelaar: ${makelaarNaam} (${domeinHint})\nReden: ${waarom}${refHint}${nabijStratenHint}\n\nVOER ALLE STAPPEN UIT (ook als je al een URL hebt — verzamel zoveel mogelijk links):\n1. "${zoekAdres}" "${postcode}" site:${domeinHint}\n2. "${zoekAdres}" "${postcode}" site:immoscoop.be\n3. "${zoekAdres}" "${postcode}" site:immoweb.be\n4. "${makelaarNaam}" "${zoekAdres}" "${postcode}" site:realo.be\n5. "${zoekAdres}" "${postcode}" site:zimmo.be\n\nTIP stap 4: Realo vermeldt de makelaarsnaam in elke listing. "${makelaarNaam}" + adres op realo.be is het krachtigste vangnet als de officiële site niets geeft.\nZet makelaar eigen URL in "url", alle aggregator-URLs in "url_alternatieven" in volgorde: Immoscoop, Immoweb, Realo, Zimmo.\n`;
     } else if (listings.length > 0) {
       listingsContext = `\n\n## LISTINGS (${listings.length} resultaten via ${listingsBron})\n`;
       if (gpsVolledigAdres) listingsContext += `GPS-adres: "${gpsVolledigAdres}" -- kies de listing met dit adres.\n\n`;
@@ -1162,7 +1163,7 @@ app.post('/api/scan', async (req, res) => {
     console.log('🎯 STAP 3: Claude matcht listing uit', listings.length, 'kandidaten...');
     const stap3Body = JSON.stringify({
       model: 'claude-sonnet-4-6', max_tokens: 4000,
-      tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: 5 }],
+      tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: 8 }],
       system: PROMPT_STAP2,
       messages: [{ role: 'user', content: [
         { type: 'image', source: { type: 'base64', media_type: mime || 'image/jpeg', data: image } },
@@ -1232,18 +1233,21 @@ app.post('/api/scan', async (req, res) => {
     }
 
     // ── Fallback: URLs uit web_search tool-results ────────────────
-    if (result.url_alternatieven.length === 0 && (gpsStraat || effectiefZoekladres)) {
+    if (gpsStraat || effectiefZoekladres) {
       const straatLower = (gpsStraat || '').toLowerCase();
       const effectiefLower = (effectiefZoekladres || '').toLowerCase();
-      const aggregators = [{ domein: 'realo.be', label: 'Realo' }, { domein: 'immoscoop.be', label: 'Immoscoop' }, { domein: 'spotto.be', label: 'Spotto' }];
-      const gevondenUrls = new Set();
+      const aggregators = [{ domein: 'immoscoop.be', label: 'Immoscoop' }, { domein: 'immoweb.be', label: 'Immoweb' }, { domein: 'realo.be', label: 'Realo' }, { domein: 'zimmo.be', label: 'Zimmo' }, { domein: 'spotto.be', label: 'Spotto' }];
+      const bestaandeUrls = new Set(result.url_alternatieven.map(a => a.url));
+      const gevondenDomeinen = new Set(result.url_alternatieven.map(a => aggregators.find(ag => a.url?.includes(ag.domein))?.domein).filter(Boolean));
       for (const block of stap3Data.content) {
         const blockStr = JSON.stringify(block);
         for (const agg of aggregators) {
+          if (gevondenDomeinen.has(agg.domein)) continue; // al een URL voor dit domein
           const urlRegex = new RegExp(`https?://(?:www\\.)?${agg.domein.replace('.','\\.')}[^"'\\s<>]+`, 'gi');
           let m;
           while ((m = urlRegex.exec(blockStr)) !== null) {
             const gevondenUrl = m[0].replace(/\\u[0-9a-f]{4}/gi, c => String.fromCharCode(parseInt(c.slice(2),16)));
+            if (bestaandeUrls.has(gevondenUrl)) continue;
             const isZoekpagina = /\/search\/|\/zoeken\/|\/resultaten\/|\?q=|\?page=/i.test(gevondenUrl);
             // Aggregator detail-URLs hebben altijd een numeriek ID of ≥4 pad-segmenten
             const padSegmenten = gevondenUrl.replace(/https?:\/\/[^/]+/, '').split('/').filter(Boolean).length;
@@ -1252,8 +1256,9 @@ app.post('/api/scan', async (req, res) => {
             const straatMatch = (straatLower && urlLower.includes(straatLower.split(' ')[0])) ||
                                 (effectiefLower && urlLower.includes(effectiefLower.split(' ')[0])) ||
                                 (postcode && gevondenUrl.includes(postcode));
-            if (!isZoekpagina && heeftDetailId && !gevondenUrls.has(agg.domein) && straatMatch) {
-              gevondenUrls.add(agg.domein);
+            if (!isZoekpagina && heeftDetailId && straatMatch) {
+              bestaandeUrls.add(gevondenUrl);
+              gevondenDomeinen.add(agg.domein);
               result.url_alternatieven.push({ label: agg.label, url: gevondenUrl });
             }
           }
