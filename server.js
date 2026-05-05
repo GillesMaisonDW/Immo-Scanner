@@ -805,7 +805,8 @@ Voer ALLE stappen hieronder uit — ook als je al een URL gevonden hebt. Doel: m
 5. Zimmo: "[GPS-straatnaam]" "[postcode]" site:zimmo.be
 6. Breed vangnet (enkel als alle bovenstaande leeg): "[Makelaar naam]" "[GPS-straatnaam]" "[postcode]" te koop
 
-Zet de makelaar eigen detail-URL in "url". Zet ALLE gevonden aggregator-URLs in "url_alternatieven" in deze volgorde: Immoscoop, Immoweb, Realo, Zimmo.
+Zet de makelaar eigen detail-URL in "url". Zet MAX 1 URL per portaal in "url_alternatieven", in volgorde: Immoscoop, Immoweb, Realo, Zimmo.
+BELANGRIJK: enkel toevoegen als de URL het exacte adres bevat (straatnaam of huisnummer in de URL of op de pagina). Geen willekeurige listings uit dezelfde stad of postcode.
 
 ADRESREGEL: match ALTIJD op straatnaam. Huisnummerverschil ≤ 2 is acceptabel (GPS-drift).
 BRONREGEL: prijs, oppervlakte en slaapkamers moeten van DEZELFDE pagina komen als de URL.
@@ -1199,8 +1200,19 @@ app.post('/api/scan', async (req, res) => {
     result.makelaar_betrouwbaarheid = result.makelaar_betrouwbaarheid || bordInfo.makelaar_betrouwbaarheid;
     result.telefoon             = result.telefoon             || bordInfo.telefoon;
     if (!Array.isArray(result.url_alternatieven)) result.url_alternatieven = [];
-    // Aggregator-domeinen horen NIET in result.url (dat is voor de makelaar's eigen website)
     const _aggDomains = ['realo.be', 'immoscoop.be', 'spotto.be', 'zimmo.be', 'immoweb.be'];
+    // Max 1 URL per portaal (dedup op domein, bewaar de eerste/beste)
+    {
+      const geziendeDomeinen = new Set();
+      result.url_alternatieven = result.url_alternatieven.filter(a => {
+        if (!a?.url) return false;
+        const domein = _aggDomains.find(d => a.url.includes(d)) || a.url.split('/')[2] || '';
+        if (geziendeDomeinen.has(domein)) return false;
+        geziendeDomeinen.add(domein);
+        return true;
+      });
+    }
+    // Aggregator-domeinen horen NIET in result.url (dat is voor de makelaar's eigen website)
     if (result.url && _aggDomains.some(d => (result.url || '').includes(d))) {
       console.log(`⚠️ Aggregator URL in result.url: ${result.url} → verplaatst naar alternatieven`);
       const _isDetailPage = /\/\d{5,}/.test(result.url) && !/\/search\/|\/zoeken\/|\/resultaten\//i.test(result.url);
@@ -1253,9 +1265,9 @@ app.post('/api/scan', async (req, res) => {
             const padSegmenten = gevondenUrl.replace(/https?:\/\/[^/]+/, '').split('/').filter(Boolean).length;
             const heeftDetailId = /\/\d{4,}/.test(gevondenUrl) || padSegmenten >= 4;
             const urlLower = gevondenUrl.toLowerCase();
+            // Postcode-only match bewust NIET gebruikt — te vaag (matcht alle listings in stad)
             const straatMatch = (straatLower && urlLower.includes(straatLower.split(' ')[0])) ||
-                                (effectiefLower && urlLower.includes(effectiefLower.split(' ')[0])) ||
-                                (postcode && gevondenUrl.includes(postcode));
+                                (effectiefLower && urlLower.includes(effectiefLower.split(' ')[0].toLowerCase()));
             if (!isZoekpagina && heeftDetailId && straatMatch) {
               bestaandeUrls.add(gevondenUrl);
               gevondenDomeinen.add(agg.domein);
