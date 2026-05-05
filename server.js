@@ -569,7 +569,7 @@ async function searchMakelaar(makelaarNaam, listingType, gemeente, postcode, mak
       try {
         const nd = JSON.parse(nextMatch[1]);
         const pp = nd?.props?.pageProps || {};
-        const results = pp.properties || pp.listings || pp.results || pp.classifieds || [];
+        const results = pp.properties || pp.listings || pp.results || pp.classifieds || pp.estates || pp.items || pp.data?.properties || pp.data?.listings || pp.data?.results || [];
         if (Array.isArray(results) && results.length > 0) {
           for (const item of results.slice(0,25)) {
             const loc = item.location || item.address || {};
@@ -594,7 +594,7 @@ async function searchMakelaar(makelaarNaam, listingType, gemeente, postcode, mak
       } catch {}
     }
     // Methode 3: Regex links
-    const linkRegex = /href="((?:https?:\/\/[^"]*)?\/(?:te-huur|te-koop|huur|koop|detail|listing|property)[\/\-][^"]{5,120})"/gi;
+    const linkRegex = /href="((?:https?:\/\/[^"]*)?\/(?:te-huur|te-koop|huur|koop|detail|listing|property|aanbod|object|pand|woning|appartement)[\/\-][^"]{5,120})"/gi;
     let lm;
     const seenUrls = new Set(listings.map(l => l.url));
     while ((lm = linkRegex.exec(html)) !== null) {
@@ -1267,10 +1267,9 @@ app.post('/api/scan', async (req, res) => {
         result.notitie = 'Dit pand is niet meer beschikbaar. ' + (result.notitie || '');
       }
     }
-    if (Array.isArray(result.url_alternatieven) && result.url_alternatieven.length > 0) {
-      const beschikbaarChecks = await Promise.all(result.url_alternatieven.map(alt => isNietBeschikbaar(alt.url)));
-      result.url_alternatieven = result.url_alternatieven.filter((_, i) => !beschikbaarChecks[i]);
-    }
+    // Aggregator alternatieven (Realo, Immoscoop, Spotto) niet filteren op isNietBeschikbaar:
+    // Realo is een vastgoedgeschiedenissite — "sold" staat altijd op de pagina (historische data).
+    // De gebruiker kan zelf beoordelen of de aggregator-link bruikbaar is.
 
     // ── Gemeente + adres cleanup ──────────────────────────────────
     if (!result.gemeente && geocodeResultaat?.gemeente) result.gemeente = geocodeResultaat.gemeente;
