@@ -793,24 +793,30 @@ const PROMPT_STAP2 = `Je bent de Immo Scanner. Je analyseert een foto van een ma
 - "niet_gevonden": straatnaam matcht niet, of echt niets gevonden.
 
 ## WANNEER JE WEB SEARCH GEBRUIKT
-Zoek in deze volgorde:
-0. Als referentienummer beschikbaar: "[referentienummer]" site:[makelaarsdomein]
-1. "[GPS-straatnaam]" "[postcode]" site:[makelaarsdomein]
-2. "[GPS-straatnaam]" "[postcode]" site:realo.be
-3. "[GPS-straatnaam]" "[gemeente]" site:immoscoop.be
-4. "[GPS-straatnaam]" "[gemeente]" site:spotto.be
-5. "[Makelaar naam]" "[GPS-straatnaam]" "[gemeente]" te koop
+Volg deze zoekvolgorde STRIKT — voer elke stap uit totdat je een directe detail-URL vindt:
+
+0. Referentienummer (als beschikbaar): "[referentienummer]" site:[makelaarsdomein]
+1. Officiële makelaarsite: "[GPS-straatnaam]" "[postcode]" site:[makelaarsdomein]
+2. Realo MET makelaarsnaam: "[Makelaar naam]" "[GPS-straatnaam]" "[postcode]" site:realo.be
+   → Realo vermeldt de makelaarsnaam in elke listing — dit is het krachtigste vangnet.
+   → Gebruik de volledige makelaarsnaam zoals op het bord (bv. "Immo Jo", "ERA", "Heylen").
+3. Immoscoop: "[GPS-straatnaam]" "[postcode]" site:immoscoop.be
+4. Breed vangnet: "[Makelaar naam]" "[GPS-straatnaam]" "[postcode]" te koop
+
+STOP zodra je een directe detail-URL hebt (met numeriek ID of specifiek adres in de URL).
+Zet die URL in "url" (als het de makelaarsite is) of in "url_alternatieven" (als het Realo/Immoscoop is).
 
 ADRESREGEL: match ALTIJD op straatnaam. Huisnummerverschil ≤ 2 is acceptabel (GPS-drift).
 BRONREGEL: prijs, oppervlakte en slaapkamers moeten van DEZELFDE pagina komen als de URL.
 
 URL-REGELS:
 - "url": ENKEL de URL op de website van de makelaar zelf. Null als niet gevonden.
-- "url_alternatieven": directe detail-pagina URLs van aggregators.
+  NOOIT een overzichtspagina (bv. /nl/te-koop, /te-koop/gent) — enkel detail-pagina's.
+- "url_alternatieven": directe detail-pagina URLs van aggregators (Realo, Immoscoop, Spotto).
   Gebruik NOOIT een zoekresultatenpagina (herkenbaar aan /search/, /zoeken/, ?q=, ?page=).
-- Aggregator detail-URLs (Spotto, Realo, Immoscoop) bevatten ALTIJD een numeriek ID of unieke slug.
-  VERBODEN: spotto.be/te-huur/lochristi/woonhuis → dit is een zoekpagina, geen listing.
-  TOEGESTAAN: spotto.be/te-huur/lochristi/woonhuis/straatnaam-27/123456 → dit is een detail-pagina.
+- Aggregator detail-URLs bevatten ALTIJD een numeriek ID of unieke slug met adres.
+  VERBODEN: realo.be/nl/search/... of spotto.be/te-huur/lochristi/woonhuis → zoekpagina's.
+  TOEGESTAAN: realo.be/nl/wapenplein-14-8400-oostende/3696695 → detail-pagina met ID.
 
 ## WANNEER JE EEN LIJST VAN LISTINGS KRIJGT
 Kies de listing die het beste overeenkomt op basis van GPS-straatnaam, pand-type en transactie. Huisnummerverschil ≤ 2 is geen reden voor "gedeeltelijk" — tel dat als "gevonden".
@@ -1121,7 +1127,9 @@ app.post('/api/scan', async (req, res) => {
           nabijStratenHint += `\nNabijgelegen locaties (${andereNamen.length} binnen 120m): ${andereNamen.join(', ')}\nHoekpand mogelijk? Zoek ook op deze locaties op ${domeinHint}.\n`;
         }
       }
-      listingsContext = `\n\n## WEB SEARCH VEREIST\n${effectiefZoekladres ? `GPS-adres: "${effectiefZoekladres}"` : 'Geen GPS beschikbaar.'}\nPostcode: ${postcode}\nMakelaar: ${bordInfo.makelaar} (${domeinHint})\nReden: ${waarom}${refHint}${nabijStratenHint}\n\nZoek: "${effectiefZoekladres || postcode}" "${postcode}" site:${domeinHint}\nFallback: "${effectiefZoekladres || postcode}" "${postcode}" ${bordInfo.listing_type}\nMakelaarszoekopdracht op aggregators: "${bordInfo.makelaar}" "${effectiefZoekladres || postcode}" — aggregators vermelden soms de makelaarsnaam in de listing, gebruik dit als extra zoeksleutel.\nURL-prioriteit: makelaar > Immoscoop/Realo/Spotto > Immoweb.\n`;
+      const zoekAdres = effectiefZoekladres || postcode || '';
+      const makelaarNaam = bordInfo.makelaar || '';
+      listingsContext = `\n\n## WEB SEARCH VEREIST\n${effectiefZoekladres ? `GPS-adres: "${effectiefZoekladres}"` : 'Geen GPS beschikbaar.'}\nPostcode: ${postcode}\nMakelaar: ${makelaarNaam} (${domeinHint})\nReden: ${waarom}${refHint}${nabijStratenHint}\n\nVOLG DEZE ZOEKVOLGORDE (stop bij eerste directe detail-URL):\n1. "${zoekAdres}" "${postcode}" site:${domeinHint}\n2. "${makelaarNaam}" "${zoekAdres}" "${postcode}" site:realo.be\n3. "${zoekAdres}" "${postcode}" site:immoscoop.be\n4. "${makelaarNaam}" "${zoekAdres}" "${postcode}" te koop\n\nTIP stap 2: Realo vermeldt de makelaarsnaam in elke listing. "${makelaarNaam}" + adres op realo.be is het krachtigste vangnet als de officiële site niets geeft.\nURL-prioriteit: makelaar eigen site > Realo/Immoscoop/Spotto > Immoweb.\n`;
     } else if (listings.length > 0) {
       listingsContext = `\n\n## LISTINGS (${listings.length} resultaten via ${listingsBron})\n`;
       if (gpsVolledigAdres) listingsContext += `GPS-adres: "${gpsVolledigAdres}" -- kies de listing met dit adres.\n\n`;
@@ -1152,21 +1160,32 @@ app.post('/api/scan', async (req, res) => {
 
     // ── STAP 3: Claude matcht listing ────────────────────────────
     console.log('🎯 STAP 3: Claude matcht listing uit', listings.length, 'kandidaten...');
-    const stap3Resp = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-api-key': API_KEY, 'anthropic-version': '2023-06-01', 'anthropic-beta': 'web-search-2025-03-05' },
-      body: JSON.stringify({
-        model: 'claude-sonnet-4-6', max_tokens: 4000,
-        tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: 5 }],
-        system: PROMPT_STAP2,
-        messages: [{ role: 'user', content: [
-          { type: 'image', source: { type: 'base64', media_type: mime || 'image/jpeg', data: image } },
-          { type: 'text', text: `## BORDANALYSE (stap 1)\nMakelaar: ${bordInfo.makelaar} (${bordInfo.makelaar_herkenning})\nBetrouwbaarheid: ${bordInfo.makelaar_betrouwbaarheid}\nType: ${bordInfo.listing_type}\nPand: ${bordInfo.pand_type_slug}\nReferentienummer: ${bordInfo.referentienummer || 'niet zichtbaar'}\nTelefoon: ${bordInfo.telefoon || 'niet zichtbaar'}\nMakelaar website: ${domeinMakelaar || bordInfo.makelaar_website || 'onbekend'}\n${makelaarExtra ? `Co-makelaar: ${makelaarExtra.naam} (${makelaarExtra.website || 'onbekend'})\n` : ''}\n## LOCATIE\n${locatieInfo}\n${listingsContext}\nGeef het resultaat als JSON.` }
+    const stap3Body = JSON.stringify({
+      model: 'claude-sonnet-4-6', max_tokens: 4000,
+      tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: 5 }],
+      system: PROMPT_STAP2,
+      messages: [{ role: 'user', content: [
+        { type: 'image', source: { type: 'base64', media_type: mime || 'image/jpeg', data: image } },
+        { type: 'text', text: `## BORDANALYSE (stap 1)\nMakelaar: ${bordInfo.makelaar} (${bordInfo.makelaar_herkenning})\nBetrouwbaarheid: ${bordInfo.makelaar_betrouwbaarheid}\nType: ${bordInfo.listing_type}\nPand: ${bordInfo.pand_type_slug}\nReferentienummer: ${bordInfo.referentienummer || 'niet zichtbaar'}\nTelefoon: ${bordInfo.telefoon || 'niet zichtbaar'}\nMakelaar website: ${domeinMakelaar || bordInfo.makelaar_website || 'onbekend'}\n${makelaarExtra ? `Co-makelaar: ${makelaarExtra.naam} (${makelaarExtra.website || 'onbekend'})\n` : ''}\n## LOCATIE\n${locatieInfo}\n${listingsContext}\nGeef het resultaat als JSON.` }
         ]}]
       })
+      ]}]
     });
+    const stap3Headers = { 'Content-Type': 'application/json', 'x-api-key': API_KEY, 'anthropic-version': '2023-06-01', 'anthropic-beta': 'web-search-2025-03-05' };
+    let stap3Resp = await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', headers: stap3Headers, body: stap3Body });
+    // Automatische retry bij transient 500/529 (Anthropic overload)
+    if (!stap3Resp.ok && [500, 529].includes(stap3Resp.status)) {
+      const errBody = await stap3Resp.text();
+      console.warn(`⚠️ STAP 3 fout ${stap3Resp.status} — retry over 8s. Detail: ${errBody.slice(0, 200)}`);
+      await new Promise(r => setTimeout(r, 8000));
+      stap3Resp = await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', headers: stap3Headers, body: stap3Body });
+    }
     const zoekduur = ((Date.now() - startTime) / 1000).toFixed(2);
-    if (!stap3Resp.ok) { return res.status(502).json({ error: `Claude API fout stap 3 (${stap3Resp.status}).` }); }
+    if (!stap3Resp.ok) {
+      const errBody = await stap3Resp.text();
+      console.error(`❌ STAP 3 mislukt (${stap3Resp.status}): ${errBody.slice(0, 400)}`);
+      return res.status(502).json({ error: `Claude API fout stap 3 (${stap3Resp.status}).` });
+    }
     const stap3Data = await stap3Resp.json();
 
     let rawText = '';
