@@ -739,7 +739,7 @@ async function straatNamenInBuurt(lat, lon, straal = 120) {
 // ================================================================
 //  STAP 2.5 — PARALLEL PORTAL SEARCHES (Haiku, 1 call per portaal)
 // ================================================================
-async function zoekPortalenParallel(makelaarNaam, domeinHint, zoekAdres, postcode, referentienummer) {
+async function zoekPortalenParallel(makelaarNaam, domeinHint, zoekAdres, postcode, referentienummer, pandType) {
   if (!zoekAdres && !postcode) return [];
   const ad = zoekAdres || postcode;
   // Zoek 1: open Google-search makelaar — geen site:-filter zodat Google de beste match kiest
@@ -760,13 +760,15 @@ async function zoekPortalenParallel(makelaarNaam, domeinHint, zoekAdres, postcod
     {
       label: 'Immoweb',
       domein: 'immoweb.be',
-      query: `"${ad}" "${postcode}" te-koop site:immoweb.be`,
+      // Makelaarsnaam + straat → Google vindt het juiste pand van die makelaar op Immoweb
+      query: `"${ad}" "${makelaarNaam}" site:immoweb.be`,
       openSearch: false,
     },
     {
       label: 'Zimmo',
       domein: 'zimmo.be',
-      query: `"${ad}" "${postcode}" site:zimmo.be`,
+      // Makelaarsnaam + straat → specifiek genoeg voor Zimmo
+      query: `"${ad}" "${makelaarNaam}" site:zimmo.be`,
       openSearch: false,
     },
   ];
@@ -808,19 +810,27 @@ async function zoekPortalenParallel(makelaarNaam, domeinHint, zoekAdres, postcod
       }
 
       // Open search: bepaal effectief domein + label van gevonden URL
-      const resultaten = gevonden.slice(0, 2).map(url => {
+      const resultaten = gevonden.slice(0, 3).map(url => {  // max 3 per portal
         if (!openSearch) return { label, url, domein, query };
         const match = url.match(/https?:\/\/(?:www\.)?([\w.-]+)/);
         const effectiefDomein = match ? match[1] : domein;
-        // Realo en Immoscoop weggooien uit open search (verlopen data)
-        if (effectiefDomein.includes('realo.be') || effectiefDomein.includes('immoscoop.be')) return null;
         let effectiefLabel = label; // default: makelaar eigen site
-        if (effectiefDomein.includes('immoweb.be')) effectiefLabel = 'Immoweb';
-        else if (effectiefDomein.includes('zimmo.be')) effectiefLabel = 'Zimmo';
+        if (effectiefDomein.includes('immoweb.be'))       effectiefLabel = 'Immoweb';
+        else if (effectiefDomein.includes('zimmo.be'))    effectiefLabel = 'Zimmo';
+        else if (effectiefDomein.includes('realo.be'))    effectiefLabel = 'Realo';
+        else if (effectiefDomein.includes('immoscoop.be')) effectiefLabel = 'Immoscoop';
         return { label: effectiefLabel, url, domein: effectiefDomein, query };
       }).filter(Boolean);
 
-      console.log(`  Portal [${label}]: ${gevonden.length} detail-URL(s)${resultaten.length ? ': ' + resultaten[0].url : ''}`);
+      // Duidelijke logging: toon elke gevonden URL en wat ermee gebeurt
+      if (gevonden.length > 0) {
+        gevonden.forEach(u => {
+          const doorgegeven = resultaten.some(r => r.url === u);
+          console.log(`  Portal [${label}]: ${doorgegeven ? '✅' : '⏭️ '} ${u}`);
+        });
+      } else {
+        console.log(`  Portal [${label}]: 0 URLs gevonden`);
+      }
       return resultaten;
     } catch (e) { console.warn(`  Portal [${label}] mislukt:`, e.message); return []; }
   }
@@ -1251,7 +1261,7 @@ app.post('/api/scan', async (req, res) => {
       const makelaarNaam = bordInfo.makelaar || '';
 
       // ── STAP 2.5: Parallel portal searches ───────────────────────
-      const portalResultaten = await zoekPortalenParallel(makelaarNaam, domeinHint, zoekAdres, postcode, bordInfo.referentienummer);
+      const portalResultaten = await zoekPortalenParallel(makelaarNaam, domeinHint, zoekAdres, postcode, bordInfo.referentienummer, bordInfo.pand_type_slug);
       // Bouw portal-context op voor Claude (enkel wat er gevonden is)
       makelaarPortal = portalResultaten.find(r => r.domein === domeinHint);
       const aggPortalen = [
@@ -1542,6 +1552,35 @@ app.post('/api/scan', async (req, res) => {
         result.status = 'gedeeltelijk';
         result.faal_categorie = result.faal_categorie || 'VISUELE_MISMATCH';
         result.notitie = `Visuele check: gebouw lijkt niet overeen te komen met listing-foto. ` + (result.notitie || '');
+      }
+    }
+
+    // ── Server-side: voeg STAP 2.5 portal URLs toe die Claude miste ─────────
+    // Claude is soms te conservatief — portal URLs gevonden door Google gaan er altijd in
+    if (Array.isArray(portalResultaten) && portalResultaten.length > 0) {
+      const toegelaten = ['immoweb.be', 'zimmo.be', 'realo.be', 'immoscoop.be'];
+      const bestaand = new Set((result.url_alternatieven || []).map(a => a.url));
+      const domeinenAlt = new Set((result.url_alternatieven || []).map(a => {
+        const m = a.url?.match(/https?:\/\/(?:www\.)?([\w.-]+)/); return m ? m[1] : '';
+      }));
+      for (const r of portalResultaten) {
+        if (!r.url || r.url === result.url) continue;
+        // Makelaar eigen site: gaat in result.url als dat nog leeg is
+        const isMakelaar = !toegelaten.some(d => r.domein.includes(d));
+        if (isMakelaar && !result.url) {
+          result.url = r.url;
+          if (!result.status || result.status === 'niet_gevonden') result.status = 'gedeeltelijk';
+          console.log(`🔧 Server-side: makelaar URL ${r.url} gezet`);
+          continue;
+        }
+        // Aggregator: max 1 per domein, geen duplicaten
+        if (!isMakelaar && toegelaten.some(d => r.domein.includes(d)) && !bestaand.has(r.url) && !domeinenAlt.has(r.domein)) {
+          result.url_alternatieven = result.url_alternatieven || [];
+          result.url_alternatieven.push({ label: r.label, url: r.url });
+          bestaand.add(r.url);
+          domeinenAlt.add(r.domein);
+          console.log(`🔧 Server-side: ${r.label} URL toegevoegd: ${r.url}`);
+        }
       }
     }
 
