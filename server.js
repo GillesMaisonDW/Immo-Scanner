@@ -742,6 +742,8 @@ async function straatNamenInBuurt(lat, lon, straal = 120) {
 async function zoekPortalenParallel(makelaarNaam, domeinHint, zoekAdres, postcode, referentienummer, pandType) {
   if (!zoekAdres && !postcode) return [];
   const ad = zoekAdres || postcode;
+  // Postcode weglaten uit queries — "Wapenplein" + "Immo Jo" werkt beter dan "Wapenplein 8400" + "Immo Jo"
+  const adZonderPostcode = postcode ? ad.replace(postcode, '').replace(/\s{2,}/g, ' ').trim() : ad;
   // Zoek 1: open Google-search makelaar — geen site:-filter zodat Google de beste match kiest
   // Zoek 2: Immoweb specifiek (actuele listings, betrouwbaar)
   // Zoek 3: Zimmo specifiek (actuele listings, secondary)
@@ -754,21 +756,21 @@ async function zoekPortalenParallel(makelaarNaam, domeinHint, zoekAdres, postcod
       // Zonder: open Google-search "straat" + "makelaar naam" → Google kiest beste match
       query: referentienummer
         ? `"${referentienummer}" site:${domeinHint}`
-        : `"${ad}" "${makelaarNaam}" te koop`,
+        : `"${adZonderPostcode}" "${makelaarNaam}" te koop`,
       openSearch: !referentienummer, // vlag: URL kan van elk domein zijn
     },
     {
       label: 'Immoweb',
       domein: 'immoweb.be',
       // Makelaarsnaam + straat → Google vindt het juiste pand van die makelaar op Immoweb
-      query: `"${ad}" "${makelaarNaam}" site:immoweb.be`,
+      query: `"${adZonderPostcode}" "${makelaarNaam}" site:immoweb.be`,
       openSearch: false,
     },
     {
       label: 'Zimmo',
       domein: 'zimmo.be',
       // Makelaarsnaam + straat → specifiek genoeg voor Zimmo
-      query: `"${ad}" "${makelaarNaam}" site:zimmo.be`,
+      query: `"${adZonderPostcode}" "${makelaarNaam}" site:zimmo.be`,
       openSearch: false,
     },
   ];
