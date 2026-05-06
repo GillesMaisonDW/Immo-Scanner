@@ -736,6 +736,55 @@ async function straatNamenInBuurt(lat, lon, straal = 120) {
   } catch (e) { console.warn('Overpass API fout:', e.message); return { straten: [], pleinen: [] }; }
 }
 // ================================================================
+//  STAP 2.5 — PARALLEL PORTAL SEARCHES (Haiku, 1 call per portaal)
+// ================================================================
+async function zoekPortalenParallel(makelaarNaam, domeinHint, zoekAdres, postcode, referentienummer) {
+  if (!zoekAdres && !postcode) return [];
+  const ad = zoekAdres || postcode;
+  const portalen = [
+    { domein: domeinHint,     label: 'makelaar',  query: referentienummer ? `"${referentienummer}" site:${domeinHint}` : `"${ad}" "${postcode}" site:${domeinHint}` },
+    { domein: 'immoscoop.be', label: 'Immoscoop', query: `"${makelaarNaam}" "${ad}" site:immoscoop.be` },
+    { domein: 'immoweb.be',   label: 'Immoweb',   query: `"${makelaarNaam}" "${ad}" site:immoweb.be` },
+    { domein: 'realo.be',     label: 'Realo',     query: `"${makelaarNaam}" "${ad}" "${postcode}" site:realo.be` },
+    { domein: 'zimmo.be',     label: 'Zimmo',     query: `"${makelaarNaam}" "${ad}" site:zimmo.be` },
+  ];
+  const _isDetailUrl = (url) => {
+    const pad = url.replace(/https?:\/\/[^/]+/, '').replace(/\?.*$/, '');
+    const segs = pad.split('/').filter(Boolean).length;
+    const heeftId = /\/\d{4,}(\/|$)/.test(pad);
+    return !(/\/search\/|\/zoeken\/|\/resultaten\/|\/overzicht/i.test(url)) && (heeftId || segs >= 3);
+  };
+  async function zoekEen({ domein, label, query }) {
+    try {
+      const resp = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-api-key': API_KEY, 'anthropic-version': '2023-06-01', 'anthropic-beta': 'web-search-2025-03-05' },
+        body: JSON.stringify({ model: 'claude-haiku-4-5-20251001', max_tokens: 150, tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: 1 }], messages: [{ role: 'user', content: query }] }),
+        signal: AbortSignal.timeout(25000)
+      });
+      if (!resp.ok) { console.warn(`  Portal [${label}]: HTTP ${resp.status}`); return []; }
+      const data = await resp.json();
+      const blockStr = JSON.stringify(data.content || []);
+      const domeinEsc = domein.replace('.', '\\.');
+      const urlRegex = new RegExp(`https?://(?:www\\.)?${domeinEsc}[^"'\\s<>\\\\]+`, 'gi');
+      const gevonden = [];
+      let m;
+      while ((m = urlRegex.exec(blockStr)) !== null) {
+        const url = m[0].replace(/\\u[0-9a-f]{4}/gi, c => String.fromCharCode(parseInt(c.slice(2), 16)));
+        if (_isDetailUrl(url) && !gevonden.includes(url)) gevonden.push(url);
+      }
+      console.log(`  Portal [${label}]: ${gevonden.length} detail-URL(s)${gevonden.length ? ': ' + gevonden[0] : ''}`);
+      return gevonden.slice(0, 2).map(url => ({ label, url, domein }));
+    } catch (e) { console.warn(`  Portal [${label}] mislukt:`, e.message); return []; }
+  }
+  const t = Date.now();
+  const resultaten = await Promise.all(portalen.map(zoekEen));
+  const gevonden = resultaten.flat();
+  console.log(`✅ STAP 2.5 klaar (${((Date.now()-t)/1000).toFixed(1)}s): ${gevonden.length} URLs gevonden`);
+  return gevonden;
+}
+
+// ================================================================
 //  SYSTEM PROMPTS
 // ================================================================
 const PROMPT_STAP1 = `Analyseer dit makelaarsbord. Geef ENKEL deze JSON terug, niets anders:
@@ -1152,7 +1201,25 @@ app.post('/api/scan', async (req, res) => {
       }
       const zoekAdres = effectiefZoekladres || postcode || '';
       const makelaarNaam = bordInfo.makelaar || '';
-      listingsContext = `\n\n## WEB SEARCH VEREIST\n${effectiefZoekladres ? `GPS-adres: "${effectiefZoekladres}"` : 'Geen GPS beschikbaar.'}\nPostcode: ${postcode}\nMakelaar: ${makelaarNaam} (${domeinHint})\nReden: ${waarom}${refHint}${nabijStratenHint}\n\nVERPLICHT: Voer ELKE stap hieronder uit als een APARTE web_search aanroep, in volgorde. Stop niet vroeg — ook als stap 1 al een resultaat geeft, voer je stap 2, 3, 4 en 5 nog steeds uit.\n1. "${zoekAdres}" "${postcode}" site:${domeinHint}\n2. "${makelaarNaam}" "${zoekAdres}" site:immoscoop.be\n3. "${makelaarNaam}" "${zoekAdres}" site:immoweb.be\n4. "${makelaarNaam}" "${zoekAdres}" "${postcode}" site:realo.be\n5. "${makelaarNaam}" "${zoekAdres}" site:zimmo.be\n\nLET OP: Zimmo en Immoweb gebruiken numerieke IDs in hun URL, niet de straatnaam. Controleer de paginainhoud (niet de URL) om het adres te bevestigen.\nTIP stap 4: Realo vermeldt de makelaarsnaam in elke listing — sterkste vangnet.\nNa alle 5 stappen: zet makelaar eigen URL in "url", aggregator-URLs in "url_alternatieven" in volgorde: Immoscoop, Immoweb, Realo, Zimmo.\n`;
+
+      // ── STAP 2.5: Parallel portal searches ───────────────────────
+      const portalResultaten = await zoekPortalenParallel(makelaarNaam, domeinHint, zoekAdres, postcode, bordInfo.referentienummer);
+      // Bouw portal-context op voor Claude (enkel wat er gevonden is)
+      const makelaarPortal = portalResultaten.find(r => r.domein === domeinHint);
+      const aggPortalen = [
+        { label: 'Immoscoop', domein: 'immoscoop.be' },
+        { label: 'Immoweb',   domein: 'immoweb.be' },
+        { label: 'Realo',     domein: 'realo.be' },
+        { label: 'Zimmo',     domein: 'zimmo.be' },
+      ];
+      let portalContext = `\n\n## GEVONDEN PORTAL-URLS (parallel gezocht)${nabijStratenHint}\nGPS-adres: "${zoekAdres}"\nMakelaar: ${makelaarNaam} (${domeinHint})\nReden: ${waarom}${refHint}\n\n`;
+      portalContext += `Makelaar eigen site (${domeinHint}): ${makelaarPortal ? makelaarPortal.url : 'geen detail-URL gevonden'}\n`;
+      for (const agg of aggPortalen) {
+        const gevonden = portalResultaten.filter(r => r.domein === agg.domein);
+        portalContext += `${agg.label}: ${gevonden.length ? gevonden.map(r => r.url).join(' | ') : 'geen detail-URL gevonden'}\n`;
+      }
+      portalContext += `\nControleer voor elke gevonden URL of het adres overeenkomt met "${zoekAdres}". Zet de makelaar eigen URL in "url" (null als niet gevonden). Zet de juiste aggregator-URLs in "url_alternatieven" in volgorde: Immoscoop, Immoweb, Realo, Zimmo.\nLET OP: Zimmo en Immoweb gebruiken numerieke IDs in hun URL — controleer de paginainhoud, niet de URL-structuur.\n`;
+      listingsContext = portalContext;
     } else if (listings.length > 0) {
       listingsContext = `\n\n## LISTINGS (${listings.length} resultaten via ${listingsBron})\n`;
       if (gpsVolledigAdres) listingsContext += `GPS-adres: "${gpsVolledigAdres}" -- kies de listing met dit adres.\n\n`;
@@ -1185,7 +1252,7 @@ app.post('/api/scan', async (req, res) => {
     console.log('🎯 STAP 3: Claude matcht listing uit', listings.length, 'kandidaten...');
     const stap3Body = JSON.stringify({
       model: 'claude-sonnet-4-6', max_tokens: 4000,
-      tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: 10 }],
+      tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: 3 }],
       system: PROMPT_STAP2,
       messages: [{ role: 'user', content: [
         { type: 'image', source: { type: 'base64', media_type: mime || 'image/jpeg', data: image } },
@@ -1479,3 +1546,62 @@ app.listen(PORT, () => {
   console.log(`Immo Scanner draait op http://localhost:${PORT}`);
   console.log(`API key: ${API_KEY ? 'geladen' : 'ONTBREEKT'}`);
 });
+ result.gevonden_via,
+        faal_categorie: result.faal_categorie, notitie: result.notitie,
+        gps_beschikbaar: !!gps, gps_nauwkeurigheid_m: gps?.accuracy || null,
+        zoekduur_seconden: parseFloat(zoekduur)
+      }).select('id').single();
+      if (error) { console.error('Supabase schrijffout:', JSON.stringify(error)); }
+      else { scanId = dbData?.id; console.log('Scan opgeslagen, id:', scanId); }
+    }
+    return res.json({ ...result, scan_id: scanId });
+
+  } catch (err) {
+    console.error('Server fout:', err);
+    return res.status(500).json({ error: 'Server fout: ' + err.message });
+  }
+});
+
+// ── /api/supabase-check ───────────────────────────────────────────
+app.get('/api/supabase-check', async (req, res) => {
+  if (!supabase) return res.json({ ok: false, reden: 'SUPABASE_ANON_KEY niet ingesteld' });
+  try {
+    const { data, error } = await supabase.from('scans').select('id').limit(1);
+    if (error) return res.json({ ok: false, reden: 'Leestest mislukt', fout: error.message });
+    const { data: ins, error: insErr } = await supabase.from('scans').insert({ makelaar: '_test_', status: 'niet_gevonden', gps_beschikbaar: false, zoekduur_seconden: 0 }).select('id').single();
+    if (insErr) return res.json({ ok: false, reden: 'Test-insert mislukt', fout: insErr.message });
+    await supabase.from('scans').delete().eq('id', ins.id);
+    return res.json({ ok: true, bericht: 'Supabase verbinding en insert werken correct' });
+  } catch (e) { return res.json({ ok: false, reden: 'Onverwachte fout', fout: e.message }); }
+});
+
+// ── /api/test-zoeken ──────────────────────────────────────────────
+app.get('/api/test-zoeken', async (req, res) => {
+  const { makelaar, type, transactie, gemeente, postcode } = req.query;
+  const gem = gemeente || 'gent';
+  const pc  = postcode || '9000';
+  const tr  = transactie || 'Te huur';
+  const [makelaarListings, immowebListings] = await Promise.all([
+    searchMakelaar(makelaar || 'de fooz', tr, gem, pc),
+    searchImmoweb(type || 'duplex', tr, gem, pc)
+  ]);
+  res.json({ makelaar_direct: { count: makelaarListings.length, listings: makelaarListings }, immoweb_fallback: { count: immowebListings.length, listings: immowebListings } });
+});
+
+// ── /api/feedback ─────────────────────────────────────────────────
+app.post('/api/feedback', async (req, res) => {
+  const { scan_id, feedback_type, makelaar_correct, makelaar_naam_correct, faal_categorie_override } = req.body;
+  console.log('FEEDBACK:', { scan_id, feedback_type, makelaar_correct, makelaar_naam_correct });
+  if (supabase && scan_id) {
+    const { error } = await supabase.from('feedback').insert({ scan_id, feedback_type, makelaar_correct: makelaar_correct ?? null, makelaar_naam_correct: makelaar_naam_correct || null, faal_categorie_override: faal_categorie_override || null });
+    if (error) console.error('Feedback schrijffout:', JSON.stringify(error));
+  }
+  res.json({ ok: true });
+});
+
+// ── Server starten ────────────────────────────────────────────────
+app.listen(PORT, () => console.log(`Immo Scanner draait op poort ${PORT}`));
+PI_KEY ? 'aanwezig' : 'ontbreekt', supabase: supabase ? 'verbonden' : 'niet verbonden' });
+});
+
+app.listen(PORT, () => console.log(`🚀 Immo Scanner v2 draait op poort ${PORT}`));
