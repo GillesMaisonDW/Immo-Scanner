@@ -742,18 +742,26 @@ async function zoekPortalenParallel(makelaarNaam, domeinHint, zoekAdres, postcod
   if (!zoekAdres && !postcode) return [];
   const ad = zoekAdres || postcode;
   const portalen = [
+    // Makelaar: adres + postcode (referentienummer heeft voorrang)
     { domein: domeinHint,     label: 'makelaar',  query: referentienummer ? `"${referentienummer}" site:${domeinHint}` : `"${ad}" "${postcode}" site:${domeinHint}` },
+    // Immoscoop: makelaarsnaam + adres
     { domein: 'immoscoop.be', label: 'Immoscoop', query: `"${makelaarNaam}" "${ad}" site:immoscoop.be` },
-    { domein: 'immoweb.be',   label: 'Immoweb',   query: `"${makelaarNaam}" "${ad}" site:immoweb.be` },
+    // Immoweb: enkel adres + postcode (geen makelaarsnaam → anders vinden we de agentschapspagina)
+    { domein: 'immoweb.be',   label: 'Immoweb',   query: `"${ad}" "${postcode}" te-koop site:immoweb.be` },
+    // Realo: makelaarsnaam + adres + postcode (Realo toont makelaarsnaam op elke listing)
     { domein: 'realo.be',     label: 'Realo',     query: `"${makelaarNaam}" "${ad}" "${postcode}" site:realo.be` },
-    { domein: 'zimmo.be',     label: 'Zimmo',     query: `"${makelaarNaam}" "${ad}" site:zimmo.be` },
+    // Zimmo: enkel adres + postcode (Zimmo toont makelaarsnaam niet prominent)
+    { domein: 'zimmo.be',     label: 'Zimmo',     query: `"${ad}" "${postcode}" site:zimmo.be` },
   ];
   const _isDetailUrl = (url) => {
     const pad = url.replace(/https?:\/\/[^/]+/, '').replace(/\?.*$/, '');
     const segs = pad.split('/').filter(Boolean).length;
-    const heeftId = /\/\d{4,}(\/|$)/.test(pad);
-    return !(/\/search\/|\/zoeken\/|\/resultaten\/|\/overzicht/i.test(url)) && (heeftId || segs >= 3);
+    const heeftNumId = /\/\d{4,}(\/|$)/.test(pad);
+    // Blokkeer zoekpagina's, overzichten en Immoweb agentschapspagina's
+    const geblokkeerd = /\/search\/|\/zoeken\/|\/resultaten\/|\/overzicht|\/agentschap\//i.test(url);
+    return !geblokkeerd && (heeftNumId || segs >= 3);
   };
+  const _stripQueryParams = (url) => url.split('?')[0].split('#')[0];
   async function zoekEen({ domein, label, query }) {
     try {
       const resp = await fetch('https://api.anthropic.com/v1/messages', {
@@ -770,11 +778,13 @@ async function zoekPortalenParallel(makelaarNaam, domeinHint, zoekAdres, postcod
       const gevonden = [];
       let m;
       while ((m = urlRegex.exec(blockStr)) !== null) {
-        const url = m[0].replace(/\\u[0-9a-f]{4}/gi, c => String.fromCharCode(parseInt(c.slice(2), 16)));
+        const rawUrl = m[0].replace(/\\u[0-9a-f]{4}/gi, c => String.fromCharCode(parseInt(c.slice(2), 16)));
+        const url = _stripQueryParams(rawUrl); // verwijder tracking-parameters
         if (_isDetailUrl(url) && !gevonden.includes(url)) gevonden.push(url);
       }
       console.log(`  Portal [${label}]: ${gevonden.length} detail-URL(s)${gevonden.length ? ': ' + gevonden[0] : ''}`);
-      return gevonden.slice(0, 2).map(url => ({ label, url, domein }));
+      // Sla de zoekquery mee op als verificatiebewijs voor Claude
+      return gevonden.slice(0, 2).map(url => ({ label, url, domein, query }));
     } catch (e) { console.warn(`  Portal [${label}] mislukt:`, e.message); return []; }
   }
   const t = Date.now();
@@ -1212,13 +1222,33 @@ app.post('/api/scan', async (req, res) => {
         { label: 'Realo',     domein: 'realo.be' },
         { label: 'Zimmo',     domein: 'zimmo.be' },
       ];
-      let portalContext = `\n\n## GEVONDEN PORTAL-URLS (parallel gezocht)${nabijStratenHint}\nGPS-adres: "${zoekAdres}"\nMakelaar: ${makelaarNaam} (${domeinHint})\nReden: ${waarom}${refHint}\n\n`;
-      portalContext += `Makelaar eigen site (${domeinHint}): ${makelaarPortal ? makelaarPortal.url : 'geen detail-URL gevonden'}\n`;
+      let portalContext = `\n\n## GEVONDEN PORTAL-URLS (parallel gezocht via Google)${nabijStratenHint}\nGPS-adres: "${zoekAdres}"\nMakelaar: ${makelaarNaam} (${domeinHint})\nReden: ${waarom}${refHint}\n\n`;
+
+      // Makelaar eigen site — met verificatiequery
+      if (makelaarPortal) {
+        portalContext += `Makelaar eigen site (${domeinHint}): ${makelaarPortal.url}\n`;
+        portalContext += `  → Gevonden via Google query: "${makelaarPortal.query}" — Google bevestigt dat deze URL inhoud heeft over "${zoekAdres}".\n`;
+      } else {
+        portalContext += `Makelaar eigen site (${domeinHint}): geen detail-URL gevonden\n`;
+      }
+
+      // Aggregators — met verificatiequery per gevonden URL
       for (const agg of aggPortalen) {
         const gevonden = portalResultaten.filter(r => r.domein === agg.domein);
-        portalContext += `${agg.label}: ${gevonden.length ? gevonden.map(r => r.url).join(' | ') : 'geen detail-URL gevonden'}\n`;
+        if (gevonden.length > 0) {
+          for (const r of gevonden) {
+            portalContext += `${agg.label}: ${r.url}\n`;
+            portalContext += `  → Gevonden via Google query: "${r.query}"\n`;
+          }
+        } else {
+          portalContext += `${agg.label}: geen detail-URL gevonden\n`;
+        }
       }
-      portalContext += `\nControleer voor elke gevonden URL of het adres overeenkomt met "${zoekAdres}". Zet de makelaar eigen URL in "url" (null als niet gevonden). Zet de juiste aggregator-URLs in "url_alternatieven" in volgorde: Immoscoop, Immoweb, Realo, Zimmo.\nLET OP: Zimmo en Immoweb gebruiken numerieke IDs in hun URL — controleer de paginainhoud, niet de URL-structuur.\n`;
+
+      portalContext += `\nINSTRUCTIES:\n`;
+      portalContext += `- Makelaar eigen site: als er een URL staat, neem die over in "url". De Google-zoekopdracht gebruikt het exacte GPS-adres als zoekterm — dat IS de verificatie. Zet status op "gevonden" als ook minstens één aggregator het adres "${zoekAdres}" bevestigt, anders "gedeeltelijk".\n`;
+      portalContext += `- Aggregator URLs: controleer of de pagina-inhoud overeenkomt met "${zoekAdres}". Zimmo en Immoweb gebruiken numerieke IDs in de URL — het adres staat NIET in de URL maar wel op de pagina. Gebruik web_search om de paginainhoud te controleren als je twijfelt.\n`;
+      portalContext += `- Volgorde url_alternatieven: Immoscoop → Immoweb → Realo → Zimmo.\n`;
       listingsContext = portalContext;
     } else if (listings.length > 0) {
       listingsContext = `\n\n## LISTINGS (${listings.length} resultaten via ${listingsBron})\n`;
@@ -1541,5 +1571,4 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', api_key: API_KEY ? 'geladen' : 'ONTBREEKT', supabase: supabase ? 'verbonden' : 'ONTBREEKT', timestamp: new Date().toISOString() });
 });
 
-// ── Server starten ────────────────────────────────────────────────
-app.listen(PORT, () => console.log(`🚀 Immo Scanner v2 draait op poort ${PORT}`));
+app.listen(PORT, () => console.log(`Immo Scanner v2 listening on port ${PORT}`));
