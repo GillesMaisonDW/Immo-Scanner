@@ -808,7 +808,9 @@ const PROMPT_STAP2 = `Je bent de Immo Scanner. Je analyseert een foto van een ma
 - "niet_gevonden": straatnaam matcht niet, of echt niets gevonden.
 
 ## WANNEER JE WEB SEARCH GEBRUIKT
-Voer ALLE stappen hieronder uit — ook als je al een URL gevonden hebt. Doel: maximaal aantal betrouwbare links verzamelen voor de gebruiker.
+VERPLICHT: Roep web_search op voor ELKE stap hieronder — als afzonderlijke tool call, in volgorde, zonder uitzondering.
+Stop NOOIT vroeg. Ook als stap 1 al een URL geeft, voer je stap 2, 3, 4 en 5 nog steeds uit.
+Doel: voor elk portaal minstens één poging doen zodat de gebruiker alle beschikbare links krijgt.
 
 0. Referentienummer (als beschikbaar): "[referentienummer]" site:[makelaarsdomein]
 1. Officiële makelaarsite: "[GPS-straatnaam]" "[postcode]" site:[makelaarsdomein]
@@ -820,7 +822,7 @@ Voer ALLE stappen hieronder uit — ook als je al een URL gevonden hebt. Doel: m
 5. Zimmo: "[GPS-straatnaam]" "[postcode]" site:zimmo.be
 6. Breed vangnet (enkel als alle bovenstaande leeg): "[Makelaar naam]" "[GPS-straatnaam]" "[postcode]" te koop
 
-Zet de makelaar eigen detail-URL in "url". Zet MAX 1 URL per portaal in "url_alternatieven", in volgorde: Immoscoop, Immoweb, Realo, Zimmo.
+Na alle stappen: zet de makelaar eigen detail-URL in "url". Zet MAX 1 URL per portaal in "url_alternatieven", in volgorde: Immoscoop, Immoweb, Realo, Zimmo.
 BELANGRIJK: voeg een aggregator-URL enkel toe als de listing-pagina zelf het juiste adres (straatnaam) bevestigt. De straatnaam hoeft NIET in de URL-slug te staan — Zimmo en Immoweb gebruiken numerieke IDs. Controleer de inhoud van de pagina, niet de URL-structuur.
 
 ADRESREGEL: match ALTIJD op straatnaam. Huisnummerverschil ≤ 2 is acceptabel (GPS-drift).
@@ -1150,7 +1152,7 @@ app.post('/api/scan', async (req, res) => {
       }
       const zoekAdres = effectiefZoekladres || postcode || '';
       const makelaarNaam = bordInfo.makelaar || '';
-      listingsContext = `\n\n## WEB SEARCH VEREIST\n${effectiefZoekladres ? `GPS-adres: "${effectiefZoekladres}"` : 'Geen GPS beschikbaar.'}\nPostcode: ${postcode}\nMakelaar: ${makelaarNaam} (${domeinHint})\nReden: ${waarom}${refHint}${nabijStratenHint}\n\nVOER ALLE STAPPEN UIT (ook als je al een URL hebt — verzamel zoveel mogelijk links):\n1. "${zoekAdres}" "${postcode}" site:${domeinHint}\n2. "${makelaarNaam}" "${zoekAdres}" site:immoscoop.be\n3. "${makelaarNaam}" "${zoekAdres}" site:immoweb.be\n4. "${makelaarNaam}" "${zoekAdres}" "${postcode}" site:realo.be\n5. "${makelaarNaam}" "${zoekAdres}" site:zimmo.be\n\nLET OP: Zimmo en Immoweb gebruiken numerieke IDs in hun URL, niet de straatnaam. Controleer de paginainhoud (niet de URL) om het adres te bevestigen.\nTIP stap 4: Realo vermeldt de makelaarsnaam in elke listing — sterkste vangnet.\nZet makelaar eigen URL in "url", alle aggregator-URLs in "url_alternatieven" in volgorde: Immoscoop, Immoweb, Realo, Zimmo.\n`;
+      listingsContext = `\n\n## WEB SEARCH VEREIST\n${effectiefZoekladres ? `GPS-adres: "${effectiefZoekladres}"` : 'Geen GPS beschikbaar.'}\nPostcode: ${postcode}\nMakelaar: ${makelaarNaam} (${domeinHint})\nReden: ${waarom}${refHint}${nabijStratenHint}\n\nVERPLICHT: Voer ELKE stap hieronder uit als een APARTE web_search aanroep, in volgorde. Stop niet vroeg — ook als stap 1 al een resultaat geeft, voer je stap 2, 3, 4 en 5 nog steeds uit.\n1. "${zoekAdres}" "${postcode}" site:${domeinHint}\n2. "${makelaarNaam}" "${zoekAdres}" site:immoscoop.be\n3. "${makelaarNaam}" "${zoekAdres}" site:immoweb.be\n4. "${makelaarNaam}" "${zoekAdres}" "${postcode}" site:realo.be\n5. "${makelaarNaam}" "${zoekAdres}" site:zimmo.be\n\nLET OP: Zimmo en Immoweb gebruiken numerieke IDs in hun URL, niet de straatnaam. Controleer de paginainhoud (niet de URL) om het adres te bevestigen.\nTIP stap 4: Realo vermeldt de makelaarsnaam in elke listing — sterkste vangnet.\nNa alle 5 stappen: zet makelaar eigen URL in "url", aggregator-URLs in "url_alternatieven" in volgorde: Immoscoop, Immoweb, Realo, Zimmo.\n`;
     } else if (listings.length > 0) {
       listingsContext = `\n\n## LISTINGS (${listings.length} resultaten via ${listingsBron})\n`;
       if (gpsVolledigAdres) listingsContext += `GPS-adres: "${gpsVolledigAdres}" -- kies de listing met dit adres.\n\n`;
@@ -1183,7 +1185,7 @@ app.post('/api/scan', async (req, res) => {
     console.log('🎯 STAP 3: Claude matcht listing uit', listings.length, 'kandidaten...');
     const stap3Body = JSON.stringify({
       model: 'claude-sonnet-4-6', max_tokens: 4000,
-      tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: 7 }],
+      tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: 10 }],
       system: PROMPT_STAP2,
       messages: [{ role: 'user', content: [
         { type: 'image', source: { type: 'base64', media_type: mime || 'image/jpeg', data: image } },
