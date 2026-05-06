@@ -757,7 +757,9 @@ async function zoekPortalenParallel(makelaarNaam, domeinHint, zoekAdres, postcod
     const pad = url.replace(/https?:\/\/[^/]+/, '').replace(/\?.*$/, '');
     const segs = pad.split('/').filter(Boolean).length;
     const heeftNumId = /\/\d{4,}(\/|$)/.test(pad);
-    // Blokkeer zoekpagina's, overzichten en Immoweb agentschapspagina's
+    // Immoweb: enkel zoekertje/classified detail-URLs accepteren (geen agentschap, geen zoeken-goedkope)
+    if (url.includes('immoweb.be')) return /\/(zoekertje|classified)\//i.test(url) && heeftNumId;
+    // Blokkeer zoekpagina's, overzichten en agentschapspagina's
     const geblokkeerd = /\/search\/|\/zoeken\/|\/resultaten\/|\/overzicht|\/agentschap\//i.test(url);
     return !geblokkeerd && (heeftNumId || segs >= 3);
   };
@@ -1282,7 +1284,7 @@ app.post('/api/scan', async (req, res) => {
     console.log('🎯 STAP 3: Claude matcht listing uit', listings.length, 'kandidaten...');
     const stap3Body = JSON.stringify({
       model: 'claude-sonnet-4-6', max_tokens: 4000,
-      tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: 3 }],
+      tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: 1 }],
       system: PROMPT_STAP2,
       messages: [{ role: 'user', content: [
         { type: 'image', source: { type: 'base64', media_type: mime || 'image/jpeg', data: image } },
@@ -1361,6 +1363,12 @@ app.post('/api/scan', async (req, res) => {
         if (result.status === 'gevonden') result.status = 'gedeeltelijk';
       }
     }
+    // ── Server-side override: STAP 2.5 vond makelaar-URL maar Claude negeerde die → forceer ──
+    if (!result.url && makelaarPortal && makelaarPortal.url) {
+      result.url = makelaarPortal.url;
+      if (!result.status || result.status === 'niet_gevonden') result.status = 'gedeeltelijk';
+      console.log(`🔧 Makelaar URL geforceerd vanuit STAP 2.5: ${result.url}`);
+    }
     // Normaliseer gevonden_via — Claude plaatst soms lange tekst ipv enum-waarde
     const _validGevondenVia = ['web_search', 'makelaar_direct', 'immoweb_fallback', 'niet_gevonden'];
     if (!_validGevondenVia.includes(result.gevonden_via)) {
@@ -1395,6 +1403,8 @@ app.post('/api/scan', async (req, res) => {
             const straatMatch = (straatLower && urlLower.includes(straatLower.split(' ')[0])) ||
                                 (effectiefLower && urlLower.includes(effectiefLower.split(' ')[0].toLowerCase())) ||
                                 (heeftDetailId && postcode && gevondenUrl.includes(postcode));
+            // Immoweb: enkel zoekertje/classified URLs, geen zoeken-goedkope of andere pagina's
+            if (agg.domein === 'immoweb.be' && !/\/(zoekertje|classified)\//i.test(gevondenUrl)) continue;
             if (!isZoekpagina && heeftDetailId && straatMatch) {
               bestaandeUrls.add(gevondenUrl);
               gevondenDomeinen.add(agg.domein);
