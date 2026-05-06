@@ -742,17 +742,33 @@ async function straatNamenInBuurt(lat, lon, straal = 120) {
 async function zoekPortalenParallel(makelaarNaam, domeinHint, zoekAdres, postcode, referentienummer) {
   if (!zoekAdres && !postcode) return [];
   const ad = zoekAdres || postcode;
+  // Zoek 1: open Google-search makelaar — geen site:-filter zodat Google de beste match kiest
+  // Zoek 2: Immoweb specifiek (actuele listings, betrouwbaar)
+  // Zoek 3: Zimmo specifiek (actuele listings, secondary)
+  // Realo en Immoscoop weggelaten — tonen voornamelijk verlopen/historische data
   const portalen = [
-    // Makelaar: adres + postcode (referentienummer heeft voorrang)
-    { domein: domeinHint,     label: 'makelaar',  query: referentienummer ? `"${referentienummer}" site:${domeinHint}` : `"${ad}" "${postcode}" site:${domeinHint}` },
-    // Immoscoop: makelaarsnaam + adres
-    { domein: 'immoscoop.be', label: 'Immoscoop', query: `"${makelaarNaam}" "${ad}" site:immoscoop.be` },
-    // Immoweb: enkel adres + postcode (geen makelaarsnaam → anders vinden we de agentschapspagina)
-    { domein: 'immoweb.be',   label: 'Immoweb',   query: `"${ad}" "${postcode}" te-koop site:immoweb.be` },
-    // Realo: makelaarsnaam + adres + postcode (Realo toont makelaarsnaam op elke listing)
-    { domein: 'realo.be',     label: 'Realo',     query: `"${makelaarNaam}" "${ad}" "${postcode}" site:realo.be` },
-    // Zimmo: enkel adres + postcode (Zimmo toont makelaarsnaam niet prominent)
-    { domein: 'zimmo.be',     label: 'Zimmo',     query: `"${ad}" "${postcode}" site:zimmo.be` },
+    {
+      label: 'makelaar',
+      domein: domeinHint,
+      // Met referentienummer: altijd site:-filter (uniek ID → altijd correct)
+      // Zonder: open Google-search "straat" + "makelaar naam" → Google kiest beste match
+      query: referentienummer
+        ? `"${referentienummer}" site:${domeinHint}`
+        : `"${ad}" "${makelaarNaam}" te koop`,
+      openSearch: !referentienummer, // vlag: URL kan van elk domein zijn
+    },
+    {
+      label: 'Immoweb',
+      domein: 'immoweb.be',
+      query: `"${ad}" "${postcode}" te-koop site:immoweb.be`,
+      openSearch: false,
+    },
+    {
+      label: 'Zimmo',
+      domein: 'zimmo.be',
+      query: `"${ad}" "${postcode}" site:zimmo.be`,
+      openSearch: false,
+    },
   ];
   const _isDetailUrl = (url) => {
     const pad = url.replace(/https?:\/\/[^/]+/, '').replace(/\?.*$/, '');
@@ -765,7 +781,7 @@ async function zoekPortalenParallel(makelaarNaam, domeinHint, zoekAdres, postcod
     return !geblokkeerd && (heeftNumId || segs >= 3);
   };
   const _stripQueryParams = (url) => url.split('?')[0].split('#')[0];
-  async function zoekEen({ domein, label, query }) {
+  async function zoekEen({ domein, label, query, openSearch }) {
     try {
       const resp = await fetch('https://api.anthropic.com/v1/messages', {
         method: 'POST',
@@ -776,18 +792,36 @@ async function zoekPortalenParallel(makelaarNaam, domeinHint, zoekAdres, postcod
       if (!resp.ok) { console.warn(`  Portal [${label}]: HTTP ${resp.status}`); return []; }
       const data = await resp.json();
       const blockStr = JSON.stringify(data.content || []);
-      const domeinEsc = domein.replace('.', '\\.');
-      const urlRegex = new RegExp(`https?://(?:www\\.)?${domeinEsc}[^"'\\s<>\\\\]+`, 'gi');
+
+      // Open search (makelaar zonder site:-filter): pak alle URLs, categoriseer op domein
+      // Gesloten search (Immoweb/Zimmo met site:-filter): filter op exact domein
+      const urlRegex = openSearch
+        ? /https?:\/\/(?:www\.)?[\w.-]+(?:\.be|\.nl|\.com|\.immo)(?:\/[^"'\s<>]+)?/gi
+        : new RegExp(`https?://(?:www\\.)?${domein.replace('.', '\\.')}[^"'\\s<>\\\\]+`, 'gi');
+
       const gevonden = [];
       let m;
       while ((m = urlRegex.exec(blockStr)) !== null) {
-        const rawUrl = m[0].replace(/\\u[0-9a-f]{4}/gi, c => String.fromCharCode(parseInt(c.slice(2), 16)));
-        const url = _stripQueryParams(rawUrl); // verwijder tracking-parameters
+        const rawUrl = m[0].replace(/\u[0-9a-f]{4}/gi, c => String.fromCharCode(parseInt(c.slice(2), 16)));
+        const url = _stripQueryParams(rawUrl);
         if (_isDetailUrl(url) && !gevonden.includes(url)) gevonden.push(url);
       }
-      console.log(`  Portal [${label}]: ${gevonden.length} detail-URL(s)${gevonden.length ? ': ' + gevonden[0] : ''}`);
-      // Sla de zoekquery mee op als verificatiebewijs voor Claude
-      return gevonden.slice(0, 2).map(url => ({ label, url, domein, query }));
+
+      // Open search: bepaal effectief domein + label van gevonden URL
+      const resultaten = gevonden.slice(0, 2).map(url => {
+        if (!openSearch) return { label, url, domein, query };
+        const match = url.match(/https?:\/\/(?:www\.)?([\w.-]+)/);
+        const effectiefDomein = match ? match[1] : domein;
+        // Realo en Immoscoop weggooien uit open search (verlopen data)
+        if (effectiefDomein.includes('realo.be') || effectiefDomein.includes('immoscoop.be')) return null;
+        let effectiefLabel = label; // default: makelaar eigen site
+        if (effectiefDomein.includes('immoweb.be')) effectiefLabel = 'Immoweb';
+        else if (effectiefDomein.includes('zimmo.be')) effectiefLabel = 'Zimmo';
+        return { label: effectiefLabel, url, domein: effectiefDomein, query };
+      }).filter(Boolean);
+
+      console.log(`  Portal [${label}]: ${gevonden.length} detail-URL(s)${resultaten.length ? ': ' + resultaten[0].url : ''}`);
+      return resultaten;
     } catch (e) { console.warn(`  Portal [${label}] mislukt:`, e.message); return []; }
   }
   const t = Date.now();
