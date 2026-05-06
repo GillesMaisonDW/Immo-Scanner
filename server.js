@@ -1190,6 +1190,7 @@ app.post('/api/scan', async (req, res) => {
     const deelgemeente = geocodeResultaat?.gemeente || null;
     const heeftDeelgemeente = deelgemeente && hoofdgemeente && deelgemeente.toLowerCase() !== hoofdgemeente.toLowerCase();
 
+    let makelaarPortal = null; // scope buiten if-blok zodat override na STAP 3 het kan gebruiken
     if (listingsBron === 'web_search_direct' || listingsBron === 'scraping_leeg' || listingsBron === 'straat_geen_match') {
       const waarom = { 'web_search_direct': 'Makelaar staat niet in onze database.', 'scraping_leeg': 'Directe scraping leverde geen listings op.', 'straat_geen_match': `Scraping vond listings, maar geen enkele had adres "${gpsStraat}".` }[listingsBron] || '';
       const refHint = bordInfo.referentienummer ? `\nReferentienummer: ${bordInfo.referentienummer} → Zoek dit EERST: "${bordInfo.referentienummer}" site:${domeinHint}` : '';
@@ -1218,7 +1219,7 @@ app.post('/api/scan', async (req, res) => {
       // ── STAP 2.5: Parallel portal searches ───────────────────────
       const portalResultaten = await zoekPortalenParallel(makelaarNaam, domeinHint, zoekAdres, postcode, bordInfo.referentienummer);
       // Bouw portal-context op voor Claude (enkel wat er gevonden is)
-      const makelaarPortal = portalResultaten.find(r => r.domein === domeinHint);
+      makelaarPortal = portalResultaten.find(r => r.domein === domeinHint);
       const aggPortalen = [
         { label: 'Immoscoop', domein: 'immoscoop.be' },
         { label: 'Immoweb',   domein: 'immoweb.be' },
