@@ -829,10 +829,10 @@ BRONREGEL: prijs, oppervlakte en slaapkamers moeten van DEZELFDE pagina komen al
 URL-REGELS:
 - "url": ENKEL de URL op de website van de makelaar zelf. Null als niet gevonden.
   NOOIT een overzichtspagina (bv. /nl/te-koop, /te-koop/gent) — enkel detail-pagina's.
-- "url_alternatieven": directe detail-pagina URLs van aggregators (Realo, Immoscoop, Spotto, Zimmo, Immoweb).
+- "url_alternatieven": directe detail-pagina URLs van aggregators (Immoscoop, Immoweb, Realo, Zimmo). GEEN Spotto.
   Gebruik NOOIT een zoekresultatenpagina (herkenbaar aan /search/, /zoeken/, ?q=, ?page=).
 - Aggregator detail-URLs bevatten ALTIJD een numeriek ID of unieke slug met adres.
-  VERBODEN: realo.be/nl/search/... of spotto.be/te-huur/lochristi/woonhuis → zoekpagina's.
+  VERBODEN: realo.be/nl/search/... of immoscoop.be/te-huur/overzicht → zoekpagina's.
   TOEGESTAAN: realo.be/nl/wapenplein-14-8400-oostende/3696695 → detail-pagina met ID.
 
 ## WANNEER JE EEN LIJST VAN LISTINGS KRIJGT
@@ -1220,13 +1220,18 @@ app.post('/api/scan', async (req, res) => {
     result.makelaar_betrouwbaarheid = result.makelaar_betrouwbaarheid || bordInfo.makelaar_betrouwbaarheid;
     result.telefoon             = result.telefoon             || bordInfo.telefoon;
     if (!Array.isArray(result.url_alternatieven)) result.url_alternatieven = [];
+    // Alle aggregator-domeinen (geblokkeerd uit result.url)
     const _aggDomains = ['realo.be', 'immoscoop.be', 'spotto.be', 'zimmo.be', 'immoweb.be'];
-    // Max 1 URL per portaal (dedup op domein, bewaar de eerste/beste)
+    // Toegelaten alternatieven-domeinen (Spotto niet inbegrepen)
+    const _toegelatenAltDomains = ['immoscoop.be', 'immoweb.be', 'realo.be', 'zimmo.be'];
+    // Verwijder Spotto en ongeldige URLs uit url_alternatieven + dedup op domein
     {
       const geziendeDomeinen = new Set();
       result.url_alternatieven = result.url_alternatieven.filter(a => {
         if (!a?.url) return false;
-        const domein = _aggDomains.find(d => a.url.includes(d)) || a.url.split('/')[2] || '';
+        // Spotto en andere niet-toegelaten domeinen eruit
+        if (!_toegelatenAltDomains.some(d => a.url.includes(d))) return false;
+        const domein = _toegelatenAltDomains.find(d => a.url.includes(d)) || a.url.split('/')[2] || '';
         if (geziendeDomeinen.has(domein)) return false;
         geziendeDomeinen.add(domein);
         return true;
@@ -1235,9 +1240,11 @@ app.post('/api/scan', async (req, res) => {
     // Aggregator-domeinen horen NIET in result.url (dat is voor de makelaar's eigen website)
     if (result.url && _aggDomains.some(d => (result.url || '').includes(d))) {
       console.log(`⚠️ Aggregator URL in result.url: ${result.url} → verplaatst naar alternatieven`);
+      const isSpotto = result.url.includes('spotto.be');
       const _isDetailPage = /\/\d{5,}/.test(result.url) && !/\/search\/|\/zoeken\/|\/resultaten\//i.test(result.url);
-      if (_isDetailPage && !result.url_alternatieven.some(a => a.url === result.url)) {
-        const _domLabel = _aggDomains.find(d => result.url.includes(d))?.split('.')[0] || 'aggregator';
+      // Spotto nooit in url_alternatieven zetten; andere aggregators enkel als het een detail-URL is
+      if (!isSpotto && _isDetailPage && !result.url_alternatieven.some(a => a.url === result.url)) {
+        const _domLabel = _toegelatenAltDomains.find(d => result.url.includes(d))?.split('.')[0] || 'aggregator';
         result.url_alternatieven.push({ label: _domLabel.charAt(0).toUpperCase() + _domLabel.slice(1), url: result.url });
         console.log(`✅ URL verplaatst naar url_alternatieven: ${result.url}`);
       }
@@ -1268,7 +1275,7 @@ app.post('/api/scan', async (req, res) => {
     if (gpsStraat || effectiefZoekladres) {
       const straatLower = (gpsStraat || '').toLowerCase();
       const effectiefLower = (effectiefZoekladres || '').toLowerCase();
-      const aggregators = [{ domein: 'immoscoop.be', label: 'Immoscoop' }, { domein: 'immoweb.be', label: 'Immoweb' }, { domein: 'realo.be', label: 'Realo' }, { domein: 'zimmo.be', label: 'Zimmo' }, { domein: 'spotto.be', label: 'Spotto' }];
+      const aggregators = [{ domein: 'immoscoop.be', label: 'Immoscoop' }, { domein: 'immoweb.be', label: 'Immoweb' }, { domein: 'realo.be', label: 'Realo' }, { domein: 'zimmo.be', label: 'Zimmo' }];
       const bestaandeUrls = new Set(result.url_alternatieven.map(a => a.url));
       const gevondenDomeinen = new Set(result.url_alternatieven.map(a => aggregators.find(ag => a.url?.includes(ag.domein))?.domein).filter(Boolean));
       for (const block of stap3Data.content) {
