@@ -784,6 +784,7 @@ async function zoekPortalenParallel(makelaarNaam, domeinHint, zoekAdres, postcod
   };
   const _stripQueryParams = (url) => url.split('?')[0].split('#')[0];
   async function zoekEen({ domein, label, query, openSearch }) {
+    console.log(`\n  🔎 [${label}] Google query: ${query}`);
     try {
       const resp = await fetch('https://api.anthropic.com/v1/messages', {
         method: 'POST',
@@ -802,11 +803,22 @@ async function zoekPortalenParallel(makelaarNaam, domeinHint, zoekAdres, postcod
         : new RegExp(`https?://(?:www\\.)?${domein.replace('.', '\\.')}[^"'\\s<>\\\\]+`, 'gi');
 
       const gevonden = [];
+      const alleUrls = [];
       let m;
       while ((m = urlRegex.exec(blockStr)) !== null) {
         const rawUrl = m[0].replace(/\u[0-9a-f]{4}/gi, c => String.fromCharCode(parseInt(c.slice(2), 16)));
         const url = _stripQueryParams(rawUrl);
+        alleUrls.push(url);
         if (_isDetailUrl(url) && !gevonden.includes(url)) gevonden.push(url);
+      }
+      if (alleUrls.length > 0) {
+        console.log(`  📋 [${label}] Alle URLs uit Google response (${alleUrls.length}):`);
+        alleUrls.forEach(u => {
+          const ok = gevonden.includes(u);
+          console.log(`      ${ok ? '✅ detail' : '⏭️  filter'} ${u}`);
+        });
+      } else {
+        console.log(`  📋 [${label}] Geen URLs gevonden in Google response`);
       }
 
       // Open search: bepaal effectief domein + label van gevonden URL
@@ -1328,7 +1340,15 @@ app.post('/api/scan', async (req, res) => {
     }
 
     // ── STAP 3: Claude matcht listing ────────────────────────────
+    console.log('\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
     console.log('🎯 STAP 3: Claude matcht listing uit', listings.length, 'kandidaten...');
+    if (listingsContext && listingsContext.includes('PORTAL-URLS')) {
+      // Toon de portal-URLs die Claude te zien krijgt
+      const lines = listingsContext.split('\n').filter(l => l.trim() && !l.includes('INSTRUCTIES') && !l.includes('Nabijgelegen'));
+      console.log('📤 Portal context naar Claude:');
+      lines.forEach(l => { if (l.trim()) console.log('   ', l.trim()); });
+    }
+    console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
     const stap3Body = JSON.stringify({
       model: 'claude-sonnet-4-6', max_tokens: 4000,
       tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: 1 }],
@@ -1557,6 +1577,7 @@ app.post('/api/scan', async (req, res) => {
     }
 
     // ── Server-side: voeg STAP 2.5 portal URLs toe die Claude miste ─────────
+    console.log('\n🔧 SERVER-SIDE CHECK: STAP 3 gaf url=' + (result.url||'null') + ', ' + (result.url_alternatieven||[]).length + ' alternatieven');
     // Claude is soms te conservatief — portal URLs gevonden door Google gaan er altijd in
     if (Array.isArray(portalResultaten) && portalResultaten.length > 0) {
       const toegelaten = ['immoweb.be', 'zimmo.be', 'realo.be', 'immoscoop.be'];
