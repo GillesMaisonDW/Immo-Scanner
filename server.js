@@ -1509,6 +1509,12 @@ app.post('/api/scan', async (req, res) => {
       }
     }
 
+    // ── Laatste status-check: niet_gevonden + alternatieven → gedeeltelijk ──
+    if (!result.url && Array.isArray(result.url_alternatieven) && result.url_alternatieven.length > 0 && result.status === 'niet_gevonden') {
+      result.status = 'gedeeltelijk';
+      console.log(`📋 Status upgrade niet_gevonden→gedeeltelijk: ${result.url_alternatieven.length} alternatief(ven) beschikbaar`);
+    }
+
     const altLog = (result.url_alternatieven || []).map(a => `${a.label}: ${a.url}`).join(' | ') || 'geen';
     console.log('✅ SCAN KLAAR:', { makelaar: result.makelaar, status: result.status, adres: result.adres, url: result.url || 'geen', alternatieven: altLog, duur: `${zoekduur}s` });
 
