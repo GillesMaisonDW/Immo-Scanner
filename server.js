@@ -175,10 +175,11 @@ async function fetchDetailVanListing(url) {
       if (!detail.adres) console.log(`Geen adres via directe fetch voor ${url} -- geen Puppeteer fallback`);
       return detail;
     }
+    console.warn(`fetchDetailVanListing: HTTP ${directResp.status} voor ${url}`);
   } catch (e) {
     console.warn('fetchDetailVanListing fout:', e.message);
-    return { adres: null, prijs: null, slaapkamers: null, oppervlakte: null };
   }
+  return { adres: null, prijs: null, slaapkamers: null, oppervlakte: null };
 }
 async function fetchAdresVanListing(url) {
   const detail = await fetchDetailVanListing(url);
