@@ -5,6 +5,7 @@ const app        = express();
 // ── Config ────────────────────────────────────────────────────────
 const PORT           = process.env.PORT || 3000;
 const API_KEY        = process.env.ANTHROPIC_API_KEY;
+const SERPER_API_KEY = process.env.SERPER_API_KEY;
 const SUPABASE_URL   = process.env.SUPABASE_URL   || 'https://esnpeegulhbcyjnvszaf.supabase.co';
 const SUPABASE_KEY   = process.env.SUPABASE_ANON_KEY;
 // ── Supabase client ───────────────────────────────────────────────
@@ -378,7 +379,7 @@ async function laadMakelaarsUitSupabase() {
   const nu = Date.now();
   if (nu - _makelaarsCacheTs < CACHE_TTL_MS && _makelaarsCache.length > 0) return _makelaarsCache;
   if (!supabase) return [];
-  const { data, error } = await supabase.from('makelaars').select('domein, naam, koop_url, huur_url').order('bevestigd', { ascending: false });
+  const { data, error } = await supabase.from('makelaars').select('domein, naam, koop_url, huur_url, immoweb_agency_id').order('bevestigd', { ascending: false });
   if (error) { console.warn('Makelaars laden mislukt:', error.message); return []; }
   _makelaarsCache   = data || [];
   _makelaarsCacheTs = nu;
@@ -682,6 +683,127 @@ async function searchImmoweb(pandType, listingType, gemeente, postcode) {
   console.log(`Immoweb totaal: ${unique.length} unieke listings`);
   return unique;
 }
+// ── Immoweb agentschapspagina direct scrapen ──────────────────────
+// Omzeilt Google search: fetcht de makelaarspagina op Immoweb rechtstreeks.
+// Voordeel: altijd de meest actuele listings van die makelaar, zonder Google-ruis.
+async function zoekImmowebViaAgentschap(agencyId, straat, postcode, pandType, makelaarNaam) {
+  if (!agencyId) return null;
+  // URL-formaat: /nl/agentschap/[slug]/[id] — slug = makelaarsnaam als kebab-case
+  // Immoweb gebruikt de slug voor SEO maar redirect bij verkeerde slug op basis van ID
+  const slug = (makelaarNaam || 'kantoor')
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, '')
+    .replace(/\s+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '') || 'kantoor';
+  const agencyUrl = `https://www.immoweb.be/nl/agentschap/${slug}/${agencyId}`;
+  console.log(`🏢 Immoweb agentschap direct: ${agencyUrl}`);
+  try {
+    const resp = await fetch(agencyUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'nl-BE,nl;q=0.9,en;q=0.8'
+      },
+      signal: AbortSignal.timeout(12000)
+    });
+    if (!resp.ok) {
+      console.warn(`Immoweb agentschap HTTP ${resp.status} voor agency ${agencyId}`);
+      return null;
+    }
+    const html = await resp.text();
+    const listings = [];
+    // Methode 1: __NEXT_DATA__ (meest betrouwbaar)
+    const nextMatch = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
+    if (nextMatch) {
+      try {
+        const nd = JSON.parse(nextMatch[1]);
+        const pp = nd?.props?.pageProps || {};
+        // Immoweb agentschapspagina kan listings op meerdere plekken stoppen
+        const results =
+          pp.classifieds ||
+          pp.listings ||
+          pp.results ||
+          pp.searchResults?.results ||
+          pp.agency?.classifieds ||
+          pp.data?.classifieds ||
+          [];
+        if (Array.isArray(results) && results.length > 0) {
+          for (const item of results.slice(0, 50)) {
+            const prop = item.property || item;
+            const loc  = prop.location || item.location || {};
+            const trans = item.transaction || {};
+            const priceObj = item.price || trans.sale || trans.rental || {};
+            const listingId = item.id || item.classified?.id || null;
+            const gemeente  = (loc.locality || loc.city || '').toLowerCase().replace(/\s+/g, '-');
+            const pc        = loc.postalCode || postcode || '';
+            const typeSlug  = (prop.type || prop.subtype || pandType || 'appartement').toLowerCase();
+            const transSlug = trans.type === 'FOR_RENT' ? 'te-huur' : 'te-koop';
+            const listingUrl = listingId
+              ? `https://www.immoweb.be/nl/zoekertje/${typeSlug}/${transSlug}/${gemeente}/${pc}/${listingId}`
+              : null;
+            listings.push({
+              id:      listingId,
+              url:     listingUrl,
+              address: [loc.street, loc.number, loc.locality].filter(Boolean).join(' ') || null,
+              postcode: pc || null,
+              price:   priceObj.mainValue ? `EUR ${priceObj.mainValue.toLocaleString('nl-BE')}` : (priceObj.value ? `EUR ${priceObj.value}` : null),
+              bedrooms: prop.bedroomCount || null,
+              area:     prop.netHabitableSurface || prop.surface || null,
+              bron:    'immoweb_agentschap'
+            });
+          }
+          console.log(`  📋 Immoweb agentschap __NEXT_DATA__: ${listings.length} listings`);
+        }
+      } catch (e) { console.warn('Immoweb agentschap __NEXT_DATA__ fout:', e.message); }
+    }
+    // Methode 2: Regex op listing-URLs als fallback
+    if (listings.length === 0) {
+      const urlRegex = /href="(\/nl\/zoekertje\/[^"]+\/(\d{5,}))"/g;
+      let m;
+      const seenIds = new Set();
+      while ((m = urlRegex.exec(html)) !== null) {
+        const id  = m[2];
+        const url = `https://www.immoweb.be${m[1]}`;
+        if (!seenIds.has(id)) {
+          seenIds.add(id);
+          listings.push({ id, url, bron: 'immoweb_agentschap_regex' });
+        }
+      }
+      console.log(`  📋 Immoweb agentschap regex: ${listings.length} listing-URLs`);
+    }
+    if (listings.length === 0) {
+      console.warn(`  Immoweb agentschap ${agencyId}: geen listings geparsed`);
+      return null;
+    }
+    // Filter op straat als GPS-straat beschikbaar
+    if (straat && straat.length >= 4) {
+      const straatLow = straat.toLowerCase();
+      const metAdres  = listings.filter(l => l.address && l.address.toLowerCase().includes(straatLow));
+      if (metAdres.length > 0) {
+        console.log(`  ✅ Immoweb agentschap: ${metAdres.length} listing(s) matchen straat "${straat}"`);
+        return metAdres[0].url;
+      }
+      // Geen adres in __NEXT_DATA__? Haal detail op van recente listings
+      console.log(`  ⏳ Immoweb agentschap: adres niet in overzicht, detail ophalen voor ${Math.min(listings.length, 10)} listings...`);
+      for (const listing of listings.slice(0, 10)) {
+        if (!listing.url) continue;
+        const detail = await fetchDetailVanListing(listing.url);
+        if (detail?.adres && detail.adres.toLowerCase().includes(straatLow)) {
+          console.log(`  ✅ Immoweb agentschap detail-match: ${listing.url} → ${detail.adres}`);
+          return listing.url;
+        }
+      }
+      console.log(`  ❌ Immoweb agentschap: geen listing met straat "${straat}" gevonden`);
+      return null;
+    }
+    // Geen straat? Geef meest recente listing terug
+    return listings[0]?.url || null;
+  } catch (e) {
+    console.warn('zoekImmowebViaAgentschap fout:', e.message);
+    return null;
+  }
+}
 // ── Makelaar afleiden via Immoweb op adres ────────────────────────
 async function ontdekMakelaarViaAdres(straat, gemeente, postcode) {
   if (!straat || !gemeente) return null;
@@ -737,15 +859,33 @@ async function straatNamenInBuurt(lat, lon, straal = 120) {
   } catch (e) { console.warn('Overpass API fout:', e.message); return { straten: [], pleinen: [] }; }
 }
 // ================================================================
-//  STAP 2.5 — PARALLEL PORTAL SEARCHES (Haiku, 1 call per portaal)
+//  STAP 2.5 — PARALLEL PORTAL SEARCHES (Serper.dev = echte Google)
 // ================================================================
 async function zoekPortalenParallel(makelaarNaam, domeinHint, zoekAdres, postcode, referentienummer, pandType) {
   if (!zoekAdres && !postcode) return [];
   const ad = zoekAdres || postcode;
   // Postcode weglaten uit queries — "Wapenplein" + "Immo Jo" werkt beter dan "Wapenplein 8400" + "Immo Jo"
   const adZonderPostcode = postcode ? ad.replace(postcode, '').replace(/\s{2,}/g, ' ').trim() : ad;
+
+  // Zoek het immoweb_agency_id op voor deze makelaar (uit de reeds gecachte DB)
+  let agencyId = null;
+  {
+    const makelaars = await laadMakelaarsUitSupabase();
+    const naamLow   = (makelaarNaam || '').toLowerCase().replace(/[-\s]+/g, ' ').trim();
+    const domClean  = domeinHint.replace('www.', '');
+    const dbMatch   = makelaars.find(m => {
+      const d = m.domein.replace('www.', '');
+      return d === domClean || d.includes(domClean) || domClean.includes(d) ||
+        (m.naam || '').toLowerCase().replace(/[-\s]+/g, ' ').trim() === naamLow;
+    });
+    if (dbMatch?.immoweb_agency_id) {
+      agencyId = dbMatch.immoweb_agency_id;
+      console.log(`  🏢 Immoweb agency ID gevonden voor ${makelaarNaam}: ${agencyId} → directe agentschapspagina`);
+    }
+  }
+
   // Zoek 1: open Google-search makelaar — geen site:-filter zodat Google de beste match kiest
-  // Zoek 2: Immoweb specifiek (actuele listings, betrouwbaar)
+  // Zoek 2: Immoweb — directe agentschapspagina als agency_id bekend, anders Google fallback
   // Zoek 3: Zimmo specifiek (actuele listings, secondary)
   // Realo en Immoscoop weggelaten — tonen voornamelijk verlopen/historische data
   const portalen = [
@@ -762,7 +902,9 @@ async function zoekPortalenParallel(makelaarNaam, domeinHint, zoekAdres, postcod
     {
       label: 'Immoweb',
       domein: 'immoweb.be',
-      // Makelaarsnaam + straat → Google vindt het juiste pand van die makelaar op Immoweb
+      // Agency ID bekend → directe agentschapspagina (geen Google ruis)
+      // Onbekend → Google fallback met makelaarsnaam + straat
+      agencyId: agencyId || null,
       query: `"${adZonderPostcode}" "${makelaarNaam}" site:immoweb.be`,
       openSearch: false,
     },
@@ -774,76 +916,95 @@ async function zoekPortalenParallel(makelaarNaam, domeinHint, zoekAdres, postcod
       openSearch: false,
     },
   ];
-  const _isDetailUrl = (url) => {
+  const _isDetailUrl = (url, openSearch = false) => {
     const pad = url.replace(/https?:\/\/[^/]+/, '').replace(/\?.*$/, '');
     const segs = pad.split('/').filter(Boolean).length;
     const heeftNumId = /\/\d{4,}(\/|$)/.test(pad);
     // Immoweb: enkel zoekertje/classified detail-URLs accepteren (geen agentschap, geen zoeken-goedkope)
     if (url.includes('immoweb.be')) return /\/(zoekertje|classified)\//i.test(url) && heeftNumId;
-    // Blokkeer zoekpagina's, overzichten en agentschapspagina's
-    const geblokkeerd = /\/search\/|\/zoeken\/|\/resultaten\/|\/overzicht|\/agentschap\//i.test(url);
-    return !geblokkeerd && (heeftNumId || segs >= 3);
+    // Blokkeer zoekpagina's, overzichten en agentschapspagina's (altijd)
+    const geblokkeerd = /\/search\/|\/zoeken\/|\/resultaten\/|\/overzicht|\/agentschap\/|\?(q|page|filter)=/i.test(url);
+    if (geblokkeerd) return false;
+    // Open search (makelaar-query via Google): soepeler — 2+ segmenten is genoeg
+    // Google heeft al gefilterd op relevantie, we hoeven niet nog eens streng te zijn
+    if (openSearch) return segs >= 2;
+    // Gesloten search (site:-filter op portaal): strenger — numeriek ID of 3+ segmenten
+    return heeftNumId || segs >= 3;
   };
   const _stripQueryParams = (url) => url.split('?')[0].split('#')[0];
-  async function zoekEen({ domein, label, query, openSearch }) {
-    console.log(`\n  🔎 [${label}] Google query: ${query}`);
+  async function zoekEen({ domein, label, query, openSearch, agencyId }) {
+    // Immoweb met gekend agency ID → directe agentschapspagina, geen Google
+    if (label === 'Immoweb' && agencyId) {
+      console.log(`\n  🔎 [Immoweb] Directe agentschapspagina (agency ${agencyId}), straat: "${adZonderPostcode}"`);
+      const straatVoorFilter = adZonderPostcode || null;
+      const url = await zoekImmowebViaAgentschap(agencyId, straatVoorFilter, postcode, pandType, makelaarNaam);
+      if (url) {
+        console.log(`  Portal [Immoweb]: ✅ ${url}`);
+        return [{ label: 'Immoweb', url, domein: 'immoweb.be', query: `agentschap/${agencyId}` }];
+      }
+      console.log(`  Portal [Immoweb]: 0 URLs gevonden via agentschapspagina`);
+      return [];
+    }
+
+    if (!SERPER_API_KEY) {
+      console.warn(`  Portal [${label}]: SERPER_API_KEY niet ingesteld — zoeken overgeslagen`);
+      return [];
+    }
+
+    console.log(`\n  🔎 [${label}] Serper (Google) query: ${query}`);
     try {
-      const resp = await fetch('https://api.anthropic.com/v1/messages', {
+      const resp = await fetch('https://google.serper.dev/search', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'x-api-key': API_KEY, 'anthropic-version': '2023-06-01', 'anthropic-beta': 'web-search-2025-03-05' },
-        body: JSON.stringify({ model: 'claude-haiku-4-5-20251001', max_tokens: 150, tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: 1 }], messages: [{ role: 'user', content: query }] }),
-        signal: AbortSignal.timeout(25000)
+        headers: { 'Content-Type': 'application/json', 'X-API-KEY': SERPER_API_KEY },
+        body: JSON.stringify({ q: query, gl: 'be', hl: 'nl', num: 10 }),
+        signal: AbortSignal.timeout(10000)
       });
-      if (!resp.ok) { console.warn(`  Portal [${label}]: HTTP ${resp.status}`); return []; }
+      if (!resp.ok) { console.warn(`  Portal [${label}]: Serper HTTP ${resp.status}`); return []; }
       const data = await resp.json();
-      const blockStr = JSON.stringify(data.content || []);
 
-      // Open search (makelaar zonder site:-filter): pak alle URLs, categoriseer op domein
-      // Gesloten search (Immoweb/Zimmo met site:-filter): filter op exact domein
-      const urlRegex = openSearch
-        ? /https?:\/\/(?:www\.)?[\w.-]+(?:\.be|\.nl|\.com|\.immo)(?:\/[^"'\s<>]+)?/gi
-        : new RegExp(`https?://(?:www\\.)?${domein.replace('.', '\\.')}[^"'\\s<>\\\\]+`, 'gi');
+      // Serper geeft organic zoekresultaten terug — dit zijn echte Google-resultaten
+      const organicUrls = (data.organic || []).map(r => _stripQueryParams(r.link)).filter(Boolean);
 
+      if (organicUrls.length === 0) {
+        console.log(`  📋 [${label}] Geen organische resultaten van Serper`);
+        return [];
+      }
+
+      // Filter: open search pakt alles (makelaar-zoekopdracht), gesloten search filtert op domein
       const gevonden = [];
       const alleUrls = [];
-      let m;
-      while ((m = urlRegex.exec(blockStr)) !== null) {
-        const rawUrl = m[0].replace(/\u[0-9a-f]{4}/gi, c => String.fromCharCode(parseInt(c.slice(2), 16)));
-        const url = _stripQueryParams(rawUrl);
+      for (const url of organicUrls) {
         alleUrls.push(url);
-        if (_isDetailUrl(url) && !gevonden.includes(url)) gevonden.push(url);
-      }
-      if (alleUrls.length > 0) {
-        console.log(`  📋 [${label}] Alle URLs uit Google response (${alleUrls.length}):`);
-        alleUrls.forEach(u => {
-          const ok = gevonden.includes(u);
-          console.log(`      ${ok ? '✅ detail' : '⏭️  filter'} ${u}`);
-        });
-      } else {
-        console.log(`  📋 [${label}] Geen URLs gevonden in Google response`);
+        const domeinMatch = openSearch || url.includes(domein.replace('www.', ''));
+        if (domeinMatch && _isDetailUrl(url, openSearch) && !gevonden.includes(url)) gevonden.push(url);
       }
 
-      // Open search: bepaal effectief domein + label van gevonden URL
-      const resultaten = gevonden.slice(0, 3).map(url => {  // max 3 per portal
+      console.log(`  📋 [${label}] Serper resultaten (${alleUrls.length}):`);
+      alleUrls.forEach(u => {
+        const ok = gevonden.includes(u);
+        console.log(`      ${ok ? '✅ detail' : '⏭️  filter'} ${u}`);
+      });
+
+      // Open search: categoriseer op domein (makelaar / Immoweb / Zimmo / ...)
+      const resultaten = gevonden.slice(0, 3).map(url => {
         if (!openSearch) return { label, url, domein, query };
         const match = url.match(/https?:\/\/(?:www\.)?([\w.-]+)/);
         const effectiefDomein = match ? match[1] : domein;
-        let effectiefLabel = label; // default: makelaar eigen site
-        if (effectiefDomein.includes('immoweb.be'))       effectiefLabel = 'Immoweb';
-        else if (effectiefDomein.includes('zimmo.be'))    effectiefLabel = 'Zimmo';
-        else if (effectiefDomein.includes('realo.be'))    effectiefLabel = 'Realo';
+        let effectiefLabel = label;
+        if (effectiefDomein.includes('immoweb.be'))        effectiefLabel = 'Immoweb';
+        else if (effectiefDomein.includes('zimmo.be'))     effectiefLabel = 'Zimmo';
+        else if (effectiefDomein.includes('realo.be'))     effectiefLabel = 'Realo';
         else if (effectiefDomein.includes('immoscoop.be')) effectiefLabel = 'Immoscoop';
         return { label: effectiefLabel, url, domein: effectiefDomein, query };
       }).filter(Boolean);
 
-      // Duidelijke logging: toon elke gevonden URL en wat ermee gebeurt
       if (gevonden.length > 0) {
         gevonden.forEach(u => {
           const doorgegeven = resultaten.some(r => r.url === u);
           console.log(`  Portal [${label}]: ${doorgegeven ? '✅' : '⏭️ '} ${u}`);
         });
       } else {
-        console.log(`  Portal [${label}]: 0 URLs gevonden`);
+        console.log(`  Portal [${label}]: 0 detail-URLs na filter`);
       }
       return resultaten;
     } catch (e) { console.warn(`  Portal [${label}] mislukt:`, e.message); return []; }
