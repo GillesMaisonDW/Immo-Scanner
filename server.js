@@ -479,16 +479,54 @@ async function slimFetchHtml(url) {
   return await fetchWithPuppeteer(url);
 }
 // ── fetchDetailMetPuppeteer ───────────────────────────────────────
-// Zelfde als fetchDetailVanListing maar MET Puppeteer fallback via slimFetchHtml.
-// Gebruik ENKEL voor de definitief gevonden listing — te traag voor bulk-fetching.
+// Voor de definitief gevonden listing — met echte Puppeteer fallback.
+// Verschil met slimFetchHtml: die checkt enkel op tekst-lengte (≥800 tekens).
+// JS-sites zoals huysewinkel.be hebben genoeg navigatietekst om die drempel te halen,
+// maar de listing-data is nog niet gerenderd. Hier checken we op ECHTE data.
 async function fetchDetailMetPuppeteer(url) {
   if (!url) return { adres: null, prijs: null, slaapkamers: null, oppervlakte: null };
+  const label = url.split('/').slice(-2).join('/');
+  // Stap 1: directe fetch — snel, werkt voor SSR-sites
   try {
-    const label = url.split('/').slice(-2).join('/');
-    const html = await slimFetchHtml(url); // directe fetch + Puppeteer fallback
-    if (html) return _extractDetailsUitHtml(html, label);
+    const resp = await fetch(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'nl-BE,nl;q=0.9,en;q=0.8'
+      },
+      signal: AbortSignal.timeout(10000)
+    });
+    if (resp.ok) {
+      const html = await resp.text();
+      const detail = _extractDetailsUitHtml(html, label);
+      // Alleen teruggeven als we echt iets nuttig gevonden hebben
+      if (detail.adres || detail.prijs || detail.slaapkamers) {
+        console.log(`  fetchDetailMetPuppeteer: data via directe fetch (${label})`);
+        return detail;
+      }
+      console.log(`  fetchDetailMetPuppeteer: directe fetch leeg → Puppeteer (${label})`);
+    } else {
+      console.warn(`  fetchDetailMetPuppeteer: HTTP ${resp.status} voor ${url}`);
+    }
   } catch (e) {
-    console.warn('fetchDetailMetPuppeteer fout:', e.message);
+    console.warn(`  fetchDetailMetPuppeteer directe fetch fout (${label}):`, e.message);
+  }
+  // Stap 2: Puppeteer — voor JS-zware sites (React/Vue zonder SSR)
+  // Puppeteer voert JS uit en wacht tot de pagina geladen is
+  try {
+    console.log(`  fetchDetailMetPuppeteer: Puppeteer starten voor ${label}...`);
+    const html = await fetchWithPuppeteer(url, 25000);
+    if (html) {
+      const detail = _extractDetailsUitHtml(html, label);
+      if (detail.adres || detail.prijs || detail.slaapkamers) {
+        console.log(`  fetchDetailMetPuppeteer: data via Puppeteer (${label})`);
+      } else {
+        console.log(`  fetchDetailMetPuppeteer: ook Puppeteer gaf geen data (${label})`);
+      }
+      return detail;
+    }
+  } catch (e) {
+    console.warn(`  fetchDetailMetPuppeteer Puppeteer fout (${label}):`, e.message);
   }
   return { adres: null, prijs: null, slaapkamers: null, oppervlakte: null };
 }
