@@ -478,6 +478,20 @@ async function slimFetchHtml(url) {
   } catch (e) { console.warn(`slimFetchHtml mislukt voor ${url}: ${e.message}`); }
   return await fetchWithPuppeteer(url);
 }
+// ── fetchDetailMetPuppeteer ───────────────────────────────────────
+// Zelfde als fetchDetailVanListing maar MET Puppeteer fallback via slimFetchHtml.
+// Gebruik ENKEL voor de definitief gevonden listing — te traag voor bulk-fetching.
+async function fetchDetailMetPuppeteer(url) {
+  if (!url) return { adres: null, prijs: null, slaapkamers: null, oppervlakte: null };
+  try {
+    const label = url.split('/').slice(-2).join('/');
+    const html = await slimFetchHtml(url); // directe fetch + Puppeteer fallback
+    if (html) return _extractDetailsUitHtml(html, label);
+  } catch (e) {
+    console.warn('fetchDetailMetPuppeteer fout:', e.message);
+  }
+  return { adres: null, prijs: null, slaapkamers: null, oppervlakte: null };
+}
 // ── Auto-ontdekking makelaar URLs ─────────────────────────────────
 async function ontdekMakelaarUrls(domein) {
   const homepage = `https://${domein.startsWith('www.') ? domein : 'www.' + domein}`;
@@ -1407,6 +1421,93 @@ app.post('/api/scan', async (req, res) => {
 
     console.log(`✅ STAP 2 klaar: ${listings.length} listings via ${listingsBron}${makelaarExtra ? ` | Co-makelaar: ${makelaarExtra.naam}` : ''}`);
 
+    // ── Early exit: exact 1 listing → STAP 3 overgeslagen ────────
+    // Als STAP 2 exact 1 listing vindt (via directe makelaar scraping of co-makelaar),
+    // weten we het antwoord al — Claude hoeft dit niet meer te kiezen.
+    // We halen de details op met Puppeteer fallback zodat adres/prijs/kamers volledig zijn.
+    const isEarlyExitBron = listingsBron === 'makelaar_direct' || listingsBron.startsWith('co_makelaar_');
+    if (listings.length === 1 && isEarlyExitBron && listings[0].url) {
+      const eenListing = listings[0];
+      console.log(`\n⚡ EARLY EXIT: exact 1 listing gevonden — STAP 3 overgeslagen`);
+      console.log(`   URL: ${eenListing.url}`);
+      // Detail ophalen met Puppeteer fallback (slimFetchHtml — werkt ook op JS-zware sites)
+      const detailEarly = await fetchDetailMetPuppeteer(eenListing.url);
+      if (detailEarly.adres)       console.log(`📍 Adres listing: ${detailEarly.adres}`);
+      if (detailEarly.prijs)       console.log(`💰 Prijs listing: ${detailEarly.prijs}`);
+      if (detailEarly.slaapkamers) console.log(`🛏️  Slaapkamers: ${detailEarly.slaapkamers}`);
+      if (detailEarly.oppervlakte) console.log(`📐 Oppervlakte: ${detailEarly.oppervlakte}m2`);
+      // GPS-adres validatie: als de listing een adres heeft, check of GPS-straat daarin zit.
+      // Mismatch = val terug op STAP 3 (we weten dan niet zeker genoeg dat het de juiste listing is)
+      let earlyExitOk = true;
+      let adresEarly = detailEarly.adres || null;
+      if (gpsStraat && adresEarly) {
+        const adresEarlyLow = adresEarly.toLowerCase();
+        if (!adresEarlyLow.includes(gpsStraat.toLowerCase())) {
+          console.log(`🔴 Adres-mismatch early exit: "${gpsStraat}" niet in "${adresEarly}" — doorgaan naar STAP 3`);
+          earlyExitOk = false;
+        }
+      }
+      if (earlyExitOk) {
+        // Stel resultaat samen
+        const earlyResult = {
+          status: 'gevonden',
+          makelaar: bordInfo.makelaar,
+          makelaar_herkenning: bordInfo.makelaar_herkenning,
+          makelaar_betrouwbaarheid: bordInfo.makelaar_betrouwbaarheid,
+          pand_type: bordInfo.pand_type_display || 'Woning',
+          listing_type: bordInfo.listing_type,
+          adres: adresEarly || adresFoto || null,
+          gemeente: geocodeResultaat?.gemeente || gemeente,
+          prijs: detailEarly.prijs || eenListing.price || null,
+          slaapkamers: detailEarly.slaapkamers || eenListing.bedrooms || null,
+          oppervlakte: detailEarly.oppervlakte || eenListing.area || null,
+          staat: 'Onbekend',
+          extras: [],
+          url: eenListing.url,
+          url_alternatieven: [],
+          telefoon: bordInfo.telefoon || null,
+          gevonden_via: 'makelaar_direct',
+          faal_categorie: null,
+          notitie: 'Exact 1 listing gevonden via directe makelaar scraping.',
+          visuele_match: 'niet_gecontroleerd',
+          visuele_match_reden: null,
+        };
+        // Visuele gebouwbevestiging (zelfde als normaal pad)
+        const vCheckEarly = await vergelijkGebouwen(image, mime || 'image/jpeg', earlyResult.url);
+        earlyResult.visuele_match       = vCheckEarly.resultaat;
+        earlyResult.visuele_match_reden = vCheckEarly.reden || null;
+        if (vCheckEarly.resultaat === 'twijfel') {
+          earlyResult.status = 'gedeeltelijk';
+          earlyResult.faal_categorie = 'VISUELE_MISMATCH';
+          earlyResult.notitie = `Visuele check: gebouw lijkt niet overeen te komen met listing-foto. ${earlyResult.notitie}`;
+        }
+        const zoekduurEarly = ((Date.now() - startTime) / 1000).toFixed(2);
+        console.log('✅ SCAN KLAAR (early exit):', { makelaar: earlyResult.makelaar, status: earlyResult.status, adres: earlyResult.adres, url: earlyResult.url, duur: `${zoekduurEarly}s` });
+        // Supabase opslaan
+        let scanIdEarly = null;
+        if (supabase) {
+          const { data: dbData, error } = await supabase.from('scans').insert({
+            makelaar: earlyResult.makelaar, makelaar_herkenning: earlyResult.makelaar_herkenning,
+            makelaar_betrouwbaarheid: (earlyResult.makelaar_betrouwbaarheid || '').toLowerCase() || null,
+            listing_type: earlyResult.listing_type, pand_type: earlyResult.pand_type,
+            adres_foto: adresFoto, adres: earlyResult.adres || null,
+            gemeente: earlyResult.gemeente, prijs: earlyResult.prijs, slaapkamers: earlyResult.slaapkamers,
+            oppervlakte: earlyResult.oppervlakte, staat: earlyResult.staat, extras: earlyResult.extras || [],
+            status: earlyResult.status, url: earlyResult.url, url_alternatieven: earlyResult.url_alternatieven || [],
+            telefoon: earlyResult.telefoon, gevonden_via: earlyResult.gevonden_via,
+            faal_categorie: earlyResult.faal_categorie, notitie: earlyResult.notitie,
+            gps_beschikbaar: !!gps, gps_nauwkeurigheid_m: gps?.accuracy || null,
+            zoekduur_seconden: parseFloat(zoekduurEarly)
+          }).select('id').single();
+          if (error) console.error('Supabase schrijffout (early exit):', JSON.stringify(error));
+          else { scanIdEarly = dbData?.id; console.log('Scan opgeslagen (early exit), id:', scanIdEarly); }
+        }
+        return res.json({ ...earlyResult, scan_id: scanIdEarly });
+      }
+      // earlyExitOk = false → gewoon doorgaan naar STAP 3 hieronder
+    }
+    // ── Einde early exit ─────────────────────────────────────────
+
     // ── Context voor Claude ───────────────────────────────────────
     let listingsContext = '';
     let effectiefZoekladres = gpsVolledigAdres; // kan bijgesteld worden door plein-detectie
@@ -1650,9 +1751,11 @@ app.post('/api/scan', async (req, res) => {
     }
 
     // ── Details van detailpagina (prijs, adres, kamers) ──────────
+    // fetchDetailMetPuppeteer: MET Puppeteer fallback — voor de definitief gematchte listing.
+    // Werkt ook op JS-zware sites zoals huysewinkel.be (waar directe fetch leeg teruggeeft).
     let adresListing = null;
     if (result.url && result.status !== 'niet_gevonden') {
-      const detail = await fetchDetailVanListing(result.url);
+      const detail = await fetchDetailMetPuppeteer(result.url);
       adresListing = detail.adres || null;
       if (adresListing) console.log('📍 Adres van detailpagina:', adresListing);
       if (detail.prijs)      { console.log(`💰 Prijs overschreven: "${result.prijs}" -> "${detail.prijs}"`); result.prijs = detail.prijs; }
@@ -1782,7 +1885,7 @@ app.post('/api/scan', async (req, res) => {
     const altLog = (result.url_alternatieven || []).map(a => `${a.label}: ${a.url}`).join(' | ') || 'geen';
     console.log('✅ SCAN KLAAR:', { makelaar: result.makelaar, status: result.status, adres: result.adres, url: result.url || 'geen', alternatieven: altLog, duur: `${zoekduur}s` });
 
-    // ── Supabase opslaan ──────────────────────────────────────────
+    // ── Supabase opslaan ────────────────────────────────────────────
     let scanId = null;
     if (supabase) {
       const { data: dbData, error } = await supabase.from('scans').insert({
@@ -1809,7 +1912,7 @@ app.post('/api/scan', async (req, res) => {
   }
 });
 
-// ── /api/supabase-check ───────────────────────────────────────────
+// ── /api/supabase-check ─────────────────────────────────────────────────
 app.get('/api/supabase-check', async (req, res) => {
   if (!supabase) return res.json({ ok: false, reden: 'SUPABASE_ANON_KEY niet ingesteld' });
   try {
@@ -1822,7 +1925,7 @@ app.get('/api/supabase-check', async (req, res) => {
   } catch (e) { return res.json({ ok: false, reden: 'Onverwachte fout', fout: e.message }); }
 });
 
-// ── /api/test-zoeken ──────────────────────────────────────────────
+// ── /api/test-zoeken ──────────────────────────────────────────────────────
 app.get('/api/test-zoeken', async (req, res) => {
   const { makelaar, type, transactie, gemeente, postcode } = req.query;
   const gem = gemeente || 'gent';
@@ -1835,8 +1938,7 @@ app.get('/api/test-zoeken', async (req, res) => {
   res.json({ makelaar_direct: { count: makelaarListings.length, listings: makelaarListings }, immoweb_fallback: { count: immowebListings.length, listings: immowebListings } });
 });
 
-// ── /api/feedback ─────────────────────────────────────────────────
-// ── /api/feedback ─────────────────────────────────────────────────
+// ── /api/feedback ─────────────────────────────────────────────────────
 app.post('/api/feedback', async (req, res) => {
   const { scan_id, feedback_type, makelaar_correct, makelaar_naam_correct, faal_categorie, opmerking } = req.body;
   if (!supabase) return res.json({ ok: false, reden: 'Supabase niet geconfigureerd' });
@@ -1858,7 +1960,7 @@ app.post('/api/feedback', async (req, res) => {
   } catch (e) { return res.status(500).json({ ok: false, reden: e.message }); }
 });
 
-// ── Health check ──────────────────────────────────────────────────
+// ── Health check ──────────────────────────────────────────────────────────────
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', api_key: API_KEY ? 'geladen' : 'ONTBREEKT', serper: SERPER_API_KEY ? 'geladen' : 'ONTBREEKT', supabase: supabase ? 'verbonden' : 'ONTBREEKT', timestamp: new Date().toISOString() });
 });
