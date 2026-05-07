@@ -861,7 +861,7 @@ async function straatNamenInBuurt(lat, lon, straal = 120) {
 // ================================================================
 //  STAP 2.5 — PARALLEL PORTAL SEARCHES (Serper.dev = echte Google)
 // ================================================================
-async function zoekPortalenParallel(makelaarNaam, domeinHint, zoekAdres, postcode, referentienummer, pandType) {
+async function zoekPortalenParallel(makelaarNaam, domeinHint, zoekAdres, postcode, referentienummer, pandType, listingType) {
   if (!zoekAdres && !postcode) return [];
   const ad = zoekAdres || postcode;
   // Postcode weglaten uit queries — "Wapenplein" + "Immo Jo" werkt beter dan "Wapenplein 8400" + "Immo Jo"
@@ -896,7 +896,7 @@ async function zoekPortalenParallel(makelaarNaam, domeinHint, zoekAdres, postcod
       // Zonder: open Google-search "straat" + "makelaar naam" → Google kiest beste match
       query: referentienummer
         ? `"${referentienummer}" site:${domeinHint}`
-        : `"${adZonderPostcode}" "${makelaarNaam}" te koop`,
+        : `"${adZonderPostcode}" "${makelaarNaam}" ${listingType === 'Te huur' ? 'te huur' : 'te koop'}`,
       openSearch: !referentienummer, // vlag: URL kan van elk domein zijn
     },
     {
@@ -1072,14 +1072,14 @@ Onderscheid bij H-logo: Heylen = BLAUW. Hillewaere = ORANJE.
 
 Geef ENKEL de JSON terug.`;
 
-const PROMPT_STAP2 = `Je bent de Immo Scanner. Je analyseert een foto van een makelaarsbord en zoekt de bijhorende listing.
+const PROMPT_STAP2 = `Je bent de Immo Scanner. Je krijgt een foto van een makelaarsbord + een lijst van vooraf gevonden URLs. Jouw taak: kies de juiste URL en vul de JSON in. Zoek NIET zelf — alle zoekwerk is al gedaan.
 
 ## ALTIJD GELDENDE REGELS
-1. Geen hallucinations. Vul enkel velden in met data uit echte gevonden listings.
+1. Geen hallucinations. Vul enkel velden in met data uit de aangeleverde listings of URLs.
 2. Transactie (te koop / te huur) moet kloppen met het bord.
 3. Kies nooit raak. "niet_gevonden" of "gedeeltelijk" is eerlijker dan een verkeerde match.
 4. Een URL van Realo of Immoscoop is BETER dan geen URL.
-5. Kies een prijs van de meest betrouwbare bron. Vermeld geen prijsverschillen tussen aggregators.
+5. Kies een prijs van de meest betrouwbare bron.
 6. "gevonden_via": gebruik UITSLUITEND één van deze exacte waarden: "web_search" | "makelaar_direct" | "immoweb_fallback" | "niet_gevonden". Geen andere tekst.
 
 ## STATUS-REGELS (volg exact)
@@ -1088,35 +1088,23 @@ const PROMPT_STAP2 = `Je bent de Immo Scanner. Je analyseert een foto van een ma
 - "gedeeltelijk": straatnaam matcht maar huisnummer onbekend of twijfelachtig. Óf: listing gevonden maar adres niet volledig bevestigd.
 - "niet_gevonden": straatnaam matcht niet, of echt niets gevonden.
 
-## WANNEER JE WEB SEARCH GEBRUIKT
-VERPLICHT: Roep web_search op voor ELKE stap hieronder — als afzonderlijke tool call, in volgorde, zonder uitzondering.
-Stop NOOIT vroeg. Ook als stap 1 al een URL geeft, voer je stap 2, 3, 4 en 5 nog steeds uit.
-Doel: voor elk portaal minstens één poging doen zodat de gebruiker alle beschikbare links krijgt.
+## HOE JE DE AANGELEVERDE URLs GEBRUIKT
+Je krijgt een sectie "GEVONDEN PORTAL-URLS" of "LISTINGS". Werk als volgt:
+- Makelaar eigen site URL → zet in "url" (enkel detail-pagina's, nooit overzicht)
+- Immoweb / Zimmo / Realo / Immoscoop URLs → zet in "url_alternatieven" (max 1 per portaal)
+- Als de URL van de makelaar eigen site staat: status = "gevonden" als GPS-straat overeenkomt, anders "gedeeltelijk"
+- Als alleen aggregator-URLs: status = "gedeeltelijk" tenzij adres volledig bevestigd
 
-0. Referentienummer (als beschikbaar): "[referentienummer]" site:[makelaarsdomein]
-1. Officiële makelaarsite: "[GPS-straatnaam]" "[postcode]" site:[makelaarsdomein]
-2. Immoscoop: "[GPS-straatnaam]" "[postcode]" site:immoscoop.be
-3. Immoweb: "[GPS-straatnaam]" "[postcode]" site:immoweb.be
-4. Realo MET makelaarsnaam: "[Makelaar naam]" "[GPS-straatnaam]" "[postcode]" site:realo.be
-   → Realo vermeldt de makelaarsnaam in elke listing — dit is het krachtigste vangnet.
-   → Gebruik de volledige makelaarsnaam zoals op het bord (bv. "Immo Jo", "ERA", "Heylen").
-5. Zimmo: "[GPS-straatnaam]" "[postcode]" site:zimmo.be
-6. Breed vangnet (enkel als alle bovenstaande leeg): "[Makelaar naam]" "[GPS-straatnaam]" "[postcode]" te koop
-
-Na alle stappen: zet de makelaar eigen detail-URL in "url". Zet MAX 1 URL per portaal in "url_alternatieven", in volgorde: Immoscoop, Immoweb, Realo, Zimmo.
-BELANGRIJK: voeg een aggregator-URL enkel toe als de listing-pagina zelf het juiste adres (straatnaam) bevestigt. De straatnaam hoeft NIET in de URL-slug te staan — Zimmo en Immoweb gebruiken numerieke IDs. Controleer de inhoud van de pagina, niet de URL-structuur.
+## URL-REGELS
+- "url": ENKEL de URL op de website van de makelaar zelf. Null als niet gevonden.
+  NOOIT een overzichtspagina (bv. /nl/te-koop, /te-koop/gent) — enkel detail-pagina's.
+- "url_alternatieven": directe detail-pagina URLs van aggregators. GEEN Spotto.
+  VERBODEN: zoekresultatenpagina's (herkenbaar aan /search/, /zoeken/, ?q=, ?page=).
+  TOEGESTAAN: realo.be/nl/wapenplein-14-8400-oostende/3696695 → detail-pagina met ID.
+- Volgorde url_alternatieven: Immoscoop → Immoweb → Realo → Zimmo.
 
 ADRESREGEL: match ALTIJD op straatnaam. Huisnummerverschil ≤ 2 is acceptabel (GPS-drift).
 BRONREGEL: prijs, oppervlakte en slaapkamers moeten van DEZELFDE pagina komen als de URL.
-
-URL-REGELS:
-- "url": ENKEL de URL op de website van de makelaar zelf. Null als niet gevonden.
-  NOOIT een overzichtspagina (bv. /nl/te-koop, /te-koop/gent) — enkel detail-pagina's.
-- "url_alternatieven": directe detail-pagina URLs van aggregators (Immoscoop, Immoweb, Realo, Zimmo). GEEN Spotto.
-  Gebruik NOOIT een zoekresultatenpagina (herkenbaar aan /search/, /zoeken/, ?q=, ?page=).
-- Aggregator detail-URLs bevatten ALTIJD een numeriek ID of unieke slug met adres.
-  VERBODEN: realo.be/nl/search/... of immoscoop.be/te-huur/overzicht → zoekpagina's.
-  TOEGESTAAN: realo.be/nl/wapenplein-14-8400-oostende/3696695 → detail-pagina met ID.
 
 ## WANNEER JE EEN LIJST VAN LISTINGS KRIJGT
 Kies de listing die het beste overeenkomt op basis van GPS-straatnaam, pand-type en transactie. Huisnummerverschil ≤ 2 is geen reden voor "gedeeltelijk" — tel dat als "gevonden".
@@ -1437,7 +1425,7 @@ app.post('/api/scan', async (req, res) => {
       const makelaarNaam = bordInfo.makelaar || '';
 
       // ── STAP 2.5: Parallel portal searches ───────────────────────
-      portalResultaten = await zoekPortalenParallel(makelaarNaam, domeinHint, zoekAdres, postcode, bordInfo.referentienummer, bordInfo.pand_type_slug);
+      portalResultaten = await zoekPortalenParallel(makelaarNaam, domeinHint, zoekAdres, postcode, bordInfo.referentienummer, bordInfo.pand_type_slug, bordInfo.listing_type);
       // Bouw portal-context op voor Claude (enkel wat er gevonden is)
       makelaarPortal = portalResultaten.find(r => r.domein === domeinHint);
       const aggPortalen = [
@@ -1513,15 +1501,14 @@ app.post('/api/scan', async (req, res) => {
     }
     console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
     const stap3Body = JSON.stringify({
-      model: 'claude-sonnet-4-6', max_tokens: 4000,
-      tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: 1 }],
+      model: 'claude-sonnet-4-6', max_tokens: 1500,
       system: PROMPT_STAP2,
       messages: [{ role: 'user', content: [
         { type: 'image', source: { type: 'base64', media_type: mime || 'image/jpeg', data: image } },
         { type: 'text', text: `## BORDANALYSE (stap 1)\nMakelaar: ${bordInfo.makelaar} (${bordInfo.makelaar_herkenning})\nBetrouwbaarheid: ${bordInfo.makelaar_betrouwbaarheid}\nType: ${bordInfo.listing_type}\nPand: ${bordInfo.pand_type_slug}\nReferentienummer: ${bordInfo.referentienummer || 'niet zichtbaar'}\nTelefoon: ${bordInfo.telefoon || 'niet zichtbaar'}\nMakelaar website: ${domeinMakelaar || bordInfo.makelaar_website || 'onbekend'}\n${makelaarExtra ? `Co-makelaar: ${makelaarExtra.naam} (${makelaarExtra.website || 'onbekend'})\n` : ''}\n## LOCATIE\n${locatieInfo}\n${listingsContext}\nGeef het resultaat als JSON.` }
       ]}]
     });
-    const stap3Headers = { 'Content-Type': 'application/json', 'x-api-key': API_KEY, 'anthropic-version': '2023-06-01', 'anthropic-beta': 'web-search-2025-03-05' };
+    const stap3Headers = { 'Content-Type': 'application/json', 'x-api-key': API_KEY, 'anthropic-version': '2023-06-01' };
     let stap3Resp = await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', headers: stap3Headers, body: stap3Body });
     // Automatische retry bij transient 500/529 (Anthropic overload)
     if (!stap3Resp.ok && [500, 529].includes(stap3Resp.status)) {
