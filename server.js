@@ -864,8 +864,11 @@ async function straatNamenInBuurt(lat, lon, straal = 120) {
 async function zoekPortalenParallel(makelaarNaam, domeinHint, zoekAdres, postcode, referentienummer, pandType, listingType) {
   if (!zoekAdres && !postcode) return [];
   const ad = zoekAdres || postcode;
-  // Postcode weglaten uit queries — "Wapenplein" + "Immo Jo" werkt beter dan "Wapenplein 8400" + "Immo Jo"
+  // Postcode weglaten uit queries
   const adZonderPostcode = postcode ? ad.replace(postcode, '').replace(/\s{2,}/g, ' ').trim() : ad;
+  // Huisnummer weglaten — GPS-huisnummers zijn vaak incorrect (375 ipv 373, drift van 1-2 nummers)
+  // "Coupure Links" vindt altijd meer dan "Coupure Links 375" dat niets vindt
+  const adZonderNummer = adZonderPostcode.replace(/\s+\d+[a-zA-Z]?\s*$/i, '').trim() || adZonderPostcode;
 
   // Zoek het immoweb_agency_id op voor deze makelaar (uit de reeds gecachte DB)
   let agencyId = null;
@@ -896,7 +899,7 @@ async function zoekPortalenParallel(makelaarNaam, domeinHint, zoekAdres, postcod
       // Zonder: open Google-search "straat" + "makelaar naam" → Google kiest beste match
       query: referentienummer
         ? `"${referentienummer}" site:${domeinHint}`
-        : `"${adZonderPostcode}" "${makelaarNaam}" ${listingType === 'Te huur' ? 'te huur' : 'te koop'}`,
+        : `"${adZonderNummer}" "${makelaarNaam}" ${listingType === 'Te huur' ? 'te huur' : 'te koop'}`,
       openSearch: !referentienummer, // vlag: URL kan van elk domein zijn
     },
     {
@@ -905,14 +908,14 @@ async function zoekPortalenParallel(makelaarNaam, domeinHint, zoekAdres, postcod
       // Agency ID bekend → directe agentschapspagina (geen Google ruis)
       // Onbekend → Google fallback met makelaarsnaam + straat
       agencyId: agencyId || null,
-      query: `"${adZonderPostcode}" "${makelaarNaam}" site:immoweb.be`,
+      query: `"${adZonderNummer}" "${makelaarNaam}" site:immoweb.be`,
       openSearch: false,
     },
     {
       label: 'Zimmo',
       domein: 'zimmo.be',
       // Makelaarsnaam + straat → specifiek genoeg voor Zimmo
-      query: `"${adZonderPostcode}" "${makelaarNaam}" site:zimmo.be`,
+      query: `"${adZonderNummer}" "${makelaarNaam}" site:zimmo.be`,
       openSearch: false,
     },
   ];
@@ -1334,7 +1337,21 @@ app.post('/api/scan', async (req, res) => {
               const nummerMatches = straatMatches.filter(l => _normaliseHuisnummer(l.address || '').includes(nummerNorm));
               listings = nummerMatches.length > 0 ? nummerMatches : straatMatches;
             } else { listings = straatMatches; }
-          } else { listings = []; listingsBron = 'straat_geen_match'; }
+          } else {
+            // Fallback: URL slug matching — voor JS-sites waar adresfetch faalt maar straatnaam
+            // wel in de listing-URL-slug zit (bv. huysewinkel.be/...aan-de-coupure/8944715)
+            const straatWoorden = straatLow.split(' ').filter(w => w.length >= 5); // "coupure", "gentsesteenweg"...
+            const slugMatches = straatWoorden.length > 0
+              ? listings.filter(l => straatWoorden.some(w => (l.url || '').toLowerCase().includes(w)))
+              : [];
+            if (slugMatches.length > 0) {
+              listings = slugMatches;
+              console.log(`🔗 URL slug match op "${straatWoorden.join('/')}"': ${slugMatches.length} listing(s) gevonden`);
+            } else {
+              listings = [];
+              listingsBron = 'straat_geen_match';
+            }
+          }
         }
       } else { listingsBron = 'scraping_leeg'; }
     } else if (gpsStraat) {
@@ -1819,19 +1836,31 @@ app.get('/api/test-zoeken', async (req, res) => {
 });
 
 // ── /api/feedback ─────────────────────────────────────────────────
+// ── /api/feedback ─────────────────────────────────────────────────
 app.post('/api/feedback', async (req, res) => {
-  const { scan_id, feedback_type, makelaar_correct, makelaar_naam_correct, faal_categorie_override } = req.body;
-  console.log('FEEDBACK:', { scan_id, feedback_type, makelaar_correct, makelaar_naam_correct });
-  if (supabase && scan_id) {
-    const { error } = await supabase.from('feedback').insert({ scan_id, feedback_type, makelaar_correct: makelaar_correct ?? null, makelaar_naam_correct: makelaar_naam_correct || null, faal_categorie_override: faal_categorie_override || null });
-    if (error) console.error('Supabase feedback fout:', error.message);
-  }
-  return res.json({ ok: true });
+  const { scan_id, feedback_type, makelaar_correct, makelaar_naam_correct, faal_categorie, opmerking } = req.body;
+  if (!supabase) return res.json({ ok: false, reden: 'Supabase niet geconfigureerd' });
+  try {
+    const record = {
+      scan_id:               scan_id || null,
+      feedback_type:         feedback_type || null,
+      makelaar_correct:      makelaar_correct ?? null,
+      makelaar_naam_correct: makelaar_naam_correct || null,
+      faal_categorie:        faal_categorie || null,
+      opmerking:             opmerking || null,
+      created_at:            new Date().toISOString()
+    };
+    const { error } = await supabase.from('feedback').insert(record);
+    if (error) { console.error('Feedback schrijffout:', error.message); return res.json({ ok: false, reden: error.message }); }
+    _makelaarsCacheTs = 0;
+    console.log('💬 Feedback opgeslagen:', feedback_type, scan_id ? `(scan ${scan_id})` : '');
+    return res.json({ ok: true });
+  } catch (e) { return res.status(500).json({ ok: false, reden: e.message }); }
 });
 
 // ── Health check ──────────────────────────────────────────────────
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', api_key: API_KEY ? 'geladen' : 'ONTBREEKT', supabase: supabase ? 'verbonden' : 'ONTBREEKT', timestamp: new Date().toISOString() });
+  res.json({ status: 'ok', api_key: API_KEY ? 'geladen' : 'ONTBREEKT', serper: SERPER_API_KEY ? 'geladen' : 'ONTBREEKT', supabase: supabase ? 'verbonden' : 'ONTBREEKT', timestamp: new Date().toISOString() });
 });
 
 app.listen(PORT, () => console.log(`Immo Scanner v2 listening on port ${PORT}`));
