@@ -422,8 +422,18 @@ let _browser   = null;
 let _browserLastUsed = 0;
 async function laadPuppeteer() {
   if (_chromium && _puppeteer) return true;
-  try { _chromium = require('@sparticuz/chromium'); _puppeteer = require('puppeteer-core'); return true; }
-  catch (e) { console.warn('Puppeteer niet beschikbaar:', e.message); return false; }
+  try {
+    // Dynamische import werkt zowel voor ESM- als CJS-pakketten.
+    // require() faalt voor ESM-only pakketten zoals nieuwere versies van @sparticuz/chromium.
+    const chromiumMod  = await import('@sparticuz/chromium');
+    const puppeteerMod = await import('puppeteer-core');
+    _chromium  = chromiumMod.default  ?? chromiumMod;
+    _puppeteer = puppeteerMod.default ?? puppeteerMod;
+    return true;
+  } catch (e) {
+    console.warn('Puppeteer niet beschikbaar:', e.message);
+    return false;
+  }
 }
 async function getPuppeteerBrowser() {
   if (_browser) {
@@ -1358,7 +1368,10 @@ app.post('/api/scan', async (req, res) => {
 
     if (makelaarInDB) {
       console.log(`🔍 SCRAPING: ${domeinMakelaar} in DB`);
-      listings = await searchMakelaar(bordInfo.makelaar, bordInfo.listing_type, hoofdgemeente, postcode, bordInfo.makelaar_website);
+      // Gebruik domeinMakelaar (reeds opgelost via naam/score-matching) als website-hint,
+      // NIET bordInfo.makelaar_website (kan fout zijn — bv. Claude leest verkeerde URL van bord).
+      // Zo scrapet searchMakelaar altijd de juiste makelaarsite, ook als het bord iets anders toont.
+      listings = await searchMakelaar(bordInfo.makelaar, bordInfo.listing_type, hoofdgemeente, postcode, domeinMakelaar || bordInfo.makelaar_website);
       listingsBron = 'makelaar_direct';
       if (listings.length > 0) {
         listings = await verrijkListingAdressen(listings, hoofdgemeente, postcode, gpsStraat);
