@@ -1280,13 +1280,21 @@ app.post('/api/scan', async (req, res) => {
           if (telMatch) {
             const telInfo = JSON.parse(telMatch[1]);
             if (telInfo.naam) {
-              bordInfo.makelaar = telInfo.naam;
-              if (telInfo.website) bordInfo.makelaar_website = telInfo.website;
-              bordInfo.makelaar_herkenning += ` (via telefoonnummer)`;
-              bordInfo.makelaar_betrouwbaarheid = 'HOOG';
-              if (telInfo.website) {
-                const domeinNieuw = telInfo.website.replace('www.','').replace(/^https?:\/\//,'').split('/')[0];
-                voegMakelaarToeAanSupabase(domeinNieuw, telInfo.naam, null, null, bordInfo.telefoon);
+              const huidigBetrouwbaar = (bordInfo.makelaar_betrouwbaarheid || '').toUpperCase();
+              if (huidigBetrouwbaar !== 'HOOG') {
+                // STAP 1 herkende makelaar niet goed → vul aan met telefoon-resultaat
+                bordInfo.makelaar = telInfo.naam;
+                if (telInfo.website) bordInfo.makelaar_website = telInfo.website;
+                bordInfo.makelaar_herkenning += ` (via telefoonnummer)`;
+                bordInfo.makelaar_betrouwbaarheid = 'HOOG';
+                if (telInfo.website) {
+                  const domeinNieuw = telInfo.website.replace('www.','').replace(/^https?:\/\//,'').split('/')[0];
+                  voegMakelaarToeAanSupabase(domeinNieuw, telInfo.naam, null, null, bordInfo.telefoon);
+                }
+              } else {
+                // STAP 1 al HOOG-betrouwbaar → telefoon-resultaat niet overschrijven
+                // (bv. "059 333 900" geeft "Immo Home" terug, maar bord toont duidelijk "Jo Immo")
+                console.log(`  Stap 1.5a: STAP 1 al HOOG-betrouwbaar (${bordInfo.makelaar}) — tel-resultaat "${telInfo.naam}" genegeerd`);
               }
             }
           }
@@ -1366,6 +1374,13 @@ app.post('/api/scan', async (req, res) => {
     let listings = [];
     let listingsBron = 'geen';
 
+    // ════════════════════════════════════════════════════════════════
+    // ✅ STAP 2 — DIRECTE MAKELAARSITE SCRAPING (PRIMAIRE ROUTE)
+    //    Werkt stabiel per 2026-05-07. Pas NIET aan tenzij er een
+    //    duidelijke bug is. Dit is de kern van de app.
+    //    Flow: searchMakelaar → verrijkListingAdressen → straatfilter
+    //          → URL slug matching (JS-heavy fallback) → early exit bij 1 listing
+    // ════════════════════════════════════════════════════════════════
     if (makelaarInDB) {
       console.log(`🔍 SCRAPING: ${domeinMakelaar} in DB`);
       // Gebruik domeinMakelaar (reeds opgelost via naam/score-matching) als website-hint,
@@ -2008,12 +2023,10 @@ app.post('/api/feedback', async (req, res) => {
     _makelaarsCacheTs = 0;
     console.log('💬 Feedback opgeslagen:', feedback_type, scan_id ? `(scan ${scan_id})` : '');
     return res.json({ ok: true });
-  } catch (e) { return res.status(500).json({ ok: false, reden: e.message }); }
+  } catch (e) {
+    console.error('Feedback fout:', e.message);
+    return res.json({ ok: false, reden: e.message });
+  }
 });
 
-// ── Health check ──────────────────────────────────────────────────────────────
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', api_key: API_KEY ? 'geladen' : 'ONTBREEKT', serper: SERPER_API_KEY ? 'geladen' : 'ONTBREEKT', supabase: supabase ? 'verbonden' : 'ONTBREEKT', timestamp: new Date().toISOString() });
-});
-
-app.listen(PORT, () => console.log(`Immo Scanner v2 listening on port ${PORT}`));
+app.listen(PORT, () => console.log(`Server draait op poort ${PORT}`));
