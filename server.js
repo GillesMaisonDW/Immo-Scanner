@@ -365,6 +365,11 @@ async function reverseGeocode(lat, lon) {
     const fallback = await _geocodeViaNominatim(lat, lon);
     if (fallback?.straat) resultaat = fallback;
   }
+  // Fallback: huisnummer via Overpass OSM als geocoders null gaven
+  if (resultaat?.straat && !resultaat.huisnummer) {
+    const osmNummer = await huisnummerViaOverpass(lat, lon, resultaat.straat);
+    if (osmNummer) resultaat = { ...resultaat, huisnummer: osmNummer };
+  }
   if (resultaat) {
     if (_geocodeCache.size >= 200) _geocodeCache.delete(_geocodeCache.keys().next().value);
     _geocodeCache.set(cacheKey, resultaat);
@@ -920,10 +925,40 @@ async function straatNamenInBuurt(lat, lon, straal = 120) {
     return { straten, pleinen };
   } catch (e) { console.warn('Overpass API fout:', e.message); return { straten: [], pleinen: [] }; }
 }
+// ── Huisnummer via Overpass (OSM addr:housenumber) ───────────────
+async function huisnummerViaOverpass(lat, lon, straatNaam) {
+  try {
+    const straal = 30; // meter — dicht genoeg voor individuele gebouwen
+    const query = `[out:json][timeout:5];(node(around:${straal},${lat},${lon})["addr:housenumber"];way(around:${straal},${lat},${lon})["addr:housenumber"];);out center tags;`;
+    const url = `https://overpass-api.de/api/interpreter?data=${encodeURIComponent(query)}`;
+    const resp = await fetch(url, { headers: { 'User-Agent': 'ImmoScannerApp/1.0 (gilles@maisondw.be)' }, signal: AbortSignal.timeout(5000) });
+    if (!resp.ok) return null;
+    const data = await resp.json();
+    const straatLow = (straatNaam || '').toLowerCase().replace(/[\s\-]/g, '');
+    // Bereken afstand (graden) voor elk element, filter op straatnaam indien aanwezig
+    let beste = null, besteAfstand = Infinity;
+    for (const e of (data.elements || [])) {
+      const eLat = e.lat ?? e.center?.lat;
+      const eLon = e.lon ?? e.center?.lon;
+      if (!eLat || !eLon || !e.tags?.['addr:housenumber']) continue;
+      const osmStraat = (e.tags['addr:street'] || '').toLowerCase().replace(/[\s\-]/g, '');
+      // Sla over als straatnaam niet overeenkomt (als die beschikbaar is)
+      if (straatNaam && osmStraat && !osmStraat.includes(straatLow) && !straatLow.includes(osmStraat)) continue;
+      const afstand = Math.sqrt((eLat - lat) ** 2 + (eLon - lon) ** 2);
+      if (afstand < besteAfstand) { besteAfstand = afstand; beste = e; }
+    }
+    if (beste) {
+      const nummer = beste.tags['addr:housenumber'];
+      console.log(`🏠 Overpass huisnummer: ${nummer} (${besteAfstand.toFixed(6)}° van GPS)`);
+      return nummer;
+    }
+    return null;
+  } catch (e) { console.warn('Overpass huisnummer fout:', e.message); return null; }
+}
 // ================================================================
 //  STAP 2.5 — PARALLEL PORTAL SEARCHES (Serper.dev = echte Google)
 // ================================================================
-async function zoekPortalenParallel(makelaarNaam, domeinHint, zoekAdres, postcode, referentienummer, pandType, listingType) {
+async function zoekPortalenParallel(makelaarNaam, domeinHint, zoekAdres, postcode, referentienummer, pandType, listingType, makelaarExtra = null) {
   if (!zoekAdres && !postcode) return [];
   const ad = zoekAdres || postcode;
   // Postcode weglaten uit queries
@@ -988,6 +1023,33 @@ async function zoekPortalenParallel(makelaarNaam, domeinHint, zoekAdres, postcod
       query: `"${adZonderNummer}" "${makelaarNaam}" site:zimmo.be`,
       openSearch: false,
     },
+    // Co-makelaar queries: als er een tweede makelaar op het bord staat, ook die doorzoeken
+    // Nuttig wanneer het pand ENKEL op de site van de co-makelaar staat (niet bij de primaire)
+    ...(() => {
+      if (!makelaarExtra?.naam) return [];
+      const coNaam = makelaarExtra.naam;
+      const coDomein = makelaarExtra.website
+        ? makelaarExtra.website.replace(/^https?:\/\//,'').replace(/^www\./,'').split('/')[0]
+        : null;
+      const coType = listingType === 'Te huur' ? 'te huur' : 'te koop';
+      const entries = [{
+        label: 'makelaar',
+        domein: coDomein || 'onbekend',
+        query: `"${adZonderNummer}" "${coNaam}" ${coType}`,
+        openSearch: true,
+        isCo: true,
+        coNaam,
+      }];
+      if (coDomein) entries.push({
+        label: 'makelaar',
+        domein: coDomein,
+        query: `"${adZonderNummer}" site:${coDomein}`,
+        openSearch: false,
+        isCo: true,
+        coNaam,
+      });
+      return entries;
+    })(),
   ];
   const _isDetailUrl = (url, openSearch = false) => {
     const pad = url.replace(/https?:\/\/[^/]+/, '').replace(/\?.*$/, '');
@@ -1645,7 +1707,7 @@ app.post('/api/scan', async (req, res) => {
       const makelaarNaam = bordInfo.makelaar || '';
 
       // ── STAP 2.5: Parallel portal searches ───────────────────────
-      portalResultaten = await zoekPortalenParallel(makelaarNaam, domeinHint, zoekAdres, postcode, bordInfo.referentienummer, bordInfo.pand_type_slug, bordInfo.listing_type);
+      portalResultaten = await zoekPortalenParallel(makelaarNaam, domeinHint, zoekAdres, postcode, bordInfo.referentienummer, bordInfo.pand_type_slug, bordInfo.listing_type, makelaarExtra);
       // Bouw portal-context op voor Claude (enkel wat er gevonden is)
       makelaarPortal = portalResultaten.find(r => r.domein === domeinHint);
       const aggPortalen = [
@@ -2067,6 +2129,7 @@ app.get('/api/test-zoeken', async (req, res) => {
   res.json({ makelaar_direct: { count: makelaarListings.length, listings: makelaarListings }, immoweb_fallback: { count: immowebListings.length, listings: immowebListings } });
 });
 
+// ── /api/feedback ─────────────────────────────────────────────────────
 // ── /api/feedback ─────────────────────────────────────────────────────
 app.post('/api/feedback', async (req, res) => {
   const { scan_id, feedback_type, makelaar_correct, makelaar_naam_correct, faal_categorie, opmerking } = req.body;
