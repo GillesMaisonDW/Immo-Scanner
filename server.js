@@ -1279,12 +1279,18 @@ app.post('/api/scan', async (req, res) => {
     const _makelaarAlInDB = (naam) => {
       const naamLow = (naam || '').toLowerCase().replace(/[-\s]+/g,' ').trim();
       for (const m of allesMakelaars) {
-        const siteBase = m.domein.replace(/\.(be|com|nl|immo|eu|net|org|vlaanderen)$/,'').replace('www.','').toLowerCase().replace(/[-_]/g,' ').trim();
+        const fullDomein = (m.domein || '').replace('www.','').toLowerCase();
+        const siteBase = fullDomein.replace(/\.(be|com|nl|immo|eu|net|org|vlaanderen)$/,'').replace(/[-_]/g,' ').trim();
         const dbNaam   = (m.naam || '').toLowerCase().replace(/[-\s]+/g,' ').trim();
         if (naamLow === dbNaam || naamLow.replace(/\s/g,'') === dbNaam.replace(/\s/g,'')) return true;
         if ((naamLow.includes(dbNaam) && dbNaam.length >= 4) || (dbNaam.includes(naamLow) && naamLow.length >= 4)) return true;
         if (siteBase.length >= 3 && (naamLow === siteBase || naamLow.replace(/\s/g,'') === siteBase.replace(/\s/g,''))) return true;
         if (siteBase.length >= 5 && (naamLow.includes(siteBase) || siteBase.includes(naamLow))) return true;
+        // Extra: check of alle woorden (≥2 tekens) van de naam voorkomen in het domein
+        // Werkt voor korte domeinen zoals "jo.immo" → woorden "immo" en "jo" zitten allebei in "jo.immo"
+        const naamWords = naamLow.split(' ').filter(w => w.length >= 2);
+        const domeinFlat = fullDomein.replace(/[.\-_]/g,'');
+        if (naamWords.length >= 2 && naamWords.every(w => domeinFlat.includes(w))) return true;
       }
       return false;
     };
