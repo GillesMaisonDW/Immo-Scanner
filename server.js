@@ -964,6 +964,14 @@ async function zoekPortalenParallel(makelaarNaam, domeinHint, zoekAdres, postcod
         : `"${adZonderNummer}" "${makelaarNaam}" ${listingType === 'Te huur' ? 'te huur' : 'te koop'}`,
       openSearch: !referentienummer, // vlag: URL kan van elk domein zijn
     },
+    // Extra makelaar-zoekopdracht: site:domein zodat naam-mismatch geen probleem is
+    // (bv. query zegt "Immo Jo" maar site zegt "Jo Immo" → site: filter bypast dit)
+    ...(!referentienummer ? [{
+      label: 'makelaar',
+      domein: domeinHint,
+      query: `"${adZonderNummer}" site:${domeinHint}`,
+      openSearch: false,
+    }] : []),
     {
       label: 'Immoweb',
       domein: 'immoweb.be',
@@ -1465,7 +1473,9 @@ app.post('/api/scan', async (req, res) => {
 
     // ── Co-makelaar: ook extra makelaar doorzoeken ────────────────
     const makelaarExtra = bordInfo.makelaar_extra || null;
-    if (makelaarExtra?.naam && listings.length === 0) {
+    // Co-makelaar alleen gebruiken als de primaire makelaar NIET in de DB zit.
+    // Als Immo Jo al bekend is, is de co-makelaar (bv. immo-home.be) een hallucinatie van STAP 1.
+    if (makelaarExtra?.naam && listings.length === 0 && !_makelaarAlInDB(bordInfo.makelaar)) {
       console.log(`🏢 Co-makelaar "${makelaarExtra.naam}" ook doorzoeken...`);
       const domeinExtra = makelaarExtra.website
         ? makelaarExtra.website.replace(/^https?:\/\//,'').replace(/^www\./,'').split('/')[0]
@@ -2067,13 +2077,11 @@ app.post('/api/feedback', async (req, res) => {
     };
     const { error } = await supabase.from('feedback').insert(record);
     if (error) { console.error('Feedback schrijffout:', error.message); return res.json({ ok: false, reden: error.message }); }
-    _makelaarsCacheTs = 0;
-    console.log('💬 Feedback opgeslagen:', feedback_type, scan_id ? `(scan ${scan_id})` : '');
-    return res.json({ ok: true });
+    res.json({ ok: true });
   } catch (e) {
     console.error('Feedback fout:', e.message);
-    return res.json({ ok: false, reden: e.message });
+    res.status(500).json({ ok: false, reden: e.message });
   }
 });
 
-app.listen(PORT, () => console.log(`Server draait op poort ${PORT}`));
+app.listen(PORT, () => console.log(`🏠 Immo Scanner draait op poort ${PORT}`));
