@@ -1264,9 +1264,29 @@ app.post('/api/scan', async (req, res) => {
     const hoofdgemeenteViaPostcode = await gemeenteViaPostcode(postcode, landcode);
     const hoofdgemeente = hoofdgemeenteViaPostcode || geocodeResultaat?.hoofdgemeente || gemeente.toLowerCase();
 
+    // ── DB laden vóór STAP 1.5a ───────────────────────────────────
+    // Nodig om te checken of de makelaar al bekend is — als dat zo is, slaan we
+    // het telefoonnummer-lookup volledig over (vermijdt foutieve overwriting).
+    const allesMakelaars = await laadMakelaarsUitSupabase();
+    const _makelaarAlInDB = (naam) => {
+      const naamLow = (naam || '').toLowerCase().replace(/[-\s]+/g,' ').trim();
+      for (const m of allesMakelaars) {
+        const siteBase = m.domein.replace(/\.(be|com|nl|immo|eu|net|org|vlaanderen)$/,'').replace('www.','').toLowerCase().replace(/[-_]/g,' ').trim();
+        const dbNaam   = (m.naam || '').toLowerCase().replace(/[-\s]+/g,' ').trim();
+        if (naamLow === dbNaam || naamLow.replace(/\s/g,'') === dbNaam.replace(/\s/g,'')) return true;
+        if ((naamLow.includes(dbNaam) && dbNaam.length >= 4) || (dbNaam.includes(naamLow) && naamLow.length >= 4)) return true;
+        if (siteBase.length >= 3 && (naamLow === siteBase || naamLow.replace(/\s/g,'') === siteBase.replace(/\s/g,''))) return true;
+        if (siteBase.length >= 5 && (naamLow.includes(siteBase) || siteBase.includes(naamLow))) return true;
+      }
+      return false;
+    };
+
     // ── STAP 1.5a: Telefoonnummer ─────────────────────────────────
-    if (!makelaar_override && bordInfo.telefoon) {
-      console.log(`📞 Stap 1.5a: Telefoonnummer "${bordInfo.telefoon}" opzoeken...`);
+    // Enkel uitvoeren als de makelaar NIET al in de DB zit.
+    // Als jo.immo al bekend is, heeft telefoonnummer-lookup geen meerwaarde
+    // en riskeert het de correcte naam te overschrijven met foutieve Google-resultaten.
+    if (!makelaar_override && bordInfo.telefoon && !_makelaarAlInDB(bordInfo.makelaar)) {
+      console.log(`📞 Stap 1.5a: Telefoonnummer "${bordInfo.telefoon}" opzoeken (makelaar "${bordInfo.makelaar}" niet in DB)...`);
       try {
         const telResp = await fetch('https://api.anthropic.com/v1/messages', {
           method: 'POST',
@@ -1327,7 +1347,7 @@ app.post('/api/scan', async (req, res) => {
       ? bordInfo.makelaar_website.replace(/^https?:\/\//,'').replace(/^www\./,'').split('/')[0]
       : null;
     let makelaarInDB = false;
-    const allesMakelaars = await laadMakelaarsUitSupabase();
+    // allesMakelaars al geladen vóór STAP 1.5a — hergebruiken hier
 
     if (domeinMakelaar) {
       const dbMatch = allesMakelaars.find(m => { const d = m.domein.replace('www.',''); return d === domeinMakelaar || d.includes(domeinMakelaar) || domeinMakelaar.includes(d); });
@@ -1829,6 +1849,28 @@ app.post('/api/scan', async (req, res) => {
       if (detail.oppervlakte) result.oppervlakte = detail.oppervlakte;
     }
 
+    // ── Prijs ophalen uit alternatieven als nog niet bekend ──────
+    // Als makelaar-URL geen prijs gaf (bv. niet gevonden of JS-site), probeer
+    // prijs te lezen van de eerste Immoweb of Zimmo alternatieve URL.
+    if (!result.prijs && Array.isArray(result.url_alternatieven) && result.url_alternatieven.length > 0) {
+      const prijsBronnen = ['immoweb.be', 'zimmo.be'];
+      for (const alt of result.url_alternatieven) {
+        if (prijsBronnen.some(d => (alt.url || '').includes(d))) {
+          try {
+            const altDetail = await fetchDetailVanListing(alt.url);
+            if (altDetail.prijs) {
+              result.prijs = altDetail.prijs;
+              console.log(`💰 Prijs via alternatief (${alt.label}): ${result.prijs}`);
+              // Extra info overnemen als die ook ontbreekt
+              if (!result.slaapkamers && altDetail.slaapkamers) result.slaapkamers = altDetail.slaapkamers;
+              if (!result.oppervlakte && altDetail.oppervlakte) result.oppervlakte = altDetail.oppervlakte;
+              break;
+            }
+          } catch (e) { console.warn(`Prijs ophalen uit ${alt.label} mislukt:`, e.message); }
+        }
+      }
+    }
+
     // ── URL verificatie ───────────────────────────────────────────
     if (result.url) {
       const urlActief = await checkUrlActief(result.url);
@@ -1924,11 +1966,16 @@ app.post('/api/scan', async (req, res) => {
       for (const r of portalResultaten) {
         if (!r.url || r.url === result.url) continue;
         // Makelaar eigen site: gaat in result.url als dat nog leeg is
+        // Social media (Facebook, Instagram, TikTok, YouTube...) nooit als directe listing-URL gebruiken
+        const socialMediaDomeinen = ['facebook.com', 'instagram.com', 'tiktok.com', 'youtube.com', 'twitter.com', 'x.com', 'linkedin.com'];
+        const isSocialMedia = socialMediaDomeinen.some(s => (r.url || '').toLowerCase().includes(s));
         const isMakelaar = !toegelaten.some(d => r.domein.includes(d));
-        if (isMakelaar && !result.url) {
+        if (isMakelaar && !result.url && !isSocialMedia) {
           result.url = r.url;
           if (!result.status || result.status === 'niet_gevonden') result.status = 'gedeeltelijk';
           console.log(`🔧 Server-side: makelaar URL ${r.url} gezet`);
+        } else if (isMakelaar && !result.url && isSocialMedia) {
+          console.log(`🔧 Server-side: social media URL genegeerd als makelaar-URL: ${r.url}`);
           continue;
         }
         // Aggregator: max 1 per domein, geen duplicaten
@@ -1974,6 +2021,63 @@ app.post('/api/scan', async (req, res) => {
 
   } catch (err) {
     console.error('Server fout:', err);
+    return res.status(500).json({ error: 'Server fout: ' + err.message });
+  }
+});
+
+// ── /api/supabase-check ─────────────────────────────────────────────────
+app.get('/api/supabase-check', async (req, res) => {
+  if (!supabase) return res.json({ ok: false, reden: 'SUPABASE_ANON_KEY niet ingesteld' });
+  try {
+    const { data, error } = await supabase.from('scans').select('id').limit(1);
+    if (error) return res.json({ ok: false, reden: 'Leestest mislukt', fout: error.message });
+    const { data: ins, error: insErr } = await supabase.from('scans').insert({ makelaar: '_test_', status: 'niet_gevonden', gps_beschikbaar: false, zoekduur_seconden: 0 }).select('id').single();
+    if (insErr) return res.json({ ok: false, reden: 'Test-insert mislukt', fout: insErr.message });
+    await supabase.from('scans').delete().eq('id', ins.id);
+    return res.json({ ok: true, bericht: 'Supabase verbinding en insert werken correct' });
+  } catch (e) { return res.json({ ok: false, reden: 'Onverwachte fout', fout: e.message }); }
+});
+
+// ── /api/test-zoeken ──────────────────────────────────────────────────────
+app.get('/api/test-zoeken', async (req, res) => {
+  const { makelaar, type, transactie, gemeente, postcode } = req.query;
+  const gem = gemeente || 'gent';
+  const pc  = postcode || '9000';
+  const tr  = transactie || 'Te huur';
+  const [makelaarListings, immowebListings] = await Promise.all([
+    searchMakelaar(makelaar || 'de fooz', tr, gem, pc),
+    searchImmoweb(type || 'duplex', tr, gem, pc)
+  ]);
+  res.json({ makelaar_direct: { count: makelaarListings.length, listings: makelaarListings }, immoweb_fallback: { count: immowebListings.length, listings: immowebListings } });
+});
+
+// ── /api/feedback ─────────────────────────────────────────────────────
+app.post('/api/feedback', async (req, res) => {
+  const { scan_id, feedback_type, makelaar_correct, makelaar_naam_correct, faal_categorie, opmerking } = req.body;
+  if (!supabase) return res.json({ ok: false, reden: 'Supabase niet geconfigureerd' });
+  try {
+    const record = {
+      scan_id:               scan_id || null,
+      feedback_type:         feedback_type || null,
+      makelaar_correct:      makelaar_correct ?? null,
+      makelaar_naam_correct: makelaar_naam_correct || null,
+      faal_categorie:        faal_categorie || null,
+      opmerking:             opmerking || null,
+      created_at:            new Date().toISOString()
+    };
+    const { error } = await supabase.from('feedback').insert(record);
+    if (error) { console.error('Feedback schrijffout:', error.message); return res.json({ ok: false, reden: error.message }); }
+    _makelaarsCacheTs = 0;
+    console.log('💬 Feedback opgeslagen:', feedback_type, scan_id ? `(scan ${scan_id})` : '');
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error('Feedback fout:', e.message);
+    return res.json({ ok: false, reden: e.message });
+  }
+});
+
+app.listen(PORT, () => console.log(`Server draait op poort ${PORT}`));
+rver fout:', err);
     return res.status(500).json({ error: 'Server fout: ' + err.message });
   }
 });
