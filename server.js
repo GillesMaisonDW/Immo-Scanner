@@ -773,14 +773,34 @@ async function searchMakelaar(makelaarNaam, listingType, gemeente, postcode, mak
   const websiteLower = (makelaarWebsite || '').toLowerCase().replace('www.','');
   const makelaars = await laadMakelaarsUitSupabase();
   let match = null;
-  for (const m of makelaars) {
-    const siteNorm    = normaliseer(m.domein.replace(/\.(be|com|nl|immo|eu|net|org)$/,''));
-    const domeinClean = m.domein.replace('www.','');
-    if (websiteLower && (websiteLower === domeinClean || websiteLower.includes(domeinClean) || domeinClean.includes(websiteLower))) { match = m; break; }
-    const eersteWoord = naamLower.split(' ')[0];
-    if (naamLower.includes(siteNorm) || (eersteWoord.length >= 5 && siteNorm.includes(eersteWoord))) { match = m; break; }
-    const woorden = naamLower.split(' ').filter(w => w.length > 2);
-    if (woorden.length > 0 && woorden.every(w => siteNorm.includes(w))) { match = m; break; }
+  // ── PASS 1: website/domein match (altijd prioriteit boven naam) ─────────
+  // Zo wordt jo.immo nooit verdrongen door een naam-match op immo-home.be
+  if (websiteLower) {
+    for (const m of makelaars) {
+      const domeinClean = m.domein.replace('www.','');
+      if (websiteLower === domeinClean || websiteLower.includes(domeinClean) || domeinClean.includes(websiteLower)) {
+        match = m; break;
+      }
+    }
+  }
+  // ── PASS 2: naam-gebaseerde match (alleen als geen website-match) ────────
+  // Stop-woorden: te generiek om als enige match-woord te dienen.
+  // "immo" in "Immo Jo" mag NIET matchen op "immo-home.be".
+  const STOP_WOORDEN = new Set(['immo','vastgoed','home','real','estate','realty','group','invest','property','makelaar','agence','agentschap']);
+  if (!match) {
+    for (const m of makelaars) {
+      const siteNorm    = normaliseer(m.domein.replace(/\.(be|com|nl|immo|eu|net|org)$/,''));
+      const dbNaam      = normaliseer(m.naam || '');
+      // Directe naam- of domein-match
+      if (naamLower === siteNorm || naamLower === dbNaam) { match = m; break; }
+      if (naamLower.replace(/\s/g,'') === siteNorm.replace(/\s/g,'')) { match = m; break; }
+      const eersteWoord = naamLower.split(' ')[0];
+      if (naamLower.includes(siteNorm) && siteNorm.length >= 5) { match = m; break; }
+      if (eersteWoord.length >= 5 && siteNorm.includes(eersteWoord)) { match = m; break; }
+      // Woord-voor-woord: filter stop-woorden EN te korte woorden (≤2 tekens)
+      const woorden = naamLower.split(' ').filter(w => w.length > 2 && !STOP_WOORDEN.has(w));
+      if (woorden.length > 0 && woorden.every(w => siteNorm.includes(w))) { match = m; break; }
+    }
   }
   if (!match) { console.log(`❓ Makelaar "${makelaarNaam}" niet in database`); return []; }
   const domein = match.domein;
@@ -1834,8 +1854,11 @@ app.post('/api/scan', async (req, res) => {
     // pleinen en nabijgelegen straten om toch de juiste listing te vinden.
     if (listingsBron === 'straat_geen_match' && alleListingsVoorClaude?.length > 0 && gpsStraat) {
       const nabijStraten = _nabijStratenCache || [];
+      // effectiefZoekladres wordt pas in STAP 3 berekend (plein-detectie).
+      // Hier in STAP 2 gebruiken we gpsVolledigAdres als beste schatting.
+      const _zoekAdresStap2 = gpsVolledigAdres || `${gpsStraat} ${postcode || ''}`.trim();
       const claudeMatch = await matchListingViaClaude(
-        alleListingsVoorClaude, gpsStraat, effectiefZoekladres || `${gpsStraat} ${postcode || ''}`.trim(),
+        alleListingsVoorClaude, gpsStraat, _zoekAdresStap2,
         bordInfo.makelaar, nabijStraten
       );
       if (claudeMatch?.url && claudeMatch.confidence !== 'LAAG') {
