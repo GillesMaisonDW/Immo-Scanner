@@ -49,11 +49,40 @@ function _deepFind(obj, sleutel, maxDiepte = 8) {
 function _extractDetailsUitHtml(html, urlLabel) {
   let adres = null, prijs = null, slaapkamers = null, oppervlakte = null;
   // Methode 1: JSON-LD
+  // Belangrijk: sommige sites (bv. jo.immo) hebben MEERDERE JSON-LD blokken:
+  //   - @type: RealEstateAgent → kantooradres van de makelaar (NIET het pand!)
+  //   - @type: Apartment / RealEstateListing → het eigenlijke pand (WEL gebruiken)
+  // Strategie: verwerk blokken in twee passes:
+  //   Pass 1: alleen listing-types (Apartment, House, RealEstateListing, ...)
+  //   Pass 2: alle overige types als pass 1 niets opleverde (fallback)
+  const LISTING_TYPES = ['apartment','house','singlefamilyresidence','residence','realestate',
+    'realestatelisting','property','product','offer','floorplan','accommodationtype'];
+  const SKIP_TYPES    = ['realestateagent','localbusiness','organization','person','website',
+    'webpage','breadcrumblist','sitenavigationelement'];
   const jsonldRegex = /<script[^>]*type="application\/ld\+json"[^>]*>([\s\S]*?)<\/script>/gi;
+  const jsonldBlokken = [];
   let jm;
   while ((jm = jsonldRegex.exec(html)) !== null) {
-    try {
-      const ld = JSON.parse(jm[1]);
+    try { jsonldBlokken.push(JSON.parse(jm[1])); } catch {}
+  }
+  // Classificeer blokken: listing-type vs. overig
+  const _ldType = (ld) => {
+    const t = (ld?.['@type'] || '').toLowerCase();
+    if (Array.isArray(ld?.['@type'])) return ld['@type'].map(s => s.toLowerCase()).join(',');
+    return t;
+  };
+  const listingBlokken = jsonldBlokken.filter(ld => {
+    const t = _ldType(ld);
+    return LISTING_TYPES.some(lt => t.includes(lt));
+  });
+  const overigBlokken = jsonldBlokken.filter(ld => {
+    const t = _ldType(ld);
+    return !LISTING_TYPES.some(lt => t.includes(lt)) && !SKIP_TYPES.some(st => t.includes(st));
+  });
+  // Verwerk blokken: eerst listing-types, dan overig als fallback
+  for (const blokken of [listingBlokken, overigBlokken]) {
+    for (const ld of blokken) {
+      if (adres && prijs && slaapkamers && oppervlakte) break;
       if (!adres) {
         const straat   = _deepFind(ld, 'streetAddress');
         const postcode = _deepFind(ld, 'postalCode');
@@ -83,7 +112,8 @@ function _extractDetailsUitHtml(html, urlLabel) {
           oppervlakte = parseFloat(m2) || null;
         }
       }
-    } catch {}
+    }
+    if (adres || prijs) break; // listing-blokken leverden iets op → geen fallback nodig
   }
   // Methode 2: og:title
   if (!adres) {
@@ -173,7 +203,16 @@ async function fetchDetailVanListing(url) {
     if (directResp.ok) {
       const html = await directResp.text();
       const detail = _extractDetailsUitHtml(html, label);
-      if (!detail.adres) console.log(`Geen adres via directe fetch voor ${url} -- geen Puppeteer fallback`);
+      // Claude Haiku als fallback als prijs of adres ontbreekt na regex
+      if (!detail.prijs || !detail.adres) {
+        const reden = [!detail.adres && 'adres', !detail.prijs && 'prijs'].filter(Boolean).join('+');
+        console.log(`  ⚠️  fetchDetailVanListing: regex miste ${reden} → Claude Haiku (${label})`);
+        const claudeDetail = await extractDetailsViaClaude(html, label);
+        if (!detail.adres       && claudeDetail.adres)       detail.adres       = claudeDetail.adres;
+        if (!detail.prijs       && claudeDetail.prijs)       detail.prijs       = claudeDetail.prijs;
+        if (!detail.slaapkamers && claudeDetail.slaapkamers) detail.slaapkamers = claudeDetail.slaapkamers;
+        if (!detail.oppervlakte && claudeDetail.oppervlakte) detail.oppervlakte = claudeDetail.oppervlakte;
+      }
       return detail;
     }
     console.warn(`fetchDetailVanListing: HTTP ${directResp.status} voor ${url}`);
@@ -493,6 +532,73 @@ async function slimFetchHtml(url) {
   } catch (e) { console.warn(`slimFetchHtml mislukt voor ${url}: ${e.message}`); }
   return await fetchWithPuppeteer(url);
 }
+// ── Claude Haiku detail-extractie (intelligente fallback) ────────
+// Gebruikt Claude Haiku om adres, prijs, kamers te lezen uit paginatekst.
+// Fallback wanneer regex/JSON-LD de verkeerde waarden oppikt (bv. kantooradres i.p.v. pand-adres).
+// Claude begrijpt context: hij weet dat een makelaarskantoor-adres ≠ het pand-adres.
+async function extractDetailsViaClaude(html, urlLabel) {
+  if (!API_KEY || !html) return {};
+  try {
+    // Strip scripts, styles en HTML-tags — bewaar leesbare tekst
+    const tekst = html
+      .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+      .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+      .replace(/<!--[\s\S]*?-->/g, ' ')
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 7000); // Haiku heeft klein venster nodig, 7000 tekens is ruim genoeg voor detail-pagina
+
+    if (tekst.length < 150) return {};
+
+    console.log(`  🤖 Claude Haiku leest ${urlLabel} (${tekst.length} tekens)...`);
+    const resp = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': API_KEY, 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 300,
+        system: `Je bent een vastgoed data-extractor. Extraheer enkel wat letterlijk op de pagina staat voor het te koop/huur gestelde PAND zelf — niet het kantooradres van de makelaar. Geef ALLEEN het gevraagde JSON terug, geen uitleg.`,
+        messages: [{
+          role: 'user',
+          content: `Extraheer uit deze vastgoedpagina:
+- adres: straatnaam + huisnummer + postcode + gemeente van het TE KOOP/HUUR GESTELDE PAND (NIET het kantoor van de makelaar)
+- prijs: de vraagprijs in euro (bv. "EUR 345.000")
+- slaapkamers: aantal (getal)
+- oppervlakte: bewoonbare oppervlakte in m² (getal)
+
+Geef ALLEEN dit JSON, niets anders:
+{"adres": "Wapenplein 14, 8400 Oostende", "prijs": "EUR 345.000", "slaapkamers": 3, "oppervlakte": 120}
+Elk veld dat je niet terugvindt: null.
+
+PAGINATEKST:
+${tekst}`
+        }]
+      }),
+      signal: AbortSignal.timeout(15000)
+    });
+
+    if (!resp.ok) { console.warn(`  🤖 Claude Haiku HTTP ${resp.status} voor ${urlLabel}`); return {}; }
+    const data = await resp.json();
+    const rawText = (data.content?.[0]?.text || '').trim();
+    const jsonMatch = rawText.match(/\{[\s\S]*?\}/);
+    if (!jsonMatch) return {};
+
+    const parsed = JSON.parse(jsonMatch[0]);
+    const resultaat = {
+      adres:       parsed.adres       || null,
+      prijs:       parsed.prijs       || null,
+      slaapkamers: parseInt(parsed.slaapkamers) || null,
+      oppervlakte:  parseFloat(parsed.oppervlakte) || null,
+    };
+    console.log(`  🤖 Claude Haiku resultaat: adres="${resultaat.adres}" prijs="${resultaat.prijs}" kamers=${resultaat.slaapkamers} opp=${resultaat.oppervlakte}`);
+    return resultaat;
+  } catch (e) {
+    console.warn(`  🤖 Claude Haiku extractie mislukt voor ${urlLabel}:`, e.message);
+    return {};
+  }
+}
+
 // ── fetchDetailMetPuppeteer ───────────────────────────────────────
 // Voor de definitief gevonden listing — met echte Puppeteer fallback.
 // Verschil met slimFetchHtml: die checkt enkel op tekst-lengte (≥800 tekens).
@@ -501,6 +607,22 @@ async function slimFetchHtml(url) {
 async function fetchDetailMetPuppeteer(url) {
   if (!url) return { adres: null, prijs: null, slaapkamers: null, oppervlakte: null };
   const label = url.split('/').slice(-2).join('/');
+
+  // Hulpfunctie: vul ontbrekende velden aan via Claude Haiku als fallback
+  const _claudeFallback = async (detail, html) => {
+    const missAdres = !detail.adres;
+    const missPrijs = !detail.prijs;
+    if (!missAdres && !missPrijs) return detail; // alles aanwezig → geen Claude nodig
+    const reden = [missAdres && 'adres', missPrijs && 'prijs'].filter(Boolean).join(' + ');
+    console.log(`  ⚠️  Regex/JSON-LD miste ${reden} → Claude Haiku als fallback`);
+    const claudeDetail = await extractDetailsViaClaude(html, label);
+    if (missAdres  && claudeDetail.adres)       detail.adres       = claudeDetail.adres;
+    if (missPrijs  && claudeDetail.prijs)       detail.prijs       = claudeDetail.prijs;
+    if (!detail.slaapkamers && claudeDetail.slaapkamers) detail.slaapkamers = claudeDetail.slaapkamers;
+    if (!detail.oppervlakte && claudeDetail.oppervlakte) detail.oppervlakte = claudeDetail.oppervlakte;
+    return detail;
+  };
+
   // Stap 1: directe fetch — snel, werkt voor SSR-sites
   try {
     const resp = await fetch(url, {
@@ -514,20 +636,22 @@ async function fetchDetailMetPuppeteer(url) {
     if (resp.ok) {
       const html = await resp.text();
       const detail = _extractDetailsUitHtml(html, label);
-      // Alleen teruggeven als we echt iets nuttig gevonden hebben
       if (detail.adres || detail.prijs || detail.slaapkamers) {
         console.log(`  fetchDetailMetPuppeteer: data via directe fetch (${label})`);
-        return detail;
+        return await _claudeFallback(detail, html); // aanvullen als prijs/adres mist
       }
       console.log(`  fetchDetailMetPuppeteer: directe fetch leeg → Puppeteer (${label})`);
+      // Bewaar html voor eventuele Claude-fallback na Puppeteer
+      // (als Puppeteer ook niets vindt, proberen we het met de directe HTML)
+      var _directHtml = html;
     } else {
       console.warn(`  fetchDetailMetPuppeteer: HTTP ${resp.status} voor ${url}`);
     }
   } catch (e) {
     console.warn(`  fetchDetailMetPuppeteer directe fetch fout (${label}):`, e.message);
   }
+
   // Stap 2: Puppeteer — voor JS-zware sites (React/Vue zonder SSR)
-  // Puppeteer voert JS uit en wacht tot de pagina geladen is
   try {
     console.log(`  fetchDetailMetPuppeteer: Puppeteer starten voor ${label}...`);
     const html = await fetchWithPuppeteer(url, 25000);
@@ -538,11 +662,19 @@ async function fetchDetailMetPuppeteer(url) {
       } else {
         console.log(`  fetchDetailMetPuppeteer: ook Puppeteer gaf geen data (${label})`);
       }
-      return detail;
+      return await _claudeFallback(detail, html);
     }
   } catch (e) {
     console.warn(`  fetchDetailMetPuppeteer Puppeteer fout (${label}):`, e.message);
   }
+
+  // Stap 3: Claude Haiku op directe HTML als Puppeteer ook mislukte
+  if (typeof _directHtml === 'string' && _directHtml.length > 200) {
+    console.log(`  fetchDetailMetPuppeteer: Puppeteer mislukt, Claude Haiku op directe HTML (${label})`);
+    const claudeDetail = await extractDetailsViaClaude(_directHtml, label);
+    if (Object.values(claudeDetail).some(Boolean)) return claudeDetail;
+  }
+
   return { adres: null, prijs: null, slaapkamers: null, oppervlakte: null };
 }
 // ── Auto-ontdekking makelaar URLs ─────────────────────────────────
@@ -1151,6 +1283,92 @@ async function zoekPortalenParallel(makelaarNaam, domeinHint, zoekAdres, postcod
   return gevonden;
 }
 
+// ── Claude Haiku: match listing op basis van GPS-adres ───────────
+// Wanneer STAP 2 listings vond maar geen enkele matcht de GPS-straat,
+// vraagt deze functie Claude Haiku welke listing waarschijnlijk het juiste pand is.
+// Claude kan redeneren over hoekpanden, pleinen, aangrenzende straten, etc.
+// Input: listings-array (met url + adres), GPS-context, makelaar-naam
+// Output: { url, confidence, reden } of null
+async function matchListingViaClaude(listings, gpsStraat, gpsAdres, makelaarNaam, nabijStraten = []) {
+  if (!API_KEY || !listings?.length) return null;
+  try {
+    // Bouw een leesbare listing-lijst op voor Claude
+    const listingTekst = listings.slice(0, 25).map((l, i) => {
+      const adres = l.address || l.adres || 'adres niet geladen';
+      const prijs = l.prijs || '';
+      const url   = l.url   || '';
+      return `${i + 1}. Adres: ${adres}${prijs ? ` | Prijs: ${prijs}` : ''}\n   URL: ${url}`;
+    }).join('\n\n');
+
+    const nabijHint = nabijStraten.length > 0
+      ? `\nNabijgelegen straten/pleinen (< 120m van GPS): ${nabijStraten.join(', ')}`
+      : '';
+
+    console.log(`  🤖 matchListingViaClaude: ${listings.length} listings → Claude Haiku matcht op "${gpsAdres}"`);
+    const resp = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': API_KEY, 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 400,
+        system: `Je helpt bij het matchen van een vastgoed-listing op basis van een GPS-locatie. Redeneer stap voor stap: hoekpanden staan op de hoek van twee straten, pleinen hebben aangrenzende straten, GPS is soms iets naast het exacte pand. Geef ALLEEN het gevraagde JSON terug.`,
+        messages: [{
+          role: 'user',
+          content: `Ik zoek het pand van makelaar "${makelaarNaam}" dat staat op GPS-adres: "${gpsAdres}" (straat: "${gpsStraat}").${nabijHint}
+
+Het GPS-adres matcht met geen enkel listing-adres. Welke listing hieronder is toch waarschijnlijk het juiste pand? Denk na over:
+- Hoekpanden (staan op hoek van twee straten, kunnen op beide staan)
+- Pleinen vs. aangrenzende straten (GPS pikt soms aangrenzende straat)
+- Deelgemeente vs. hoofdgemeente
+
+LISTINGS:
+${listingTekst}
+
+Geef ALLEEN dit JSON:
+{"listing_nummer": 3, "url": "https://...", "confidence": "HOOG|MIDDEL|LAAG", "reden": "Wapenplein is het plein naast Breidelstraat — GPS pikt aangrenzende straat"}
+Als echt geen enkele listing past: {"listing_nummer": null, "url": null, "confidence": "LAAG", "reden": "..."}`
+        }]
+      }),
+      signal: AbortSignal.timeout(15000)
+    });
+
+    if (!resp.ok) { console.warn(`  🤖 matchListingViaClaude HTTP ${resp.status}`); return null; }
+    const data = await resp.json();
+    const rawText = (data.content?.[0]?.text || '').trim();
+    const jsonMatch = rawText.match(/\{[\s\S]*?\}/);
+    if (!jsonMatch) return null;
+
+    const parsed = JSON.parse(jsonMatch[0]);
+    if (!parsed.url) {
+      console.log(`  🤖 matchListingViaClaude: geen match gevonden (${parsed.reden})`);
+      return null;
+    }
+    console.log(`  🤖 matchListingViaClaude: match #${parsed.listing_nummer} (${parsed.confidence}) → ${parsed.url}`);
+    console.log(`  🤖 Reden: ${parsed.reden}`);
+    return { url: parsed.url, confidence: parsed.confidence, reden: parsed.reden };
+  } catch (e) {
+    console.warn('  🤖 matchListingViaClaude mislukt:', e.message);
+    return null;
+  }
+}
+
+// ── Claude Haiku: foto-matching hook (toekomstige uitbreiding) ────
+// Architectuur klaargezet voor visuele matching van listing-foto's met bord-foto.
+// Aanroepen wanneer meerdere kandidaat-listings dezelfde straat hebben.
+// bordFotoBase64: de base64 foto van het gescande bord (inclusief gebouw op achtergrond)
+// listingFotos: array van { url, src } met foto-URLs van de kandidaat-listing
+async function matchListingOpFoto(bordFotoBase64, bordMime, listingUrl, listingFotos = []) {
+  if (!API_KEY || !bordFotoBase64 || listingFotos.length === 0) return null;
+  // TODO: implementeer wanneer listing-foto-extractie beschikbaar is
+  // Flow:
+  //   1. Haal eerste listing-foto op als base64
+  //   2. Stuur beide foto's naar Claude Sonnet met bord-foto
+  //   3. Claude beantwoordt: "Is dit hetzelfde gebouw als op het bord?" (ja/nee + confidence)
+  //   4. Gebruik als tiebreaker bij meerdere kandidaten op dezelfde straat
+  console.log(`  📸 matchListingOpFoto: ${listingFotos.length} fotos beschikbaar voor ${listingUrl} (nog niet actief)`);
+  return null;
+}
+
 // ================================================================
 //  SYSTEM PROMPTS
 // ================================================================
@@ -1514,6 +1732,8 @@ app.post('/api/scan', async (req, res) => {
     const gpsVolledigAdres = gpsStraat && geocodeResultaat?.huisnummer ? `${gpsStraat} ${geocodeResultaat.huisnummer}` : gpsStraat;
     let listings = [];
     let listingsBron = 'geen';
+    let alleListingsVoorClaude = []; // ongefilterd, voor matchListingViaClaude fallback
+    let _nabijStratenCache = [];     // nabijgelegen straten, gedeeld met Claude match
 
     // ════════════════════════════════════════════════════════════════
     // ✅ STAP 2 — DIRECTE MAKELAARSITE SCRAPING (PRIMAIRE ROUTE)
@@ -1548,6 +1768,8 @@ app.post('/api/scan', async (req, res) => {
             kantooradresGedetecteerd = true;
           }
         }
+        // Bewaar ongefilterde listings voor matchListingViaClaude (fallback bij straat_geen_match)
+        alleListingsVoorClaude = [...listings];
         if (gpsStraat && !kantooradresGedetecteerd) {
           const straatLow  = gpsStraat.toLowerCase();
           const gpsNummer  = geocodeResultaat?.huisnummer || null;
@@ -1582,6 +1804,26 @@ app.post('/api/scan', async (req, res) => {
       console.log('🔍 IMMOWEB: fallback');
       listings = await searchImmoweb(bordInfo.pand_type_slug, bordInfo.listing_type, hoofdgemeente, postcode);
       listingsBron = 'immoweb_fallback';
+    }
+
+    // ── Claude Haiku: match listing op GPS-adres als straatfilter faalde ──────
+    // Treedt op bij 'straat_geen_match': scraping vond listings maar geen enkele
+    // had het GPS-adres in het listing-adres. Claude redeneert over hoekpanden,
+    // pleinen en nabijgelegen straten om toch de juiste listing te vinden.
+    if (listingsBron === 'straat_geen_match' && alleListingsVoorClaude?.length > 0 && gpsStraat) {
+      const nabijStraten = _nabijStratenCache || [];
+      const claudeMatch = await matchListingViaClaude(
+        alleListingsVoorClaude, gpsStraat, effectiefZoekladres || `${gpsStraat} ${postcode || ''}`.trim(),
+        bordInfo.makelaar, nabijStraten
+      );
+      if (claudeMatch?.url && claudeMatch.confidence !== 'LAAG') {
+        // Claude vond een match — gebruik die listing
+        const gevondenListing = alleListingsVoorClaude.find(l => l.url === claudeMatch.url)
+          || { url: claudeMatch.url };
+        listings = [gevondenListing];
+        listingsBron = 'makelaar_direct'; // Claude vond het via de makelaarsite
+        console.log(`✅ Claude Haiku straatmatch: listing gevonden (${claudeMatch.confidence})`);
+      }
     }
 
     // ── Co-makelaar: ook extra makelaar doorzoeken ────────────────
@@ -1742,6 +1984,7 @@ app.post('/api/scan', async (req, res) => {
       let nabijStratenHint = '';
       if ((listingsBron === 'straat_geen_match' || listingsBron === 'web_search_direct' || listingsBron === 'scraping_leeg') && gps?.lat && gps?.lon) {
         const { straten: nabijStraten, pleinen: nabijPleinen } = await straatNamenInBuurt(gps.lat, gps.lon);
+        _nabijStratenCache = [...(nabijStraten || []), ...(nabijPleinen || [])]; // beschikbaar voor Claude match
         // Plein-detectie: geocoder geeft aangrenzende straat, maar we staan OP een plein
         if (nabijPleinen.length > 0 && gpsStraat && !nabijPleinen.some(p => p.toLowerCase() === gpsStraat.toLowerCase())) {
           const pleinNaam = nabijPleinen[0];
@@ -1981,24 +2224,83 @@ app.post('/api/scan', async (req, res) => {
       if (detail.oppervlakte) result.oppervlakte = detail.oppervlakte;
     }
 
-    // ── Prijs ophalen uit alternatieven als nog niet bekend ──────
-    // Als makelaar-URL geen prijs gaf (bv. niet gevonden of JS-site), probeer
-    // prijs te lezen van de eerste Immoweb of Zimmo alternatieve URL.
-    if (!result.prijs && Array.isArray(result.url_alternatieven) && result.url_alternatieven.length > 0) {
-      const prijsBronnen = ['immoweb.be', 'zimmo.be'];
-      for (const alt of result.url_alternatieven) {
-        if (prijsBronnen.some(d => (alt.url || '').includes(d))) {
+    // ── Prijs-verificatie: vergelijk prijs van ALLE beschikbare bronnen ──────────
+    // Strategie: bevraag hoofdbron + alle portalen PARALLEL. Vergelijk daarna de prijzen.
+    // Als ze overeenstemmen → bevestigd. Als ze afwijken → neem meerderheid, log discrepantie.
+    // Zo vermijden we dat één verkeerde bron (bv. Zimmo €275k i.p.v. €345k) de prijs bepaalt.
+    {
+      // Hulpfunctie: prijs-string → getal (voor vergelijking)
+      const _toPrijsGetal = (p) => {
+        if (!p) return 0;
+        // Verwijder valuta-prefix, spaties, puntduizendtalscheiding, zet komma→punt
+        const schoon = String(p).replace(/[^\d.,]/g, '').replace(/[.,](?=\d{3}(?:[.,]|$))/g, '').replace(',', '.');
+        return Math.round(parseFloat(schoon)) || 0;
+      };
+
+      // Verzamel prijzen van alternatieven (parallel, max 8s per URL)
+      const altUrls = (result.url_alternatieven || []).filter(a =>
+        a.url && !['facebook', 'instagram', 'realo', 'immoscoop'].some(s => a.url.includes(s))
+      );
+      const altResultaten = await Promise.allSettled(
+        altUrls.map(async (alt) => {
           try {
-            const altDetail = await fetchDetailVanListing(alt.url);
-            if (altDetail.prijs) {
-              result.prijs = altDetail.prijs;
-              console.log(`💰 Prijs via alternatief (${alt.label}): ${result.prijs}`);
-              // Extra info overnemen als die ook ontbreekt
-              if (!result.slaapkamers && altDetail.slaapkamers) result.slaapkamers = altDetail.slaapkamers;
-              if (!result.oppervlakte && altDetail.oppervlakte) result.oppervlakte = altDetail.oppervlakte;
-              break;
-            }
-          } catch (e) { console.warn(`Prijs ophalen uit ${alt.label} mislukt:`, e.message); }
+            const d = await fetchDetailVanListing(alt.url);
+            return { label: alt.label, url: alt.url, prijs: d.prijs || null,
+                     slaapkamers: d.slaapkamers || null, oppervlakte: d.oppervlakte || null };
+          } catch { return { label: alt.label, url: alt.url, prijs: null }; }
+        })
+      );
+
+      // Bouw lijst van alle bekende prijzen op
+      const prijsBronnen = [];
+      if (result.prijs) {
+        prijsBronnen.push({ label: 'makelaar', prijs: result.prijs, getal: _toPrijsGetal(result.prijs) });
+      }
+      for (const r of altResultaten) {
+        if (r.status === 'fulfilled' && r.value?.prijs) {
+          const b = r.value;
+          console.log(`💰 Prijs via ${b.label}: ${b.prijs}`);
+          prijsBronnen.push({ label: b.label, prijs: b.prijs, getal: _toPrijsGetal(b.prijs), ...b });
+          // Extra info overnemen als hoofdbron die mist
+          if (!result.slaapkamers && b.slaapkamers) result.slaapkamers = b.slaapkamers;
+          if (!result.oppervlakte && b.oppervlakte) result.oppervlakte = b.oppervlakte;
+        }
+      }
+
+      if (prijsBronnen.length === 0) {
+        // Geen enkele bron gaf een prijs — niets te doen
+      } else if (prijsBronnen.length === 1) {
+        // Slechts één bron — overnemen zonder verificatie
+        result.prijs = prijsBronnen[0].prijs;
+        console.log(`💰 Prijs (één bron, ${prijsBronnen[0].label}): ${result.prijs}`);
+      } else {
+        // Meerdere bronnen — vergelijk (afgerond op €1.000 om kleine afrondingsverschillen te negeren)
+        const freq = {};
+        for (const b of prijsBronnen) {
+          const k = Math.round(b.getal / 1000) * 1000;
+          if (!freq[k]) freq[k] = [];
+          freq[k].push(b.label);
+        }
+        const gesorteerd = Object.entries(freq)
+          .map(([k, labels]) => ({ waarde: parseInt(k), labels, count: labels.length }))
+          .sort((a, b) => b.count - a.count || b.waarde - a.waarde); // bij gelijke count: hogere prijs wint
+
+        if (gesorteerd.length === 1) {
+          // Alle bronnen eens
+          result.prijs = `EUR ${gesorteerd[0].waarde.toLocaleString('nl-BE')}`;
+          console.log(`✅ Prijs bevestigd door ${prijsBronnen.map(b => b.label).join(' + ')}: ${result.prijs}`);
+        } else {
+          // Discrepantie tussen bronnen
+          const discLog = gesorteerd.map(g => `${g.labels.join('+')}=€${g.waarde.toLocaleString('nl-BE')}`).join(' | ');
+          console.log(`⚠️  Prijs-discrepantie: ${discLog}`);
+          const winnaar = gesorteerd[0];
+          const oudePrijs = result.prijs;
+          result.prijs = `EUR ${winnaar.waarde.toLocaleString('nl-BE')}`;
+          if (result.prijs !== oudePrijs) {
+            console.log(`💰 Prijs gecorrigeerd via meerderheid (${winnaar.labels.join('+')}): ${oudePrijs || 'geen'} → ${result.prijs}`);
+          } else {
+            console.log(`💰 Prijs behouden via meerderheid (${winnaar.labels.join('+')}): ${result.prijs}`);
+          }
         }
       }
     }
