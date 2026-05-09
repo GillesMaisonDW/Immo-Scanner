@@ -45,6 +45,22 @@ function _deepFind(obj, sleutel, maxDiepte = 8) {
   }
   return undefined;
 }
+// ── Slimme straat-matching (GPS vs listing-adres) ─────────────────
+// Stap 1: exacte match (volledige GPS-straatnaam in adres).
+// Stap 2: eerste significant woord (≥5 tekens) van GPS-straat staat in adres.
+//   Voorbeeld: "Coupure Links" → "coupure" → matcht "Coupure 383, 9000 Gent" ✅
+function _straatMatch(gpsStraat, adres) {
+  if (!gpsStraat || !adres) return false;
+  const adresLow  = adres.toLowerCase();
+  const straatLow = gpsStraat.toLowerCase();
+  if (adresLow.includes(straatLow)) return true;
+  // Partial: eerste significant woord (≥5 tekens) van GPS-straat
+  const eersteSignificant = straatLow.split(/[\s\-]+/).find(w => w.length >= 5);
+  if (eersteSignificant && adresLow.includes(eersteSignificant)) {
+    return true;
+  }
+  return false;
+}
 // ── Details extraheren uit HTML detailpagina ─────────────────────
 function _extractDetailsUitHtml(html, urlLabel) {
   let adres = null, prijs = null, slaapkamers = null, oppervlakte = null;
@@ -188,8 +204,12 @@ function _extractAdresUitHtml(html, urlLabel) {
   return _extractDetailsUitHtml(html, urlLabel).adres;
 }
 // ── fetchDetailVanListing ─────────────────────────────────────────
-async function fetchDetailVanListing(url) {
+// opties.claudeFallback (default true): false = geen Claude Haiku call.
+// Zet op false tijdens batch adres-verrijking (verrijkListingAdressen) om te voorkomen
+// dat Claude Haiku 20+ keer wordt aangeroepen voor kandidaat-listings.
+async function fetchDetailVanListing(url, opties = {}) {
   if (!url) return { adres: null, prijs: null, slaapkamers: null, oppervlakte: null };
+  const claudeFallback = opties.claudeFallback !== false; // default: true
   try {
     const label = url.split('/').slice(-2).join('/');
     const directResp = await fetch(url, {
@@ -203,8 +223,9 @@ async function fetchDetailVanListing(url) {
     if (directResp.ok) {
       const html = await directResp.text();
       const detail = _extractDetailsUitHtml(html, label);
-      // Claude Haiku als fallback als prijs of adres ontbreekt na regex
-      if (!detail.prijs || !detail.adres) {
+      // Claude Haiku als fallback als prijs of adres ontbreekt na regex —
+      // maar NIET tijdens batch adres-verrijking (claudeFallback=false)
+      if (claudeFallback && (!detail.prijs || !detail.adres)) {
         const reden = [!detail.adres && 'adres', !detail.prijs && 'prijs'].filter(Boolean).join('+');
         console.log(`  ⚠️  fetchDetailVanListing: regex miste ${reden} → Claude Haiku (${label})`);
         const claudeDetail = await extractDetailsViaClaude(html, label);
@@ -221,8 +242,9 @@ async function fetchDetailVanListing(url) {
   }
   return { adres: null, prijs: null, slaapkamers: null, oppervlakte: null };
 }
+// fetchAdresVanListing: puur voor kandidaat-adres ophalen — geen Claude Haiku
 async function fetchAdresVanListing(url) {
-  const detail = await fetchDetailVanListing(url);
+  const detail = await fetchDetailVanListing(url, { claudeFallback: false });
   return detail.adres;
 }
 // ── Visuele gebouwbevestiging ─────────────────────────────────────
@@ -725,7 +747,7 @@ async function verrijkListingAdressen(listings, hoofdgemeente, postcode, straatG
       if (adres) {
         opeenvolgendeMislukkingen = 0;
         listing.address = adres;
-        if (straatLw && adres.toLowerCase().includes(straatLw)) { console.log(`✅  GPS-straat "${straatGps}" gevonden -- stop`); break; }
+        if (straatLw && _straatMatch(straatGps, adres)) { console.log(`✅  GPS-straat "${straatGps}" gevonden -- stop`); break; }
       } else {
         opeenvolgendeMislukkingen++;
         if (opeenvolgendeMislukkingen >= 5) {
@@ -1774,7 +1796,7 @@ app.post('/api/scan', async (req, res) => {
           const straatLow  = gpsStraat.toLowerCase();
           const gpsNummer  = geocodeResultaat?.huisnummer || null;
           const nummerNorm = _normaliseHuisnummer(gpsNummer);
-          const straatMatches = listings.filter(l => (l.address || '').toLowerCase().includes(straatLow));
+          const straatMatches = listings.filter(l => _straatMatch(gpsStraat, l.address || ''));
           if (straatMatches.length > 0) {
             if (gpsNummer && nummerNorm) {
               const nummerMatches = straatMatches.filter(l => _normaliseHuisnummer(l.address || '').includes(nummerNorm));
@@ -1854,8 +1876,7 @@ app.post('/api/scan', async (req, res) => {
       if (listingsExtra.length > 0) {
         const verrijktExtra = await verrijkListingAdressen(listingsExtra, hoofdgemeente, postcode, gpsStraat);
         if (gpsStraat) {
-          const straatLow = gpsStraat.toLowerCase();
-          const straatMatchesExtra = verrijktExtra.filter(l => (l.address || '').toLowerCase().includes(straatLow));
+          const straatMatchesExtra = verrijktExtra.filter(l => _straatMatch(gpsStraat, l.address || ''));
           if (straatMatchesExtra.length > 0) {
             listings = straatMatchesExtra;
             listingsBron = `co_makelaar_${makelaarExtra.naam.toLowerCase().replace(/\s+/g,'_')}`;
@@ -1895,8 +1916,7 @@ app.post('/api/scan', async (req, res) => {
       let earlyExitOk = true;
       let adresEarly = detailEarly.adres || null;
       if (gpsStraat && adresEarly) {
-        const adresEarlyLow = adresEarly.toLowerCase();
-        if (!adresEarlyLow.includes(gpsStraat.toLowerCase())) {
+        if (!_straatMatch(gpsStraat, adresEarly)) {
           console.log(`🔴 Adres-mismatch early exit: "${gpsStraat}" niet in "${adresEarly}" — doorgaan naar STAP 3`);
           earlyExitOk = false;
         }
@@ -2340,8 +2360,8 @@ app.post('/api/scan', async (req, res) => {
     // ── GPS-straat validatie ──────────────────────────────────────
     if (gpsStraat && adresListing) {
       const adresLow   = adresListing.toLowerCase();
-      // Accepteer: GPS-straat, het gecorrigeerde plein-adres, of postcode als match
-      const straatOk   = adresLow.includes(gpsStraat.toLowerCase()) ||
+      // Accepteer: GPS-straat (slimme match), het gecorrigeerde plein-adres, of postcode als match
+      const straatOk   = _straatMatch(gpsStraat, adresListing) ||
                          (effectiefZoekladres && effectiefZoekladres !== gpsVolledigAdres &&
                           adresLow.includes(effectiefZoekladres.toLowerCase().split(' ')[0]));
       const postcodeOk = !postcode || adresListing.includes(postcode);
@@ -2366,7 +2386,7 @@ app.post('/api/scan', async (req, res) => {
     if (result.status === 'gedeeltelijk' && gpsStraat && result.adres && result.url && domeinMakelaar) {
       const betrouwbaar = (bordInfo.makelaar_betrouwbaarheid || '').toUpperCase() === 'HOOG';
       const urlVanMakelaar = result.url.toLowerCase().includes(domeinMakelaar.toLowerCase());
-      const straatInAdres  = result.adres.toLowerCase().includes(gpsStraat.toLowerCase());
+      const straatInAdres  = _straatMatch(gpsStraat, result.adres);
       if (betrouwbaar && urlVanMakelaar && straatInAdres) {
         result.status = 'gevonden';
         result.faal_categorie = null;
