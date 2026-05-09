@@ -1416,8 +1416,8 @@ async function matchListingOpFoto(bordFotoBase64, bordMime, listingUrl, listingF
 // ================================================================
 const PROMPT_STAP1 = `Analyseer dit makelaarsbord. Geef ENKEL deze JSON terug, niets anders:
 {
-  "makelaar": "naam van de makelaar",
-  "makelaar_website": "domeinnaam: zichtbaar op bord OF afgeleid uit herkenning (ERA→era.be, Heylen→heylenvastgoed.be, Hillewaere→hillewaere-vastgoed.be, DeWaele→dewaele.com, Century21→century21.be, Trevi→trevi.be). Onbekende makelaar zonder website op bord: null",
+  "makelaar": "exacte naam zoals zichtbaar op het bord (letterlijk overtypen, geen interpretatie)",
+  "makelaar_website": "domeinnaam — prioriteit: (1) zichtbaar op bord, (2) bekend logo/huisstijl: ERA→era.be, Heylen→heylenvastgoed.be, Hillewaere→hillewaere-vastgoed.be, DeWaele→dewaele.com, Century21→century21.be, Trevi→trevi.be, JO (blauw logo)→jo.immo, Crevits→crevits.be, Huysewinkel→huysewinkel.be. Onbekende makelaar: null",
   "makelaar_herkenning": "hoe herkend (kleur + logo + tekst)",
   "makelaar_betrouwbaarheid": "HOOG" | "MIDDEL" | "LAAG",
   "makelaar_extra": {"naam": "naam tweede makelaar", "website": "domein of null", "telefoon": "nummer of null"} | null,
@@ -1696,9 +1696,18 @@ app.post('/api/scan', async (req, res) => {
     let makelaarInDB = false;
     // allesMakelaars al geladen vóór STAP 1.5a — hergebruiken hier
 
+    // ── DB-matching: website eerst, dan naam ─────────────────────
+    // Na elke match: normaliseer bordInfo.makelaar naar de canonieke DB-naam.
+    // Zo geeft "JO Vastgoed" én "Immo Jo" én "Jo Immo" altijd hetzelfde resultaat.
     if (domeinMakelaar) {
       const dbMatch = allesMakelaars.find(m => { const d = m.domein.replace('www.',''); return d === domeinMakelaar || d.includes(domeinMakelaar) || domeinMakelaar.includes(d); });
-      if (dbMatch) makelaarInDB = true;
+      if (dbMatch) {
+        makelaarInDB = true;
+        if (dbMatch.naam) {
+          console.log(`🏷️  Naam genormaliseerd: "${bordInfo.makelaar}" → "${dbMatch.naam}" (via domein ${domeinMakelaar})`);
+          bordInfo.makelaar = dbMatch.naam;
+        }
+      }
     }
     if (!makelaarInDB && bordInfo.makelaar) {
       const naamLow = (bordInfo.makelaar || '').toLowerCase().replace(/[-\s]+/g,' ').trim();
@@ -1719,9 +1728,28 @@ app.post('/api/scan', async (req, res) => {
           else if (naamLow.includes(siteBase) && siteBase.length >= 5) score = 7;
           else if (siteBase.includes(naamLow) && naamLow.length >= 5)  score = 7;
         }
+        // Extra: woord-overlap tussen bord-naam en DB-naam
+        // Vangt bv. "JO Vastgoed" → dbNaam "immo jo": "jo" zit in beide
+        if (score === 0 && dbNaam.length >= 3) {
+          const STOP = new Set(['immo','vastgoed','home','real','estate','group','invest','makelaar']);
+          const bordWoorden = naamLow.split(' ').filter(w => w.length >= 3 && !STOP.has(w));
+          const dbWoorden   = dbNaam.split(' ').filter(w => w.length >= 3 && !STOP.has(w));
+          if (bordWoorden.length > 0 && dbWoorden.length > 0) {
+            const overlap = bordWoorden.filter(w => dbWoorden.includes(w));
+            if (overlap.length > 0) score = 6;
+          }
+        }
         if (score > besteScore) { besteScore = score; besteMatch = m; }
       }
-      if (besteMatch && besteScore >= 7) { domeinMakelaar = besteMatch.domein.replace('www.',''); makelaarInDB = true; }
+      if (besteMatch && besteScore >= 6) {
+        domeinMakelaar = besteMatch.domein.replace('www.','');
+        makelaarInDB = true;
+        // Normaliseer naam naar DB-waarde voor consistente resultaten
+        if (besteMatch.naam) {
+          console.log(`🏷️  Naam genormaliseerd: "${bordInfo.makelaar}" → "${besteMatch.naam}" (via naam-match score ${besteScore})`);
+          bordInfo.makelaar = besteMatch.naam;
+        }
+      }
     }
 
     // Fallback: naam gekend maar geen domein → probeer website te vinden via Serper
