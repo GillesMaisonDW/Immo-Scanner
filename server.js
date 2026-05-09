@@ -1157,7 +1157,7 @@ async function zoekPortalenParallel(makelaarNaam, domeinHint, zoekAdres, postcod
 const PROMPT_STAP1 = `Analyseer dit makelaarsbord. Geef ENKEL deze JSON terug, niets anders:
 {
   "makelaar": "naam van de makelaar",
-  "makelaar_website": "domeinnaam als zichtbaar op bord (bv. janssen.be), anders null",
+  "makelaar_website": "domeinnaam: zichtbaar op bord OF afgeleid uit herkenning (ERA→era.be, Heylen→heylenvastgoed.be, Hillewaere→hillewaere-vastgoed.be, DeWaele→dewaele.com, Century21→century21.be, Trevi→trevi.be). Onbekende makelaar zonder website op bord: null",
   "makelaar_herkenning": "hoe herkend (kleur + logo + tekst)",
   "makelaar_betrouwbaarheid": "HOOG" | "MIDDEL" | "LAAG",
   "makelaar_extra": {"naam": "naam tweede makelaar", "website": "domein of null", "telefoon": "nummer of null"} | null,
@@ -1388,9 +1388,20 @@ app.post('/api/scan', async (req, res) => {
                   voegMakelaarToeAanSupabase(domeinNieuw, telInfo.naam, null, null, bordInfo.telefoon);
                 }
               } else {
-                // STAP 1 al HOOG-betrouwbaar → telefoon-resultaat niet overschrijven
+                // STAP 1 al HOOG-betrouwbaar → naam NIET overschrijven
                 // (bv. "059 333 900" geeft "Immo Home" terug, maar bord toont duidelijk "Jo Immo")
-                console.log(`  Stap 1.5a: STAP 1 al HOOG-betrouwbaar (${bordInfo.makelaar}) — tel-resultaat "${telInfo.naam}" genegeerd`);
+                // Maar website WEL opslaan in Supabase als die nog ontbreekt — zodat toekomstige scans
+                // direct kunnen scrapen zonder URL-ontdekking te herhalen.
+                console.log(`  Stap 1.5a: STAP 1 al HOOG-betrouwbaar (${bordInfo.makelaar}) — naam niet overschreven, website "${telInfo.website || 'geen'}" wel opgeslagen`);
+                if (telInfo.website && !domeinMakelaar) {
+                  const domeinViaPhone = telInfo.website.replace('www.','').replace(/^https?:\/\//,'').split('/')[0];
+                  const alInDB = allesMakelaars.some(m => m.domein.replace('www.','') === domeinViaPhone);
+                  if (!alInDB) {
+                    console.log(`  Stap 1.5a: Nieuw domein "${domeinViaPhone}" toegevoegd aan Supabase via telefoon-lookup`);
+                    voegMakelaarToeAanSupabase(domeinViaPhone, bordInfo.makelaar, null, null, bordInfo.telefoon);
+                    domeinMakelaar = domeinViaPhone; // gebruik dit domein voor STAP 2
+                  }
+                }
               }
             }
           }
@@ -1453,6 +1464,38 @@ app.post('/api/scan', async (req, res) => {
       if (besteMatch && besteScore >= 7) { domeinMakelaar = besteMatch.domein.replace('www.',''); makelaarInDB = true; }
     }
 
+    // Fallback: naam gekend maar geen domein → probeer website te vinden via Serper
+    // Treedt op bij: kleine makelaar zonder website op bord + geen telefoon + niet in DB
+    if (!makelaarInDB && !domeinMakelaar && bordInfo.makelaar && bordInfo.makelaar !== 'onbekend' && SERPER_API_KEY) {
+      try {
+        const zoekNaam = bordInfo.makelaar.replace(/"/g, '');
+        const zoekGem  = hoofdgemeente || '';
+        console.log(`🔍 Serper: website zoeken voor onbekende makelaar "${zoekNaam}" (${zoekGem})`);
+        const serperResp = await fetch('https://google.serper.dev/search', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-API-KEY': SERPER_API_KEY },
+          body: JSON.stringify({ q: `"${zoekNaam}" vastgoed makelaar ${zoekGem}`, gl: 'be', hl: 'nl', num: 5 }),
+          signal: AbortSignal.timeout(8000)
+        });
+        if (serperResp.ok) {
+          const serperData = await serperResp.json();
+          const organicLinks = (serperData.organic || []).map(r => r.link).filter(Boolean);
+          // Pak eerste .be/.immo/.com domein dat geen portaal is
+          const portalen = ['immoweb', 'zimmo', 'immoscoop', 'realo', 'google', 'facebook', 'instagram', 'linkedin'];
+          for (const link of organicLinks) {
+            const m = link.match(/https?:\/\/(?:www\.)?([\w.-]+)/);
+            if (!m) continue;
+            const d = m[1].toLowerCase();
+            if (portalen.some(p => d.includes(p))) continue;
+            if (!/(\.be|\.immo|\.com|\.nl)$/.test(d)) continue;
+            domeinMakelaar = d;
+            console.log(`🔍 Serper: domein gevonden → "${domeinMakelaar}"`);
+            break;
+          }
+        }
+      } catch (e) { console.warn('Serper website-lookup fout:', e.message); }
+    }
+
     if (!makelaarInDB && domeinMakelaar) {
       console.log(`🔍 URL-ontdekking starten voor ${domeinMakelaar}...`);
       const ontdekt = await ontdekMakelaarUrls(domeinMakelaar);
@@ -1462,6 +1505,8 @@ app.post('/api/scan', async (req, res) => {
       if (koopUrl || huurUrl) {
         console.log(`✅ URL ontdekt voor ${domeinMakelaar} → direct zoeken`);
         makelaarInDB = true; // URL bekend, direct doorzoeken
+      } else {
+        console.log(`ℹ️  "${domeinMakelaar}" toegevoegd aan DB (nog geen koop/huur-URL gevonden)`);
       }
     }
 
@@ -1541,9 +1586,12 @@ app.post('/api/scan', async (req, res) => {
 
     // ── Co-makelaar: ook extra makelaar doorzoeken ────────────────
     const makelaarExtra = bordInfo.makelaar_extra || null;
-    // Co-makelaar alleen gebruiken als de primaire makelaar NIET in de DB zit.
-    // Als Immo Jo al bekend is, is de co-makelaar (bv. immo-home.be) een hallucinatie van STAP 1.
-    if (makelaarExtra?.naam && listings.length === 0 && !_makelaarAlInDB(bordInfo.makelaar)) {
+    // Co-makelaar controleren als de primaire makelaar NIETS gevonden heeft (listings.length === 0).
+    // Dit geldt ongeacht of de primaire makelaar in de DB zit — als hij niets vindt voor dit adres,
+    // kan het pand exclusief bij de co-makelaar staan (zoals Christophe Colpaert bij Cambier De Nil).
+    // Bescherming tegen hallucinaties: als de primaire WEL listings vindt (length > 0),
+    // wordt co-makelaar nooit gecheckt — dat is voldoende om valse co-makelaars te blokkeren.
+    if (makelaarExtra?.naam && listings.length === 0) {
       console.log(`🏢 Co-makelaar "${makelaarExtra.naam}" ook doorzoeken...`);
       const domeinExtra = makelaarExtra.website
         ? makelaarExtra.website.replace(/^https?:\/\//,'').replace(/^www\./,'').split('/')[0]
@@ -1681,8 +1729,14 @@ app.post('/api/scan', async (req, res) => {
 
     let makelaarPortal = null; // scope buiten if-blok
     let portalResultaten = [];  // scope buiten if-blok
-    if (listingsBron === 'web_search_direct' || listingsBron === 'scraping_leeg' || listingsBron === 'straat_geen_match') {
-      const waarom = { 'web_search_direct': 'Makelaar staat niet in onze database.', 'scraping_leeg': 'Directe scraping leverde geen listings op.', 'straat_geen_match': `Scraping vond listings, maar geen enkele had adres "${gpsStraat}".` }[listingsBron] || '';
+    // STAP 2.5 triggert bij:
+    //  1. Primaire makelaar niet in DB of geen listings → altijd
+    //  2. Primaire makelaar wel in DB maar geen straatmatch → straat_geen_match
+    //  3. Co-makelaar aanwezig + primaire vond MEERDERE listings (>1) → onzeker, co-makelaar bevragen
+    //     (bij exact 1 listing is early exit al actief en is STAP 2.5 niet nodig)
+    const coMakelaarBehoeftPortal = makelaarExtra?.naam && listingsBron === 'makelaar_direct' && listings.length > 1;
+    if (listingsBron === 'web_search_direct' || listingsBron === 'scraping_leeg' || listingsBron === 'straat_geen_match' || coMakelaarBehoeftPortal) {
+      const waarom = { 'web_search_direct': 'Makelaar staat niet in onze database.', 'scraping_leeg': 'Directe scraping leverde geen listings op.', 'straat_geen_match': `Scraping vond listings, maar geen enkele had adres "${gpsStraat}".`, 'makelaar_direct': `Co-makelaar "${makelaarExtra?.naam}" ook bevragen naast primaire makelaar.` }[listingsBron] || '';
       const refHint = bordInfo.referentienummer ? `\nReferentienummer: ${bordInfo.referentienummer} → Zoek dit EERST: "${bordInfo.referentienummer}" site:${domeinHint}` : '';
       // Overpass: nabijgelegen straten + pleinen als fallback (ook bij scraping_leeg)
       let nabijStratenHint = '';
