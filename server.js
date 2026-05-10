@@ -802,7 +802,7 @@ async function searchMakelaar(makelaarNaam, listingType, gemeente, postcode, mak
       if (woorden.length > 0 && woorden.every(w => siteNorm.includes(w))) { match = m; break; }
     }
   }
-  if (!match) { console.log(`❓ Makelaar "${makelaarNaam}" niet in database`); return []; }
+  if (!match) { console.log(`❓ Makelaar "${makelaarNaam}" niet in database — scan overgeslagen (geen URL beschikbaar)`); return []; }
   const domein = match.domein;
   const isHuur = listingType === 'Te huur';
   let urlTemplate = isHuur ? match.huur_url : match.koop_url;
@@ -866,6 +866,56 @@ async function searchMakelaar(makelaarNaam, listingType, gemeente, postcode, mak
         const urlSegmenten = hrefZonderQuery.split('/').filter(Boolean);
         const beschrijvend = urlSegmenten.slice(-2).find(s => !/^\d+$/.test(s)) || urlSegmenten[urlSegmenten.length-1] || 'Listing';
         listings.push({ url: hrefZonderQuery, title: beschrijvend.replace(/-/g,' '), bron: `${domein}_regex` });
+      }
+    }
+    // Puppeteer fallback als statische fetch 0 listings geeft (JS-zware site)
+    if (listings.length === 0) {
+      console.log(`⚠️  ${domein}: 0 listings via statische fetch — Puppeteer proberen voor overzichtspagina`);
+      try {
+        const puppHtml = await fetchWithPuppeteer(url, 20000);
+        if (puppHtml && puppHtml.length > 5000) {
+          console.log(`🤖 Puppeteer overzicht ${domein}: ${puppHtml.length} bytes`);
+          const puppListings = [];
+          // Zelfde parsers als statische fetch, maar nu op Puppeteer HTML
+          const nextM = puppHtml.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
+          if (nextM) {
+            try {
+              const nd = JSON.parse(nextM[1]);
+              const pp = nd?.props?.pageProps || {};
+              const results = pp.properties || pp.listings || pp.results || pp.classifieds || pp.estates || pp.items || pp.data?.properties || pp.data?.listings || [];
+              if (Array.isArray(results) && results.length > 0) {
+                for (const item of results.slice(0,25)) {
+                  const u = item.url || item.link || item.slug || item.permalink;
+                  if (u) puppListings.push({ url: u.startsWith('http') ? u : `https://${domein}${u.startsWith('/') ? '' : '/'}${u}`, title: item.title || item.name || '', price: item.price || item.prijs || null, bedrooms: item.bedrooms || item.slaapkamers || null, area: item.area || item.oppervlakte || null, bron: `${domein}_pup_next` });
+                }
+              }
+            } catch {}
+          }
+          if (puppListings.length === 0) {
+            // JSON-LD en href-regex op Puppeteer HTML
+            const tempListings = [];
+            const scriptJsonLd = [...puppHtml.matchAll(/<script[^>]+type="application\/ld\+json"[^>]*>([\s\S]*?)<\/script>/gi)];
+            for (const sm of scriptJsonLd) {
+              try {
+                const parsed = JSON.parse(sm[1]);
+                const items = Array.isArray(parsed) ? parsed : [parsed];
+                for (const it of items) {
+                  const u = it.url || it['@id'];
+                  if (u && u.includes(domein)) tempListings.push({ url: u, title: it.name || '', bron: `${domein}_pup_jsonld` });
+                }
+              } catch {}
+            }
+            puppListings.push(...tempListings);
+          }
+          if (puppListings.length > 0) {
+            console.log(`🤖 Puppeteer overzicht ${domein}: ${puppListings.length} listings gevonden`);
+            return puppListings;
+          } else {
+            console.log(`🤖 Puppeteer overzicht ${domein}: ook 0 listings — site waarschijnlijk API-driven of geblokkeerd`);
+          }
+        }
+      } catch (puppErr) {
+        console.warn(`🤖 Puppeteer overzicht mislukt voor ${domein}: ${puppErr.message}`);
       }
     }
     console.log(`🏠 ${domein}: ${listings.length} listings gevonden`);
@@ -1912,18 +1962,60 @@ app.post('/api/scan', async (req, res) => {
         ? makelaarExtra.website.replace(/^https?:\/\//,'').replace(/^www\./,'').split('/')[0]
         : null;
 
-      // Controleer of extra makelaar in DB staat; zo niet, toevoegen
+      // Controleer of extra makelaar in DB staat; zo niet, website zoeken en toevoegen
       let extraInDB = false;
-      if (domeinExtra) {
-        const dbMatchExtra = allesMakelaars.find(m => { const d = m.domein.replace('www.',''); return d === domeinExtra || d.includes(domeinExtra) || domeinExtra.includes(d); });
+      let domeinExtraVoorDB = domeinExtra; // kan aangevuld worden via Serper
+      if (domeinExtraVoorDB) {
+        const dbMatchExtra = allesMakelaars.find(m => { const d = m.domein.replace('www.',''); return d === domeinExtraVoorDB || d.includes(domeinExtraVoorDB) || domeinExtraVoorDB.includes(d); });
         if (dbMatchExtra) extraInDB = true;
       }
-      if (!extraInDB && domeinExtra) {
-        await voegMakelaarToeAanSupabase(domeinExtra, makelaarExtra.naam, null, null, makelaarExtra.telefoon || null);
-        ontdekMakelaarUrls(domeinExtra).catch(() => {});
+      // Naam-gebaseerde DB-check (ook zonder domein)
+      if (!extraInDB && makelaarExtra.naam) {
+        const naamLowExtra = makelaarExtra.naam.toLowerCase().replace(/[-\s]+/g,' ').trim();
+        const dbMatchOpNaam = allesMakelaars.find(m => {
+          const dbNaam = (m.naam || '').toLowerCase().replace(/[-\s]+/g,' ').trim();
+          return dbNaam === naamLowExtra || dbNaam.includes(naamLowExtra) || naamLowExtra.includes(dbNaam);
+        });
+        if (dbMatchOpNaam) { extraInDB = true; domeinExtraVoorDB = dbMatchOpNaam.domein.replace('www.',''); }
+      }
+      // Nog steeds niet gevonden: Serper zoekt de website van de co-makelaar
+      if (!extraInDB && !domeinExtraVoorDB && SERPER_API_KEY) {
+        try {
+          const zoekNaamExtra = makelaarExtra.naam.replace(/"/g,'');
+          const zoekGemExtra  = hoofdgemeente || '';
+          console.log(`🔍 Serper: website zoeken voor co-makelaar "${zoekNaamExtra}"`);
+          const serperExtraResp = await fetch('https://google.serper.dev/search', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-API-KEY': SERPER_API_KEY },
+            body: JSON.stringify({ q: `"${zoekNaamExtra}" vastgoed makelaar ${zoekGemExtra}`, gl: 'be', hl: 'nl', num: 5 }),
+            signal: AbortSignal.timeout(8000)
+          });
+          if (serperExtraResp.ok) {
+            const serperExtraData = await serperExtraResp.json();
+            const portalen = ['immoweb','zimmo','immoscoop','realo','google','facebook','instagram','linkedin','spotto','luxevastgoed'];
+            for (const link of (serperExtraData.organic || []).map(r => r.link).filter(Boolean)) {
+              const m2 = link.match(/https?:\/\/(?:www\.)?([\w.-]+)/);
+              if (!m2) continue;
+              const d = m2[1].toLowerCase();
+              if (portalen.some(p => d.includes(p))) continue;
+              if (!/(\.be|\.immo|\.com|\.nl)$/.test(d)) continue;
+              domeinExtraVoorDB = d;
+              console.log(`🔍 Serper co-makelaar: domein gevonden → "${domeinExtraVoorDB}"`);
+              break;
+            }
+          }
+        } catch (e) { console.warn('Serper co-makelaar lookup fout:', e.message); }
+      }
+      if (!extraInDB && domeinExtraVoorDB) {
+        await voegMakelaarToeAanSupabase(domeinExtraVoorDB, makelaarExtra.naam, null, null, makelaarExtra.telefoon || null);
+        ontdekMakelaarUrls(domeinExtraVoorDB).catch(() => {});
+        console.log(`✅ Co-makelaar "${makelaarExtra.naam}" (${domeinExtraVoorDB}) toegevoegd aan Supabase`);
+      } else if (!extraInDB) {
+        console.log(`⚠️ Co-makelaar "${makelaarExtra.naam}": geen website gevonden, niet toegevoegd aan DB`);
       }
 
-      const listingsExtra = await searchMakelaar(makelaarExtra.naam, bordInfo.listing_type, hoofdgemeente, postcode, makelaarExtra.website);
+      // domeinExtraVoorDB kan aangevuld zijn via Serper — gebruik dat als website-hint
+      const listingsExtra = await searchMakelaar(makelaarExtra.naam, bordInfo.listing_type, hoofdgemeente, postcode, domeinExtraVoorDB || makelaarExtra.website);
       if (listingsExtra.length > 0) {
         const verrijktExtra = await verrijkListingAdressen(listingsExtra, hoofdgemeente, postcode, gpsStraat);
         if (gpsStraat) {
@@ -1941,7 +2033,8 @@ app.post('/api/scan', async (req, res) => {
           console.log(`🏢 Co-makelaar "${makelaarExtra.naam}": ${listings.length} listing(s)`);
         }
       } else {
-        console.log(`🏢 Co-makelaar "${makelaarExtra.naam}": ook geen listings`);
+        const reden = domeinExtraVoorDB ? `website ${domeinExtraVoorDB} gaf 0 listings (JS-site of geen aanbod online)` : `geen website gevonden, scan niet mogelijk`;
+        console.log(`🏢 Co-makelaar "${makelaarExtra.naam}": 0 listings — ${reden}`);
       }
     }
 
