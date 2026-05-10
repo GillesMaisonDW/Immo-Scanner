@@ -481,6 +481,78 @@ async function voegMakelaarToeAanSupabase(domein, naam, koopUrl, huurUrl, telefo
   if (error) console.warn('Makelaar toevoegen mislukt:', error.message);
   else { console.log(`Makelaar "${naam || domein}" (${domein}) opgeslagen`); _makelaarsCacheTs = 0; }
 }
+
+// ── Verificatie & verrijking nieuwe makelaar ──────────────────────
+// Wordt asynchroon (fire-and-forget) aangeroepen na elke nieuwe DB-insert.
+// Verifieert telefoon via Google, ontdekt koop/huur-URLs, en werkt Supabase bij.
+// Blokkeert de scan NIET — resultaat is beschikbaar bij de volgende scan.
+async function verifieerEnVerrijkMakelaar(domein, naam, telefoonVanBord) {
+  if (!supabase || !domein) return;
+  const PORTALEN = new Set(['immoweb','zimmo','immoscoop','realo','google','facebook','instagram','linkedin','wikipedia','youtube']);
+  try {
+    console.log(`🔍 Achtergrond-verificatie gestart voor nieuwe makelaar "${naam}" (${domein})`);
+    let geverifieerdTelefoon = null;
+
+    // ── Stap A: telefoon verifiëren via Serper ────────────────────
+    if (SERPER_API_KEY) {
+      try {
+        const serperResp = await fetch('https://google.serper.dev/search', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-API-KEY': SERPER_API_KEY },
+          body: JSON.stringify({ q: `"${naam.replace(/"/g,'')}" vastgoed makelaar ${domein}`, gl: 'be', hl: 'nl', num: 5 }),
+          signal: AbortSignal.timeout(10000)
+        });
+        if (serperResp.ok) {
+          const sd = await serperResp.json();
+          // Knowledge Graph heeft meest betrouwbare info (Google verifieert dit zelf)
+          const kgTel = sd.knowledgeGraph?.attributes?.Phone || sd.knowledgeGraph?.phone;
+          if (kgTel) {
+            geverifieerdTelefoon = kgTel.replace(/\s+/g,'');
+            console.log(`  ✅ Telefoon via Google Knowledge Graph: ${geverifieerdTelefoon}`);
+          } else {
+            // Extracteer telefoonnummers uit snippets
+            const snippetTekst = (sd.organic || []).map(r => `${r.snippet || ''} ${r.title || ''}`).join(' ');
+            const telRegex = /(?:\+32[\s.-]?|0)(?:\d[\s.-]?){8,9}/g;
+            const gevonden = [...new Set((snippetTekst.match(telRegex) || []).map(t => t.replace(/[\s.-]/g, '')))];
+            if (telefoonVanBord) {
+              const bordSchoon = telefoonVanBord.replace(/[\s.-]/g,'');
+              // Controleer of bordtelefoon voorkomt in zoekresultaten → bevestigd
+              if (gevonden.some(t => t.includes(bordSchoon) || bordSchoon.includes(t.replace(/^\+32/,'0')))) {
+                geverifieerdTelefoon = telefoonVanBord;
+                console.log(`  ✅ Telefoon van bord bevestigd via Google: ${geverifieerdTelefoon}`);
+              } else if (gevonden.length > 0) {
+                console.log(`  ⚠️  Bord-telefoon "${telefoonVanBord}" verschilt van Google "${gevonden[0]}" — bord-nummer NIET overgenomen`);
+              } else {
+                // Geen verificatie mogelijk, bord-nummer voorzichtig overnemen
+                geverifieerdTelefoon = telefoonVanBord;
+                console.log(`  ⚠️  Telefoon niet verifieerbaar via Google — bord-nummer overgenomen (niet bevestigd): ${geverifieerdTelefoon}`);
+              }
+            } else if (gevonden.length > 0) {
+              geverifieerdTelefoon = gevonden[0];
+              console.log(`  ✅ Telefoon gevonden via Google snippets: ${geverifieerdTelefoon}`);
+            }
+          }
+        }
+      } catch (e) { console.warn(`  Serper telefoon-verificatie mislukt: ${e.message}`); }
+    }
+
+    // ── Stap B: koop/huur-URLs ontdekken ────────────────────────
+    // ontdekMakelaarUrls werkt de DB zelf bij als het URLs vindt
+    const { koopUrl, huurUrl } = await ontdekMakelaarUrls(domein);
+
+    // ── Stap C: Supabase bijwerken met geverifieerde data ─────────
+    const updates = { updated_at: new Date().toISOString() };
+    if (geverifieerdTelefoon) updates.telefoon = geverifieerdTelefoon;
+    // koop/huur al bijgewerkt door ontdekMakelaarUrls — hier alleen telefoon
+    if (Object.keys(updates).length > 1) {
+      const { error } = await supabase.from('makelaars').update(updates).eq('domein', domein);
+      if (!error) { _makelaarsCacheTs = 0; }
+    }
+    console.log(`✅ Verificatie klaar voor "${naam}" (${domein}): tel=${geverifieerdTelefoon || 'niet gevonden'}, koop=${koopUrl || 'niet gevonden'}, huur=${huurUrl || 'niet gevonden'}`);
+  } catch (e) {
+    console.warn(`Verificatie mislukt voor ${domein}:`, e.message);
+  }
+}
 // ── Puppeteer ─────────────────────────────────────────────────────
 let _chromium  = null;
 let _puppeteer = null;
@@ -1284,11 +1356,13 @@ async function zoekPortalenParallel(makelaarNaam, domeinHint, zoekAdres, postcod
     // Blokkeer zoekpagina's, overzichten en agentschapspagina's (altijd)
     const geblokkeerd = /\/search\/|\/zoeken\/|\/resultaten\/|\/overzicht|\/agentschap\/|\?(q|page|filter)=/i.test(url);
     if (geblokkeerd) return false;
-    // Open search (makelaar-query via Google): soepeler — 2+ segmenten is genoeg
-    // Google heeft al gefilterd op relevantie, we hoeven niet nog eens streng te zijn
-    if (openSearch) return segs >= 2;
+    // Lange URL-slug (>40 tekens pad) = vrijwel altijd een specifieke pand-detailpagina
+    // Vangt bv. /details-verkoop+villa+bronlaan+... van kleine makelaars met 1 URL-segment
+    const heeftLangeSlug = pad.replace(/\//g,'').length > 40;
+    // Open search (makelaar-query via Google): soepeler
+    if (openSearch) return segs >= 2 || heeftLangeSlug;
     // Gesloten search (site:-filter op portaal): strenger — numeriek ID of 3+ segmenten
-    return heeftNumId || segs >= 3;
+    return heeftNumId || segs >= 3 || heeftLangeSlug;
   };
   const _stripQueryParams = (url) => url.split('?')[0].split('#')[0];
   async function zoekEen({ domein, label, query, openSearch, agencyId }) {
@@ -1696,6 +1770,7 @@ app.post('/api/scan', async (req, res) => {
                 if (telInfo.website) {
                   const domeinNieuw = telInfo.website.replace('www.','').replace(/^https?:\/\//,'').split('/')[0];
                   voegMakelaarToeAanSupabase(domeinNieuw, telInfo.naam, null, null, bordInfo.telefoon);
+                  verifieerEnVerrijkMakelaar(domeinNieuw, telInfo.naam, bordInfo.telefoon).catch(() => {});
                 }
               } else {
                 // STAP 1 al HOOG-betrouwbaar → naam NIET overschrijven
@@ -1709,6 +1784,7 @@ app.post('/api/scan', async (req, res) => {
                   if (!alInDB) {
                     console.log(`  Stap 1.5a: Nieuw domein "${domeinViaPhone}" toegevoegd aan Supabase via telefoon-lookup`);
                     voegMakelaarToeAanSupabase(domeinViaPhone, bordInfo.makelaar, null, null, bordInfo.telefoon);
+                    verifieerEnVerrijkMakelaar(domeinViaPhone, bordInfo.makelaar, bordInfo.telefoon).catch(() => {});
                     domeinMakelaar = domeinViaPhone; // gebruik dit domein voor STAP 2
                   }
                 }
@@ -1840,6 +1916,8 @@ app.post('/api/scan', async (req, res) => {
       const koopUrl = ontdekt?.koopUrl || null;
       const huurUrl = ontdekt?.huurUrl || null;
       await voegMakelaarToeAanSupabase(domeinMakelaar, bordInfo.makelaar, koopUrl, huurUrl, bordInfo.telefoon || null);
+      // Verificatie asynchroon — blokkeert scan niet
+      verifieerEnVerrijkMakelaar(domeinMakelaar, bordInfo.makelaar, bordInfo.telefoon || null).catch(() => {});
       if (koopUrl || huurUrl) {
         console.log(`✅ URL ontdekt voor ${domeinMakelaar} → direct zoeken`);
         makelaarInDB = true; // URL bekend, direct doorzoeken
@@ -2008,7 +2086,8 @@ app.post('/api/scan', async (req, res) => {
       }
       if (!extraInDB && domeinExtraVoorDB) {
         await voegMakelaarToeAanSupabase(domeinExtraVoorDB, makelaarExtra.naam, null, null, makelaarExtra.telefoon || null);
-        ontdekMakelaarUrls(domeinExtraVoorDB).catch(() => {});
+        // Verificatie asynchroon — ontdekt URLs + verifieert telefoon via Google
+        verifieerEnVerrijkMakelaar(domeinExtraVoorDB, makelaarExtra.naam, makelaarExtra.telefoon || null).catch(() => {});
         console.log(`✅ Co-makelaar "${makelaarExtra.naam}" (${domeinExtraVoorDB}) toegevoegd aan Supabase`);
       } else if (!extraInDB) {
         console.log(`⚠️ Co-makelaar "${makelaarExtra.naam}": geen website gevonden, niet toegevoegd aan DB`);
@@ -2169,6 +2248,41 @@ app.post('/api/scan', async (req, res) => {
 
       // ── STAP 2.5: Parallel portal searches ───────────────────────
       portalResultaten = await zoekPortalenParallel(makelaarNaam, domeinHint, zoekAdres, postcode, bordInfo.referentienummer, bordInfo.pand_type_slug, bordInfo.listing_type, makelaarExtra);
+
+      // ── Adresverificatie van portal-kandidaten ───────────────────
+      // Filter kandidaten waarvan we met zekerheid weten dat ze NIET het juiste adres hebben.
+      // Methode 1 (gratis): GPS-straat in URL slug → sterke indicatie → behouden
+      // Methode 2 (1 HTTP call): detail-pagina ophalen → adres extraheren → vergelijken met GPS
+      // Onbevestigde URLs blijven staan — bij geen matches houden we alles (Claude beslist dan)
+      if (gpsStraat && portalResultaten.length > 0) {
+        const straatLow = gpsStraat.toLowerCase();
+        const geverifieerdViaSlug   = portalResultaten.filter(r => (r.url || '').toLowerCase().includes(straatLow.split(' ')[0]));
+        const onbevestigd           = portalResultaten.filter(r => !geverifieerdViaSlug.includes(r));
+
+        // Haal voor onbevestigde URLs het adres op (max 5 om scan niet te vertragen)
+        const teVerifieren = onbevestigd.slice(0, 5);
+        const geverifieerdViaFetch  = [];
+        for (const r of teVerifieren) {
+          try {
+            const d = await fetchDetailVanListing(r.url, { claudeFallback: false });
+            if (d?.adres && _straatMatch(gpsStraat, d.adres)) {
+              geverifieerdViaFetch.push({ ...r, _adresGeverifieerd: d.adres });
+              console.log(`  ✅ Adres geverifieerd: ${r.url} → "${d.adres}"`);
+            } else if (d?.adres) {
+              console.log(`  ❌ Adres-mismatch: ${r.url} → "${d.adres}" (GPS: "${gpsStraat}")`);
+            }
+          } catch {}
+        }
+
+        const geverifieerd = [...geverifieerdViaSlug, ...geverifieerdViaFetch];
+        if (geverifieerd.length > 0) {
+          console.log(`🔍 Adresverificatie: ${geverifieerd.length}/${portalResultaten.length} URLs bevestigd op "${gpsStraat}"`);
+          portalResultaten = geverifieerd;
+        } else {
+          console.log(`⚠️  Adresverificatie: geen enkele URL bevestigd op "${gpsStraat}" — alle ${portalResultaten.length} kandidaten doorgegeven aan Claude`);
+        }
+      }
+
       // Bouw portal-context op voor Claude (enkel wat er gevonden is)
       makelaarPortal = portalResultaten.find(r => r.domein === domeinHint);
       const aggPortalen = [
