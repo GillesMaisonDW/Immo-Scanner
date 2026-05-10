@@ -1344,6 +1344,23 @@ async function zoekPortalenParallel(makelaarNaam, domeinHint, zoekAdres, postcod
         isCo: true,
         coNaam,
       });
+      // Immoweb + Zimmo queries voor co-makelaar (zelfde als primaire makelaar)
+      entries.push({
+        label: 'Immoweb',
+        domein: 'immoweb.be',
+        query: `"${adZonderNummer}" "${coNaam}" site:immoweb.be`,
+        openSearch: false,
+        isCo: true,
+        coNaam,
+      });
+      entries.push({
+        label: 'Zimmo',
+        domein: 'zimmo.be',
+        query: `"${adZonderNummer}" "${coNaam}" site:zimmo.be`,
+        openSearch: false,
+        isCo: true,
+        coNaam,
+      });
       return entries;
     })(),
   ];
