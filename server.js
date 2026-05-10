@@ -1416,8 +1416,8 @@ async function matchListingOpFoto(bordFotoBase64, bordMime, listingUrl, listingF
 // ================================================================
 const PROMPT_STAP1 = `Analyseer dit makelaarsbord. Geef ENKEL deze JSON terug, niets anders:
 {
-  "makelaar": "exacte naam zoals zichtbaar op het bord (letterlijk overtypen, geen interpretatie)",
-  "makelaar_website": "domeinnaam — prioriteit: (1) zichtbaar op bord, (2) bekend logo/huisstijl: ERA→era.be, Heylen→heylenvastgoed.be, Hillewaere→hillewaere-vastgoed.be, DeWaele→dewaele.com, Century21→century21.be, Trevi→trevi.be, JO (blauw logo)→jo.immo, Crevits→crevits.be, Huysewinkel→huysewinkel.be. Onbekende makelaar: null",
+  "makelaar": "naam van de makelaar zoals zichtbaar op het bord — gebruik de BEKENDE MAKELAARS lijst hieronder voor correcte spelling (bv. logo herkend als ERA → \"ERA\", niet \"Era vastgoed\")",
+  "makelaar_website": "URL/domein ENKEL als letterlijk zichtbaar op het bord (bv. era.be, jo.immo). Staat er geen URL op het bord: null",
   "makelaar_herkenning": "hoe herkend (kleur + logo + tekst)",
   "makelaar_betrouwbaarheid": "HOOG" | "MIDDEL" | "LAAG",
   "makelaar_extra": {"naam": "naam tweede makelaar", "website": "domein of null", "telefoon": "nummer of null"} | null,
