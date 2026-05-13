@@ -1641,6 +1641,7 @@ Je krijgt een sectie "GEVONDEN PORTAL-URLS" of "LISTINGS". Werk als volgt:
 
 ADRESREGEL: match ALTIJD op straatnaam. Huisnummerverschil ≤ 2 is acceptabel (GPS-drift).
 BRONREGEL: prijs, oppervlakte en slaapkamers moeten van DEZELFDE pagina komen als de URL.
+PRE-CHECK-REGEL: Als een URL is gemarkeerd met "⚠️ PRE-CHECK MISLUKT", betekent dit dat de server het verkeerde adres vond op die pagina. Gebruik zo'n URL NIET voor prijs of details. Geef die URL alleen mee als laatste redmiddel en zet dan status op "gedeeltelijk".
 
 ## WANNEER JE EEN LIJST VAN LISTINGS KRIJGT
 Kies de listing die het beste overeenkomt op basis van GPS-straatnaam, pand-type en transactie. Huisnummerverschil ≤ 2 is geen reden voor "gedeeltelijk" — tel dat als "gevonden".
@@ -2287,6 +2288,7 @@ app.post('/api/scan', async (req, res) => {
               console.log(`  ✅ Adres geverifieerd: ${r.url} → "${d.adres}"`);
             } else if (d?.adres) {
               console.log(`  ❌ Adres-mismatch: ${r.url} → "${d.adres}" (GPS: "${gpsStraat}")`);
+              r._adresMismatch = d.adres; // Markeer met het fout adres — wordt doorgegeven aan Claude als waarschuwing
             }
           } catch {}
         }
@@ -2325,6 +2327,9 @@ app.post('/api/scan', async (req, res) => {
           for (const r of gevonden) {
             portalContext += `${agg.label}: ${r.url}\n`;
             portalContext += `  → Gevonden via Google query: "${r.query}"\n`;
+            if (r._adresMismatch) {
+              portalContext += `  ⚠️  PRE-CHECK MISLUKT: pagina toont adres "${r._adresMismatch}" — NIET "${gpsStraat}". Waarschijnlijk VERKEERDE listing. Gebruik alleen als er absoluut geen andere optie is en geef dan status "gedeeltelijk".\n`;
+            }
           }
         } else {
           portalContext += `${agg.label}: geen detail-URL gevonden\n`;
